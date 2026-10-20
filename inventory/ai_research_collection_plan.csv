@@ -1,0 +1,53 @@
+action,manifest_id,person_source,url,resource_type,priority,reason
+PLAN_FETCH_METADATA_ONLY,HI-URL-001,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/index.html,Discovery index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,YB-URL-001,Yoshua Bengio,https://yoshuabengio.org/en,Discovery index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,HI-URL-002,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/publications.html,Publication index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,YB-URL-002,Yoshua Bengio,https://yoshuabengio.org/en/research,Research index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,HI-URL-003,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/papers.html,Publication index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,YB-URL-003,Yoshua Bengio,https://yoshuabengio.org/en/blog,Blog index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,HI-URL-004,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/bytopics.html,Topic index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,YB-URL-004,Yoshua Bengio,https://yoshuabengio.org/en/blog?page=1,Blog pagination,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,HI-URL-005,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/talks.html,Mixed resource index,P1,Selected by default balanced 10-page dry run; live policy must permit it
+PLAN_FETCH_METADATA_ONLY,YB-URL-005,Yoshua Bengio,https://yoshuabengio.org/en/blog/bengio-if-you-prioritize-safety-leave-frontier-ai-companies,Blog article,P1,Selected by default balanced 10-page dry run; live policy must permit it
+EXCLUDE_FROM_FETCH,HI-URL-010,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/shortcv.pdf,PDF / profile record,P2,binary resource; no PDF/media download in metadata phase
+EXCLUDE_FROM_FETCH,EXT-URL-001,Yoshua Bengio / external publisher,https://www.transformernews.ai/p/yoshua-bengio-if-you-prioritize-safety-leave-frontier-ai-companies,External article link,P3,external or record-only reference
+EXCLUDE_FROM_FETCH,EXT-URL-002,Yoshua Bengio / external publisher,https://www.ft.com/content/7afaf77b-b027-4a0f-8d53-5e88e7d6f5e4,External article link,P3,external or record-only reference
+EXCLUDE_FROM_FETCH,EXT-URL-003,Yoshua Bengio / external publisher,https://time.com/article/2026/09/09/ai-is-at-a-turning-point/,External article link,P3,external or record-only reference
+EXCLUDE_FROM_FETCH,EXT-URL-004,Yoshua Bengio / external research archive,https://arxiv.org/abs/2606.29657,External research record,P1 (later connector),external or record-only reference
+EXCLUDE_FROM_FETCH,EXT-URL-005,Yoshua Bengio / public video,https://www.youtube.com/watch?v=qe9QSCF-d88,External video link,P3,external or record-only reference
+EXCLUDE_FROM_FETCH,EXT-URL-006,Yoshua Bengio / official report,https://internationalaisafetyreport.org/,External report destination,P2,external or record-only reference
+EXCLUDE_FROM_FETCH,EXT-URL-007,Yoshua Bengio / research organization,https://lawzero.org/en/unlisted/scientist-ai-safe-design-not-desiring,External research organization link,P2,external or record-only reference
+EXCLUDE_FROM_FETCH,EXT-URL-008,Geoffrey Hinton / cross-owner course link,https://www.cs.toronto.edu/~tijmen/csc321/,Cross-owner course link,P3,external or record-only reference
+EXCLUDE_FROM_FETCH,CTRL-URL-001,University of Toronto domain,https://www.cs.toronto.edu/robots.txt,Compliance endpoint,Blocking prerequisite,policy endpoint; checked separately
+EXCLUDE_FROM_FETCH,CTRL-URL-002,University of Toronto domain,https://www.cs.toronto.edu/sitemap.xml,Compliance endpoint,Blocking prerequisite,policy endpoint; checked separately
+EXCLUDE_FROM_FETCH,CTRL-URL-003,Yoshua Bengio domain,https://yoshuabengio.org/robots.txt,Compliance endpoint,Blocking prerequisite,policy endpoint; checked separately
+EXCLUDE_FROM_FETCH,CTRL-URL-004,Yoshua Bengio domain,https://yoshuabengio.org/sitemap.xml,Compliance endpoint,Blocking prerequisite,policy endpoint; checked separately
+EXCLUDE_FROM_FETCH,CTRL-URL-005,Yoshua Bengio domain,https://yoshuabengio.org/wp-sitemap.xml,Compliance endpoint,Blocking prerequisite,policy endpoint; checked separately
+EXCLUDE_FROM_FETCH,CTRL-URL-006,Yoshua Bengio domain,https://yoshuabengio.org/sitemap_index.xml,Compliance endpoint,Blocking prerequisite,policy endpoint; checked separately
+QUEUED_NOT_SELECTED,HI-URL-006,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/coursera_lectures.html,Lecture index,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-007,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/coursera_slides.html,Slide index,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-008,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/nntut.html,Tutorial index,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-009,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/bio.html?stream=top,Biography page,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-011,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/awards.html,Awards page,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-012,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/media/video.html,Media index,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-013,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/media/print.html,Media index,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-014,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/media/podcasts.html,Media index,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-015,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/media/books.html,Book/resource index,P3,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-016,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/students/postdocs.html,Research network,P3,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-017,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/students/phds.html,Research network,P3,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-018,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/students/masters.html,Research network,P3,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-019,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/pages/students/interns.html,Research network,P3,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-020,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/csc2535/index.html,Course page,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-021,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/poe.html,Topic bibliography,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-022,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/speech.html,Topic bibliography,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,HI-URL-023,Geoffrey Hinton,https://www.cs.toronto.edu/~hinton/reviewpap.html,Topic bibliography,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-006,Yoshua Bengio,https://yoshuabengio.org/en/blog/dangerous-myth-behind-ai-agent-hacks,Blog article,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-007,Yoshua Bengio,https://yoshuabengio.org/en/blog/professor-yoshua-bengios-speech-un-security-council,Blog article / speech,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-008,Yoshua Bengio,https://yoshuabengio.org/en/blog/why-are-ai-agents-lying-cheating-and-coordinating,Blog article,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-009,Yoshua Bengio,https://yoshuabengio.org/en/blog/implications-artificial-general-intelligence-national-and-international-security,Blog article / policy essay,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-010,Yoshua Bengio,https://yoshuabengio.org/en/blog/bounding-probability-harm-ai-create-guardrail,Blog article / research commentary,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-011,Yoshua Bengio,https://yoshuabengio.org/en/blog/international-scientific-report-safety-advanced-ai,Blog article / report pointer,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-012,Yoshua Bengio,https://yoshuabengio.org/en/blog/generative-flow-networks,Blog article / research explanation,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-013,Yoshua Bengio,https://yoshuabengio.org/en/blog/towards-cautious-scientist-ai-convergent-safety-bounds,Blog article / research commentary,P1,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-014,Yoshua Bengio,https://yoshuabengio.org/en/blog/time-rethink-publication-process-machine-learning,Blog article / publication commentary,P2,Eligible but outside current batch limit
+QUEUED_NOT_SELECTED,YB-URL-015,Yoshua Bengio,https://yoshuabengio.org/en/publication/safety-honesty-disinterested-ai-predictor,Publication detail page,P1,Eligible but outside current batch limit

@@ -1,0 +1,4 @@
+# Optional: install for local exploratory notebooks / JupyterLab.
+pandas>=2.2,<4
+jupyterlab>=4.2,<5
+ipykernel>=6.29,<8
