@@ -6,12 +6,12 @@
 **Repository:** <https://github.com/maha-ai-developer/ai-research-learning>
 
 > [!IMPORTANT]
-> **Unprovisioned Cloud Infrastructure Status:**
+> **Unprovisioned Cloud Infrastructure Status & Local-First Rollout:**
 > - **No Firebase or Google Cloud projects have been created for this product.**
-> - **Project IDs, cloud regions, billing accounts, enabled APIs, and runtime environments (`DEV` / `PROD`) are not yet established.**
-> - **This architecture package and Pull Request #1 do not create projects, enable billing, enable cloud services, deploy resources, or commit environment credentials.**
-> - **Cloud provisioning is a separate, approval-gated milestone** that will only occur after architectural sign-off and cost-control verification.
-> - **Firebase App Hosting requires the Firebase Blaze (pay-as-you-go) billing plan**, so billing budgets, alert thresholds, Cloud Run `maxInstances` caps, and abuse quotas must be established before enabling it.
+> - **Project IDs (`maha-airl-dev-01` and `maha-airl-prod-01` as candidate IDs only), cloud regions, billing accounts, enabled APIs, and runtime environments (`DEV` / `PROD`) are not yet established.** Availability, account access, and billing permissions must be verified before any project creation.
+> - **This architecture package and Pull Requests #1 and #2 do not create projects, enable billing, enable cloud services, deploy resources, or commit environment credentials.**
+> - **Local-First Milestone & `DEV`-First Rollout:** Initial adapter, schema, and security-rule development (Stages 1–6) uses the **Firebase Local Emulator Suite** and **local SQLite** (`data/research_inventory.sqlite`) with zero cloud dependency. Cloud provisioning and billing authorization are deferred to a separate approval gate, followed by a **`DEV`-first rollout** (`PROD` remains unprovisioned and unavailable until release readiness has been demonstrated in `DEV`). See [`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md) for the detailed pre-provisioning blueprint.
+> - **Firebase App Hosting requires the Firebase Blaze (pay-as-you-go) billing plan** and may incur costs across multiple underlying services (Cloud Build, Cloud Run SSR in the primary region, Artifact Registry, Cloud CDN/bandwidth, and Secret Manager). Cloud Billing budgets (`$5/month DEV`, `$15/month PROD`) are **notification thresholds only, not maximum spending guarantees**, so service-specific caps (`maxInstances`), API quotas, and application-level circuit breakers must be configured before enabling Blaze.
 
 ---
 
@@ -130,14 +130,15 @@ The architecture deliberately selects the smallest set of managed services that 
 
 ### 3.1 Clients: Next.js Web Application & Flutter Mobile Application
 
-1. **Next.js Web Client (deployed on Firebase App Hosting):**
+1. **Next.js Web Client (deployed on Firebase App Hosting — Provisional Option A or Cloud Run Fallback Option C):**
    - Provides responsive browser interfaces for concept graphs, reading lists, source-grounded Q&A, side-by-side research comparisons, transcript timestamp navigation, and notebook previewing.
-   - Uses Server-Side Rendering (SSR) and Incremental Static Regeneration (ISR) for public catalog pages and SEO-friendly concept overviews, while authenticated learner state is fetched via the shared Cloud Run backend API.
+   - Uses Server-Side Rendering (SSR) and Incremental Static Regeneration (ISR) for public catalog pages and SEO-friendly concept overviews, while authenticated learner state and dynamic operations are fetched directly from the shared Cloud Run `core-api`.
+   - **Provisional Regional Topology & Request Path (Unfinalized):** As detailed in [`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md), **Option A** is the provisional recommendation: data and Python compute (`Firestore`, `Cloud Storage`, `Cloud Run` `core-api` and `ingestion-worker`, and `Artifact Registry`) in `asia-south1` (Mumbai) and Firebase App Hosting in `asia-southeast1` (Singapore, the nearest supported App Hosting region). Even when Cloud CDN is enabled on App Hosting, **uncached requests are routed to and executed by App Hosting's primary-region Cloud Run backend in `asia-southeast1`**. Therefore, dynamic web and Flutter operations (`POST /api/v1/search`, `POST /api/v1/tutor/ask`, `/api/v1/me/progress/*`) use a **direct client-to-Mumbai-API (`core-api` in `asia-south1`) request path**, avoiding unnecessary server-side proxies through `asia-southeast1`. **Option C** (hosting the Next.js container directly on Cloud Run in `asia-south1` without App Hosting) is preserved as a fallback if single-region co-location and simplicity outweigh App Hosting's convenience. No region has been finalized for provisioning.
 2. **Flutter Mobile Client (iOS and Android):**
-   - Shares the exact same backend REST API and Firebase Authentication identity model as the web application.
+   - Shares the exact same backend REST API (`core-api` in `asia-south1` under Option A/C) and Firebase Authentication identity model as the web application.
    - Focuses on structured learning paths, mathematical intuition cards (linking 3Blue1Brown lessons), spaced-repetition concept reviews, audio/video lecture companions with synchronized transcripts, and offline caching of permitted metadata and study progress.
 3. **Why both clients share a single backend API:**
-   - Centralizing business logic, entitlement checks, provenance assembly, and AI workflows in the Cloud Run `core-api` prevents duplicating security rules, prompt templates, or citation-validation logic across TypeScript (Web) and Dart (Flutter).
+   - Centralizing business logic, entitlement checks, provenance assembly, and AI workflows in the Cloud Run `core-api` prevents duplicating security rules, prompt templates, or citation-validation logic across TypeScript (Web) and Dart (Flutter), while eliminating cross-region proxy hops for dynamic browser and mobile requests.
 
 ### 3.2 Shared Backend API & Authentication Model
 
@@ -183,8 +184,8 @@ The architecture deliberately selects the smallest set of managed services that 
    - Currently runs offline tests and syntax/policy checks on every push and pull request targeting `main` with minimal permissions (`contents: read`).
    - Once cloud environments are approved and provisioned in a later milestone, deployment workflows will use OIDC Workload Identity Federation (never long-lived service account JSON keys) to deploy `core-api`, `ingestion-worker`, Firestore indexes (`firestore.indexes.json`), and security rules (`firestore.rules`, `storage.rules`).
 2. **Firebase App Hosting (Requires Blaze Plan — Provisioning Gated):**
-   - Intended to build and host the Next.js web application using `apphosting.yaml` (`runConfig` for CPU, memory, concurrency, and `minInstances`/`maxInstances`, plus Secret Manager bindings for runtime secrets).
-   - **Billing & Cost Prerequisite:** Firebase App Hosting requires upgrading a Firebase project to the **Blaze (pay-as-you-go) plan** because it provisions managed Cloud Build, Cloud Run, and Artifact Registry resources under the hood. Consequently, App Hosting **must not** be enabled until billing budgets, hard `maxInstances` caps, CDN cache policies, and abuse rate limits are configured and approved.
+   - Intended under provisional **Option A** (`asia-southeast1` primary region) to build and host the Next.js web application using `apphosting.yaml` (`runConfig` for CPU, memory, concurrency, and `minInstances`/`maxInstances`, plus Secret Manager bindings for runtime secrets), with **Option C** (direct Cloud Run deployment in `asia-south1`) retained as a single-region fallback (see [`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md)).
+   - **Billing & Multi-Service Cost Prerequisite:** Firebase App Hosting requires upgrading a Firebase project to the **Blaze (pay-as-you-go) plan** and may incur charges across multiple underlying Google Cloud services (**Cloud Build**, **Cloud Run** in the App Hosting primary region for uncached SSR requests, **Artifact Registry**, **Cloud CDN / network egress**, and **Secret Manager**). Because Cloud Billing budgets are notification thresholds only (not hard spending caps) and no single control guarantees a strict total-bill ceiling, App Hosting **must not** be enabled until billing budgets, hard `maxInstances` caps, CDN cache policies, API quotas, and abuse rate limits are configured and approved.
 
 ### 3.6 Replaceable AI Model & Configurable Embedding Strategy
 
@@ -255,16 +256,19 @@ flowchart LR
 
 ### 4.1 Target Environment Configuration Matrix (Pre-Provisioning Blueprint)
 
-| Dimension | Local Development (Active Now) | Target DEV Environment (Unprovisioned) | Target PROD Environment (Unprovisioned) |
+See [`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md) for the complete pre-provisioning blueprint, candidate project ID verification steps, regional topology analysis, and cost/quota safeguards.
+
+| Dimension | Local-First Milestone (Active Now, Stages 1–6) | Target DEV Environment (Unprovisioned — Rollout First at Stage 7) | Target PROD Environment (Unprovisioned — Gated Until DEV Release Readiness) |
 | :--- | :--- | :--- | :--- |
-| **GCP / Firebase Project** | Local Firebase Emulator Suite + SQLite dry-run | Not yet created (requires approval gate) | Not yet created (requires approval gate) |
-| **Region & Billing** | Local only (`$0` cloud spend) | Unassigned; Blaze plan required only when App Hosting is approved | Unassigned; Blaze plan + hard budget alerts required before enabling |
-| **Service Accounts** | Local developer ADC / emulator | Target: dedicated least-privilege runtime & CI identities | Target: dedicated least-privilege runtime & CI identities |
-| **Secrets Management** | `.env.local` (git-ignored) | Secret Manager (DEV project scope) | Secret Manager (PROD project scope, rotation enforced) |
-| **Cloud Run `minInstances`** | N/A | `0` (scale to zero to minimize cost) | `0` initially; `1` for `core-api` when active daily learners > 100 |
-| **Cloud Run `maxInstances`** | N/A | `3` (strict cost cap) | `10` (with budget alerts) |
+| **GCP / Firebase Project** | Local Firebase Emulator Suite + local SQLite (`data/research_inventory.sqlite`) | Candidate ID: `maha-airl-dev-01` (`${GCP_PROJECT_ID_DEV}`); not yet created, requires availability/access/billing check & approval gate | Candidate ID: `maha-airl-prod-01` (`${GCP_PROJECT_ID_PROD}`); remains unprovisioned/unavailable until release readiness is demonstrated in `DEV` |
+| **Regional Topology (Unfinalized)** | Local only (`127.0.0.1`) | Provisional **Option A**: data/compute in `asia-south1`, App Hosting in `asia-southeast1` (direct client-to-`asia-south1` API path for dynamic calls); Fallback **Option C**: all in `asia-south1` | Same approved topology as `DEV` (provisional **Option A** or fallback **Option C**; not yet finalized) |
+| **Billing & Cost Safeguards** | `$0` cloud spend (no billing account) | Spark initially if emulator-compatible; Blaze required before App Hosting/Cloud Run; `$5/mo` budget alert (**notification threshold only, not a hard cap**) + service quotas & circuit breakers | Blaze plan; `$15/mo` budget alert (**notification threshold only, not a hard cap**) + service quotas, `maxInstances`, & circuit breakers |
+| **Service Accounts** | Local developer ADC / emulator | Target: `sa-cicd-deployer`, `sa-core-api`, `sa-ingestion-worker`, `sa-apphosting-web`, `sa-lab-sandbox` (Stage 9) | Target: `sa-cicd-deployer`, `sa-core-api`, `sa-ingestion-worker`, `sa-apphosting-web`, `sa-lab-sandbox` (Stage 9) |
+| **Secrets Management** | `.env.local` (git-ignored) | Secret Manager (`DEV` project scope) | Secret Manager (`PROD` project scope, rotation enforced) |
+| **Cloud Run `minInstances`** | N/A | `0` (scale to zero to minimize cost) | `0` initially; `1` for `core-api` only if justified by active daily learners > 100 |
+| **Cloud Run `maxInstances`** | N/A | `2` (`core-api` and App Hosting `runConfig`) | `5`–`10` (`core-api`), `3` (App Hosting `runConfig`) |
 | **Source Ingestion Scope** | Offline fixtures (`tests/`) or `--policy-only` / `--limit 10` | Small capped batches (`--limit 25`) | Approved scheduled runs with full provenance audit |
-| **Firestore Backup / PITR** | Ephemeral | Daily export to DEV bucket (7-day retention) | Point-in-Time Recovery (PITR, 7-day window) + scheduled GCS exports |
+| **Firestore Backup / PITR** | Ephemeral / local SQLite | On-demand / scheduled export to `DEV` bucket (7-day retention; PITR disabled in `DEV` to save cost) | Point-in-Time Recovery (PITR, 7-day window) + scheduled GCS exports |
 
 ---
 

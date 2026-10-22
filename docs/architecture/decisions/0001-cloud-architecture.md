@@ -5,19 +5,19 @@
 | **ADR ID** | `ADR-0001` |
 | **Date** | `2026-10-22` |
 | **Status** | `Proposed` |
-| **Related Docs** | [`system-overview.md`](../system-overview.md), [`implementation-roadmap.md`](../implementation-roadmap.md) |
+| **Related Docs** | [`system-overview.md`](../system-overview.md), [`implementation-roadmap.md`](../implementation-roadmap.md), [`cloud-provisioning-plan.md`](../../operations/cloud-provisioning-plan.md) |
 
 ---
 
 ## 1. Context, Unprovisioned Infrastructure Status, and Problem Statement
 
 > [!IMPORTANT]
-> **Explicit Unprovisioned Cloud Infrastructure Status**:
+> **Explicit Unprovisioned Cloud Infrastructure Status & Local-First Rollout**:
 > - **No Firebase or Google Cloud projects have been created for this product.**
-> - **Project IDs, regions, billing configuration, APIs, and `DEV`/`PROD` environments are not yet established.**
-> - **This architecture pull request does not—and must not—create projects, enable billing, enable services, deploy resources, or commit environment credentials.**
-> - **Cloud provisioning is a separate, approval-gated milestone.**
-> - **Blaze Plan & Cost Controls**: Because **Firebase App Hosting requires the Google Cloud Blaze (pay-as-you-go) billing plan**, explicit cost controls, Cloud Billing budget alerts, Cloud Run `max-instances` caps, and per-user/project LLM token circuit breakers must be reviewed and approved before enabling Firebase App Hosting or provisioning cloud resources.
+> - **Project IDs (`maha-airl-dev-01` and `maha-airl-prod-01` recorded as unprovisioned candidates only), regions, billing configuration, APIs, and `DEV`/`PROD` environments are not yet established.** Global namespace availability, account access, and billing permissions must be verified before project creation.
+> - **This architecture package and Pull Requests #1 and #2 do not—and must not—create projects, enable billing, enable services, deploy resources, or commit environment credentials.**
+> - **Local-First Milestone & `DEV`-First Rollout**: Initial adapter, schema, and security-rule development (Stages 1–6) uses the **Firebase Local Emulator Suite** and **local SQLite** (`data/research_inventory.sqlite`) with zero cloud dependency. Cloud provisioning and billing authorization are deferred to a separate approval gate, followed by a **`DEV`-first rollout** (`PROD` remains unprovisioned and unavailable until release readiness is demonstrated in `DEV`). See [`cloud-provisioning-plan.md`](../../operations/cloud-provisioning-plan.md).
+> - **Blaze Plan & Cost Controls**: Because **Firebase App Hosting requires the Google Cloud Blaze (pay-as-you-go) billing plan** and may incur charges across multiple underlying services (Cloud Build, Cloud Run SSR in the primary region, Artifact Registry, Cloud CDN/bandwidth, and Secret Manager), and because Cloud Billing budgets (`$5/month DEV`, `$15/month PROD`) are **notification thresholds only, not maximum spending guarantees**, explicit service-specific caps (`max-instances`), API quotas, and application-level LLM token circuit breakers must be reviewed and approved before enabling Firebase App Hosting or provisioning cloud resources.
 
 The AI Research & Learning System requires a target cloud architecture capable of:
 1. Serving a responsive Next.js web application and a Flutter mobile application (iOS/Android) over a shared API with clear access boundaries (unauthenticated read-only access allowed only if the catalog is deliberately published; authentication required for user-specific progress and protected endpoints; identified principals, abuse controls, and strict quotas required for AI tutor endpoints).
@@ -29,9 +29,11 @@ The AI Research & Learning System requires a target cloud architecture capable o
 
 ## 2. Decision
 
-We adopt a **minimal serverless Google Cloud + Firebase target architecture** consisting of five core managed services isolated across separate future `DEV` (`${GCP_PROJECT_ID_DEV}`) and `PROD` (`${GCP_PROJECT_ID_PROD}`) projects (to be created only during the separate approval-gated cloud provisioning milestone):
+We adopt a **local-first development workflow** (Firebase Local Emulator Suite + local SQLite `data/research_inventory.sqlite` for Stages 1–6) followed by a **minimal serverless Google Cloud + Firebase target architecture** isolated across separate future `DEV` (`${GCP_PROJECT_ID_DEV}`, candidate `maha-airl-dev-01`) and `PROD` (`${GCP_PROJECT_ID_PROD}`, candidate `maha-airl-prod-01`) projects (to be created only during the separate approval-gated cloud provisioning milestone, using a **`DEV`-first rollout** where `PROD` remains unavailable until release readiness is demonstrated in `DEV`; see [`cloud-provisioning-plan.md`](../../operations/cloud-provisioning-plan.md)):
 
-1. **Firebase App Hosting** for the Next.js Web Client (`apphosting.yaml`), gated on Blaze plan billing approval and budget monitoring setup.
+1. **Firebase App Hosting (Provisional Option A) or Direct Cloud Run Web Hosting (Fallback Option C)**:
+   - **Provisional Recommendation (Option A)**: Deploy data and Python compute (`Firestore`, `Cloud Storage`, `Cloud Run` `core-api` and `ingestion-worker`, and `Artifact Registry`) in `asia-south1` (Mumbai) and **Firebase App Hosting** (`apphosting.yaml`) in `asia-southeast1` (Singapore, nearest supported App Hosting region), gated on Blaze plan billing approval. Because App Hosting's primary-region server (`asia-southeast1`) handles uncached SSR requests even when Cloud CDN is enabled, dynamic web and Flutter operations (`search`, `tutor`, `learner progress`) use a **direct client-to-Mumbai-API (`core-api` in `asia-south1`) request path**, avoiding unnecessary cross-region server-side proxies through `asia-southeast1`.
+   - **Co-Located Fallback (Option C)**: If single-region simplicity and strict co-location in `asia-south1` outweigh App Hosting's git-driven convenience, deploy the Next.js web container directly on **Cloud Run** in `asia-south1` alongside `core-api` and `Firestore`. No region has been finalized for provisioning.
 2. **Firebase Authentication** for unified identity management and JWT ID Token issuance across Web and Flutter clients:
    - Read-only public catalog endpoints may be accessed without authentication **only if the catalog is deliberately published**.
    - User-specific progress and protected endpoints require an authenticated user.
@@ -61,6 +63,8 @@ We adopt a **minimal serverless Google Cloud + Firebase target architecture** co
 
 ### Negative / Mitigations
 - **Cold-Start Latency on `core-api`**: Mitigated by keeping container images lean, lazy-loading heavy clients, and optionally setting `min-instances = 1` in `PROD` only if p95 cold-start latency exceeds `2.5s`.
+- **Cross-Region Split Under Provisional Option A (`asia-southeast1` App Hosting + `asia-south1` Data/Compute)**: Because App Hosting's primary-region server (`asia-southeast1`) processes uncached requests even with Cloud CDN enabled, routing dynamic API requests through Next.js SSR would add cross-region latency. Mitigated by routing all dynamic web and Flutter requests directly from the client to `core-api` in `asia-south1`, and preserving **Option C** (direct Cloud Run web hosting in `asia-south1`) as a single-region fallback.
+- **Multi-Service Blaze Billing Exposure**: Firebase App Hosting requires the Blaze plan and can incur costs across Cloud Build, Cloud Run, Artifact Registry, Cloud CDN/bandwidth, and Secret Manager, while Cloud Billing budgets (`$5 DEV` / `$15 PROD`) are notification thresholds only (with reporting delays) rather than hard total-bill ceilings. Mitigated by local-first development (Stages 1–6), `DEV`-first rollout, strict `max-instances` caps, API consumer quota overrides, and application-level token/request circuit breakers ([`cloud-provisioning-plan.md`](../../operations/cloud-provisioning-plan.md)).
 - **Vendor Coupling to GCP IAM/Firebase Auth**: Mitigated by isolating storage and AI model interactions behind Python repository and `ModelProvider` interfaces inside `core-api`.
 
 ---
