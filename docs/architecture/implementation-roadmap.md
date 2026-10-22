@@ -54,7 +54,7 @@ flowchart TD
 ## 2. Detailed Stage Definitions (Stages 1–9)
 
 ### Stage 1 — Architecture and Security Foundations
-- **Dependencies**: None (Baseline repository and CI established in Task 001).
+- **Dependencies**: None (Baseline repository and CI established in Task 001; see [`reports/repository-bootstrap-report.md`](../../reports/repository-bootstrap-report.md)).
 - **Scope**:
   - Finalize and approve architectural design package (`ARCH-SYS-001` through `ARCH-ROADMAP-006` and ADRs `0001`–`0004`).
   - Define environment configuration templates (`${GCP_PROJECT_ID_DEV}`, `${GCP_PROJECT_ID_PROD}`), Firestore security rules (`firestore.rules`), Storage security rules (`storage.rules`), and least-privilege IAM service account matrices as code (without hardcoding project IDs).
