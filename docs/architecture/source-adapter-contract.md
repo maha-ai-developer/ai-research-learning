@@ -2,7 +2,7 @@
 
 **Document ID:** `ARCH-ADAPTER-003`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-21  
+**Last Updated:** 2026-10-22  
 **Baseline Implementation Reference:** `collect.py` (`ConservativeCollector`)
 
 ---
@@ -18,8 +18,10 @@ The **Source Adapter Contract** defines a uniform programmatic interface and com
 5. **Wikipedia (`SRC-WIKIPEDIA`)** — Wikimedia REST & Action APIs (`https://en.wikipedia.org/w/rest.php/v1/`)
 
 > [!IMPORTANT]
-> **Public Visibility != Redistribution License:**  
-> The fact that a web page, PDF paper, slide deck, video lecture, or transcript is publicly reachable on the internet—or permitted to be crawled by `robots.txt`—does **not** grant a license to copy, archive in full, or redistribute that content to users. Every adapter must evaluate **access policy** (`robots.txt` / API Terms of Use) and **content reuse rights** (copyright / SPDX license) as two independent gates. When reuse rights are unverified or all-rights-reserved, the adapter must operate in **metadata-only** mode.
+> **Public Visibility != Redistribution License (And No Automated "Fair Use" Assumption):**  
+> 1. The fact that a web page, PDF paper, slide deck, video lecture, or transcript is publicly reachable on the internet—or permitted to be crawled by `robots.txt`—does **not** grant a license to copy, archive in full, or redistribute that content to users.
+> 2. **No Automatic Character-Count Fair-Use Rule:** An arbitrary character threshold (such as a 300-character snippet limit) does **not** automatically make copying or displaying verbatim quotations lawful under copyright or fair-use/fair-dealing doctrines. Software cannot adjudicate context-dependent legal questions automatically.
+> 3. Every adapter must evaluate **access policy** (`robots.txt` / API Terms of Use) and **content reuse rights** (copyright / SPDX license / explicit permission) as two independent gates. When reuse rights are unverified, ambiguous, or all-rights-reserved, the adapter must default to **not redistributing full text, verbatim excerpts, or media** (`METADATA_ONLY`) and record the legal uncertainty explicitly for human review.
 
 ---
 
@@ -110,7 +112,9 @@ class NormalizedResourceEnvelope:
     license_status: str
     license_spdx: str | None
     permitted_storage_scope: StorageScope
-    attribution_text: str
+    permits_verbatim_excerpts: bool = False
+    legal_uncertainty_status: Literal["VERIFIED_OPEN_LICENSE", "VERIFIED_TERMS_PERMITTED", "ALL_RIGHTS_RESERVED_METADATA_ONLY", "UNVERIFIED_REQUIRES_HUMAN_REVIEW"] = "UNVERIFIED_REQUIRES_HUMAN_REVIEW"
+    attribution_text: str = ""
     permitted_body_chunks: list[dict[str, Any]] = field(default_factory=list)
     discovered_links: list[DiscoveredLinkCandidate] = field(default_factory=list)
     metadata_hash: str = ""
@@ -280,3 +284,48 @@ An adapter may ingest transcript text **only** through one of the following auth
 - **No unauthorized third-party YouTube scraping:** Do not use unofficial scraper libraries (`youtube-dl`, `yt-dlp`, or unauthenticated transcript scrapers bypassing platform terms) to bulk-download audio or closed captions from third-party YouTube channels without permission or API compliance.
 - **No Whisper/ASR transcription of copyrighted streams without rights:** Do not download copyrighted video/audio files to run speech-to-text transcription unless the media itself carries an open license or explicit permission from the copyright holder.
 - **Timestamp Deep-Linking as the Default:** Whenever full transcript storage is not licensed, the system stores structured **Topic & Timestamp Index Points** (`start_ms`, `end_ms`, `concept_ids`, and an AI-generated one-sentence description of what is taught in that segment) so learners can click through directly to the exact timestamp on the official hosting platform.
+
+---
+
+## 8. Copyright, Quotations, Legal Uncertainty, and Removal Requests
+
+### 8.1 Default Rule: No Redistribution Without Verified License or Permission
+
+All source connectors default to:
+- `permitted_storage_scope = "METADATA_ONLY"`
+- `permits_full_text_storage = false`
+- `permits_verbatim_excerpts = false`
+- `permits_media_rehosting = false`
+
+Full text, transcript segments, or verbatim excerpts may be persisted and displayed **only** when the adapter or a human curator verifies an explicit open license (such as `CC-BY-4.0`, `CC-BY-SA-4.0`, `CC0-1.0`, or `MIT`), explicit API redistribution terms (such as arXiv's metadata and abstract distribution policy), or documented written permission from the rights holder.
+
+### 8.2 Handling Citations, Source Links, and Minimal Quotations
+
+1. **Citations & Outbound Source Links (Always Required):**
+   - Every resource and claim displays bibliographic attribution (`title`, `authors`, `published_at`, `source_id`, `attribution_text`), structural locators (section heading, equation/page number, or `start_ms`–`end_ms` timestamp), and a clickable canonical outbound URL (`canonical_url`) so learners read or watch the work on the rights-holder's site.
+2. **Minimal Quotations vs. AI Paraphrase:**
+   - **No Automatic "300-Character Fair Use" Assumption:** The system does **not** treat a fixed character count (e.g., 300 characters) as a blanket legal authorization to copy or display verbatim excerpts from all-rights-reserved works (`SRC-HINTON`, `SRC-BENGIO`, `SRC-3B1B`).
+   - When `permits_verbatim_excerpts == false`, `Citation` records omit `quoted_span` (`quoted_span: null`) and rely on **bibliographic metadata + section/page/timestamp locator + outbound link + clearly labeled AI-generated summary/paraphrase** (`epistemic_status: GENERATED_INTERPRETATION` or attributed `AUTHOR_OPINION` paraphrase).
+   - When `permits_verbatim_excerpts == true` (for openly licensed works such as `SRC-WIKIPEDIA` under `CC-BY-SA-4.0`, openly licensed `SRC-ARXIV` articles/abstracts, or explicitly authorized excerpts), technical snippet-length bounds (`max_excerpt_chars`) are enforced purely for UI conciseness and payload bounding—never as a substitute for license verification.
+
+### 8.3 Explicit Recording of Legal Uncertainty
+
+Automated parsers cannot resolve ambiguous copyright notices, conflicting page footers, third-party embedded media, or jurisdictional fair-use/fair-dealing questions. Whenever an adapter encounters:
+- An unrecognized or missing license URI on a page where text extraction is requested,
+- Co-authored or publisher-hosted papers linked from a researcher's site (`IEEE`, `ACM`, `Nature`, `MIT Press`), or
+- Ambiguous terms of service regarding automated indexing or excerpting,
+
+the adapter **must not guess**. It sets:
+- `legal_uncertainty_status = "UNVERIFIED_REQUIRES_HUMAN_REVIEW"`
+- `permitted_storage_scope = "METADATA_ONLY"`
+- `permits_verbatim_excerpts = false`
+
+and logs a review item for human governance rather than attempting automated legal adjudication.
+
+### 8.4 Removal, Opt-Out, and Takedown Request Workflow
+
+If a researcher, site administrator, publisher, or rights holder requests removal—or updates `robots.txt` / site terms to disallow indexing—the system executes a deterministic **Takedown & Tombstone Procedure**:
+
+1. **Immediate Ingestion Halt:** Add the URL pattern or `source_id` to the active exclusion blocklist so no further requests are made.
+2. **Purge Stored Content & Chunks:** Immediately delete any associated `knowledge_chunks`, `transcripts`, `transcript_segments`, cached agent syntheses, and Cloud Storage artifacts (`artifacts/`).
+3. **Compliance Tombstone:** Transition `resources/{resource_id}.lifecycle_state` to `"WITHDRAWN_BY_POLICY"` (or `"TOMBSTONED_ON_TAKEDOWN"`), scrubbing descriptive text and metadata down to an internal hash/URL blocklist entry and an immutable `provenance_events` audit log so future discovery runs permanently skip the withdrawn resource.

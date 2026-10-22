@@ -2,8 +2,16 @@
 
 **Document ID:** `ARCH-SYS-001`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-21  
+**Last Updated:** 2026-10-22  
 **Repository:** <https://github.com/maha-ai-developer/ai-research-learning>
+
+> [!IMPORTANT]
+> **Unprovisioned Cloud Infrastructure Status:**
+> - **No Firebase or Google Cloud projects have been created for this product.**
+> - **Project IDs, cloud regions, billing accounts, enabled APIs, and runtime environments (`DEV` / `PROD`) are not yet established.**
+> - **This architecture package and Pull Request #1 do not create projects, enable billing, enable cloud services, deploy resources, or commit environment credentials.**
+> - **Cloud provisioning is a separate, approval-gated milestone** that will only occur after architectural sign-off and cost-control verification.
+> - **Firebase App Hosting requires the Firebase Blaze (pay-as-you-go) billing plan**, so billing budgets, alert thresholds, Cloud Run `maxInstances` caps, and abuse quotas must be established before enabling it.
 
 ---
 
@@ -135,9 +143,13 @@ The architecture deliberately selects the smallest set of managed services that 
 
 1. **Firebase Authentication:**
    - Handles user sign-in across Web and Flutter via Google Sign-In, Email/Password, and GitHub OAuth, issuing short-lived (1-hour) signed JWT ID tokens (`uid`, `email`, `email_verified`, and custom role claims such as `role: "learner" | "curator" | "admin"`).
+   - **Access & Principal Policy:**
+     - **Public Catalog Endpoints:** Read-only catalog access (`GET /api/v1/resources`, `GET /api/v1/learning-paths`) may be served unauthenticated **only** for catalog slices deliberately marked `PUBLISHED` for public browsing, protected by IP rate limits.
+     - **User Progress & Protected Endpoints:** All learner progress (`users/{uid}/progress`, `/api/v1/me/*`), assessment submissions, and curation endpoints strictly require an authenticated principal.
+     - **AI Tutor & Cost-Bearing Endpoints:** AI tutor endpoints (`POST /api/v1/tutor/ask`) and model-backed semantic queries require an **identified principal**, abuse controls (Firebase App Check attestation + per-principal and per-IP rate limits), and strict daily token/request quotas. Firebase Anonymous Auth may be enabled for low-friction testing after cloud infrastructure exists, but anonymous principals must remain bound to tighter per-UID and per-IP quotas and **must never bypass cost controls**.
    - **Why selected:** Native SDK support for Next.js and Flutter, zero-maintenance token rotation, and tight integration with Google Cloud IAM and Firestore.
 2. **Backend API (`core-api` on Cloud Run):**
-   - Stateless Python (FastAPI) or TypeScript/Node service running as a single container image on Cloud Run.
+   - Stateless Python (FastAPI) or TypeScript/Node service running as a single container image on Cloud Run (once provisioned).
    - Validates Firebase ID tokens on every protected endpoint using the Firebase Admin SDK (`verify_id_token(check_revoked=True)`).
    - Enforces role-based access control (RBAC): learners access catalog, tutor, and their own `users/{uid}` progress; only `curator`/`admin` principals or internal OIDC service accounts can trigger ingestion or approve human-review queues.
    - All client reads of curated knowledge and writes of learner progress pass through `core-api` (or tightly scoped Firestore security rules for user-owned progress syncing), ensuring schema invariants and audit logging.
@@ -146,13 +158,13 @@ The architecture deliberately selects the smallest set of managed services that 
 
 1. **Cloud Firestore:**
    - Stores structured operational and knowledge metadata: source registry (`sources`), canonical resources (`resources`), content versions (`resource_versions`), provenance logs (`provenance_events`), concept graph nodes and edges (`concepts`, `concept_relations`), transcript segment metadata (`transcripts`, `transcript_segments`), permitted text chunks with native vector embeddings (`knowledge_chunks`), learning paths (`learning_paths`), learner progress (`users/{uid}/progress`), and agent run records (`agent_runs`).
-   - Uses Firestore native vector search (`find_nearest`, supporting vectors up to 2,048 dimensions) on `knowledge_chunks` combined with composite pre-filters (e.g., `source_id`, `concept_ids`, `license_class`).
-   - **Why selected:** Serverless scale-to-zero cost profile, strong consistency on document reads/transactions, native vector search for initial RAG scale (< 100,000 chunks), and built-in offline synchronization support for Flutter and Web if needed.
+   - Uses Firestore native vector search (`find_nearest`, where **2,048 dimensions is Firestore's documented maximum ceiling, not a default dimension**) on `knowledge_chunks` combined with composite pre-filters (e.g., `source_id`, `concept_ids`, `embedding_space_version`, `license_class`).
+   - **Why selected:** Serverless scale-to-zero cost profile, strong consistency on document reads/transactions, native vector search for initial RAG scale, and built-in offline synchronization support for Flutter and Web if needed.
 2. **Cloud Storage (GCS):**
-   - Stores immutable or large payloads that exceed Firestore's 1 MiB document limit or do not require field-level indexing:
-     - `gs://<env>-ai-research-audit/`: raw `robots.txt` snapshots, sitemap XML captures, and HTTP response headers for compliance evidence.
-     - `gs://<env>-ai-research-artifacts/`: permitted open-access content snapshots (e.g., CC BY-SA Wikipedia revision JSON, arXiv CC BY papers/abstract XML, authorized full transcripts).
-     - `gs://<env>-ai-research-notebooks/`: curated `.ipynb` templates and immutable experiment output bundles.
+   - When provisioned in a future approval-gated milestone, stores immutable or large payloads that exceed Firestore's 1 MiB document limit or do not require field-level indexing (using environment-parameterized bucket names—no buckets exist today):
+     - `gs://<unprovisioned-env-bucket>-audit/`: raw `robots.txt` snapshots, sitemap XML captures, and HTTP response headers for compliance evidence.
+     - `gs://<unprovisioned-env-bucket>-artifacts/`: permitted open-access content snapshots (e.g., CC BY-SA Wikipedia revision JSON, arXiv CC BY papers/abstract XML, authorized full transcripts).
+     - `gs://<unprovisioned-env-bucket>-notebooks/`: curated `.ipynb` templates and immutable experiment output bundles.
    - **Why selected:** Object versioning, lifecycle rules, low cost per GB, and signed URL delivery without routing heavy payloads through the API memory space.
 
 ### 3.4 Compute: Cloud Run Services vs. Cloud Run Jobs
@@ -168,36 +180,49 @@ The architecture deliberately selects the smallest set of managed services that 
 ### 3.5 Deployment: GitHub Actions & Firebase App Hosting
 
 1. **GitHub Actions CI/CD:**
-   - Runs on every push and pull request targeting `main` with minimal permissions (`contents: read` for tests; OIDC Workload Identity Federation for deployments—never long-lived service account JSON keys).
-   - Executes unit tests, adapter contract tests, schema validation, linting, and container builds.
-   - Deploys `core-api`, `ingestion-worker`, Firestore indexes (`firestore.indexes.json`), and security rules (`firestore.rules`, `storage.rules`) to DEV automatically on merge to `main`, and to PROD via environment approval gates.
-2. **Firebase App Hosting:**
-   - Builds and hosts the Next.js web application using `apphosting.yaml` (`runConfig` for CPU, memory, concurrency, and `minInstances`/`maxInstances`, plus Secret Manager bindings for runtime secrets).
-   - Integrates directly with GitHub branches (`main` for DEV preview/staging, release tags or production branch for PROD) with managed CDN caching and SSR on Cloud Run under the hood.
+   - Currently runs offline tests and syntax/policy checks on every push and pull request targeting `main` with minimal permissions (`contents: read`).
+   - Once cloud environments are approved and provisioned in a later milestone, deployment workflows will use OIDC Workload Identity Federation (never long-lived service account JSON keys) to deploy `core-api`, `ingestion-worker`, Firestore indexes (`firestore.indexes.json`), and security rules (`firestore.rules`, `storage.rules`).
+2. **Firebase App Hosting (Requires Blaze Plan — Provisioning Gated):**
+   - Intended to build and host the Next.js web application using `apphosting.yaml` (`runConfig` for CPU, memory, concurrency, and `minInstances`/`maxInstances`, plus Secret Manager bindings for runtime secrets).
+   - **Billing & Cost Prerequisite:** Firebase App Hosting requires upgrading a Firebase project to the **Blaze (pay-as-you-go) plan** because it provisions managed Cloud Build, Cloud Run, and Artifact Registry resources under the hood. Consequently, App Hosting **must not** be enabled until billing budgets, hard `maxInstances` caps, CDN cache policies, and abuse rate limits are configured and approved.
 
-### 3.6 Replaceable AI Model & Retrieval Layer
+### 3.6 Replaceable AI Model & Configurable Embedding Strategy
 
-To prevent vendor lock-in and support model upgrades or local evaluation:
+To prevent vendor lock-in, handle model deprecations safely, and support empirical model evaluation:
 
-- All LLM and embedding calls are isolated behind two internal Python/TypeScript protocol interfaces:
+- All LLM and embedding calls are isolated behind two configurable protocol interfaces:
   - `LanguageModelProvider`: `generate_structured(prompt, schema, temperature, system_instruction) -> StructuredOutput` and `stream_grounded_answer(query, evidence_bundle) -> AsyncIterator[AnswerChunk]`.
-  - `EmbeddingProvider`: `embed_documents(texts, task_type="RETRIEVAL_DOCUMENT") -> list[Vector]` and `embed_query(text, task_type="RETRIEVAL_QUERY") -> Vector` (standardized at 768 dimensions using `text-embedding-004` / Gemini embedding models, well within Firestore's 2,048-dimension limit).
-- Every generated artifact records `model_provider`, `model_id`, `model_version`, `prompt_template_version`, and `embedding_dimension` in its provenance metadata so embeddings or syntheses can be selectively re-indexed when models change.
+  - `EmbeddingProvider`: `embed_documents(texts, task_type="RETRIEVAL_DOCUMENT") -> list[Vector]` and `embed_query(text, task_type="RETRIEVAL_QUERY") -> Vector`.
+- **No Hardcoded or Deprecated Embedding Model:** Retired models (such as the shut-down `text-embedding-004`) must not be used. The embedding provider, model identifier, and output dimensionality are runtime-configurable parameters selected via an offline retrieval benchmark prior to Stage 5 indexing.
+- **Dimensionality Policy:** Firestore's `2,048`-dimension limit is treated strictly as the **maximum platform ceiling**, not the default dimension. Candidate models (including Matryoshka/MRL-capable models supporting `256`, `512`, `768`, or `1,024` dimensions) will be benchmarked on math/AI retrieval recall@K, latency, and storage footprint to select the smallest effective dimension.
+- **Mandatory Embedding Provenance Fields:** Every embedded chunk and query records:
+  - `embedding_provider` (e.g., configurable provider slug),
+  - `embedding_model_id` (active model identifier),
+  - `embedding_model_version` (pinned version or checkpoint identifier),
+  - `embedding_dimension` (integer $D \le 2048$), and
+  - `embedding_space_version` (e.g., `emb_v1`, binding `{provider, model_id, model_version, dimension, normalization}`).
+- **Re-Embedding & Index Migration:** Because vectors from different models or dimensions occupy incompatible vector spaces, changing the embedding model or dimension requires incrementing `embedding_space_version`, running a background re-embedding job in `ingestion-worker`, building the corresponding Firestore composite vector index, and atomically switching `core-api` queries to the new `embedding_space_version` before retiring old vectors (detailed in [`data-model.md`](./data-model.md)).
 
-### 3.7 What Is Explicitly Deferred
+### 3.7 What Is Explicitly Deferred (Initial Scaling Hypotheses)
 
-| Deferred Component | Reason for Deferral | Quantitative Trigger to Introduce |
+> [!NOTE]
+> The collection counts and latency numbers below are **initial architectural hypotheses** intended to prevent premature infrastructure complexity in Release 1—not universal scaling facts. They must be validated empirically using real workload telemetry and retrieval benchmarks once the system is running.
+
+| Deferred Component | Reason for Deferral | Initial Hypothesis Trigger to Validate via Measurement |
 | :--- | :--- | :--- |
-| **PostgreSQL (Cloud SQL / AlloyDB)** | Firestore handles document lookups, hierarchical progress, and composite filtering at near-zero idle cost. | Introduce only if multi-join analytical queries, complex transactional reporting, or Firestore document read costs exceed thresholds defined in `docs/architecture/data-model.md`. |
-| **Dedicated Vector DB (Vertex AI Vector Search / Qdrant)** | Firestore native `find_nearest` supports up to 2,048 dimensions and flat kNN queries up to ~100k chunks with low operational overhead. | Introduce when active chunk count exceeds `100,000` vectors or p95 vector query latency exceeds `250 ms`. |
-| **Dedicated Graph DB (Neo4j / Spanner Graph)** | The concept prerequisite graph has `< 5,000` nodes and `< 25,000` edges initially; adjacency lists in Firestore + in-memory DAG caching in `core-api` are faster and simpler. | Introduce only if multi-hop graph traversals (`> 4` hops with dynamic edge weights) cannot be served in `< 50 ms` from cached adjacency lists. |
-| **Remote Multi-User Jupyter Execution Cluster (JupyterHub / Cloud Run Sandbox)** | High security surface area (arbitrary code execution, container escape, network abuse) and compute cost. | Deferred to **Stage 9** after core learning paths, auth, quotas, and network egress controls are verified. |
+| **PostgreSQL (Cloud SQL / AlloyDB)** | Firestore handles document lookups, hierarchical progress, and composite filtering at near-zero idle cost. | Evaluate via measurement if multi-join analytical queries, complex transactional reporting, or measured Firestore read/write costs exceed budget thresholds defined in [`data-model.md`](./data-model.md). |
+| **Dedicated Vector DB (Vertex AI Vector Search / Qdrant)** | Firestore native `find_nearest` supports up to 2,048 dimensions and flat kNN queries for the initial corpus with low operational overhead. | Hypothesis threshold: evaluate when active chunk count approaches `50,000–100,000` vectors or measured p95 `find_nearest` latency exceeds `250 ms` under realistic pre-filters. |
+| **Dedicated Graph DB (Neo4j / Spanner Graph)** | The initial concept prerequisite graph is small (`< 5,000` nodes); adjacency lists in Firestore + in-memory DAG caching in `core-api` are simpler. | Hypothesis threshold: evaluate only if measured multi-hop graph traversals (`> 4` hops) cannot be served in `< 50 ms` from cached adjacency lists. |
+| **Interactive Notebook Execution (Client-Side Pyodide & Remote Kernel Cluster)** | Both client-side WebAssembly (`Pyodide`) and remote multi-user kernel clusters add execution, package-compatibility, and security/support surface area. | **Defer both client-side Pyodide and server-side execution initially.** Start in Stages 6–8 with static rendered notebooks and downloadable `.ipynb` artifacts; introduce interactive execution only in the dedicated **Stage 9 Isolated Lab** milestone. |
 
 ---
 
-## 4. DEV and PROD Environment Separation
+## 4. Target DEV and PROD Environment Separation (Unprovisioned Blueprint)
 
-DEV and PROD are isolated at the **Google Cloud / Firebase Project boundary** to guarantee that development tests, schema migrations, or experimental prompts never pollute production provenance or learner data.
+> [!WARNING]
+> **Target State Only — Not Yet Provisioned:** Neither the `DEV` nor the `PROD` Google Cloud / Firebase project exists today. No project IDs, regions, billing accounts, or service accounts have been created. The diagram and table below specify the target isolation boundary to be provisioned only after explicit architectural and billing approval.
+
+DEV and PROD will be isolated at the **Google Cloud / Firebase Project boundary** to guarantee that development tests, schema migrations, or experimental prompts never pollute production provenance or learner data.
 
 ```mermaid
 flowchart LR
@@ -207,7 +232,7 @@ flowchart LR
         Release["Release Tag / Approved Prod Workflow"]
     end
 
-    subgraph DevProject["GCP / Firebase Project: DEV (<project-prefix>-dev)"]
+    subgraph DevProject["Target DEV Project (Unprovisioned Placeholder)"]
         DevAppHost["Firebase App Hosting (DEV)"]
         DevAPI["Cloud Run: core-api (DEV)"]
         DevJob["Cloud Run Job: ingestion-worker (DEV)"]
@@ -215,7 +240,7 @@ flowchart LR
         DevGCS[("Cloud Storage (DEV)")]
     end
 
-    subgraph ProdProject["GCP / Firebase Project: PROD (<project-prefix>-prod)"]
+    subgraph ProdProject["Target PROD Project (Unprovisioned Placeholder)"]
         ProdAppHost["Firebase App Hosting (PROD)"]
         ProdAPI["Cloud Run: core-api (PROD)"]
         ProdJob["Cloud Run Job: ingestion-worker (PROD)"]
@@ -224,16 +249,17 @@ flowchart LR
     end
 
     PR -->|Offline Tests & Schema Checks| GitHub
-    Main -->|OIDC Deploy (Auto)| DevProject
-    Release -->|Manual Approval + OIDC Deploy| ProdProject
+    Main -.->|Future Gated OIDC Deploy| DevProject
+    Release -.->|Future Approval + OIDC Deploy| ProdProject
 ```
 
-### 4.1 Environment Configuration Matrix
+### 4.1 Target Environment Configuration Matrix (Pre-Provisioning Blueprint)
 
-| Dimension | Local Development | DEV Environment (`<prefix>-dev`) | PROD Environment (`<prefix>-prod`) |
+| Dimension | Local Development (Active Now) | Target DEV Environment (Unprovisioned) | Target PROD Environment (Unprovisioned) |
 | :--- | :--- | :--- | :--- |
-| **GCP / Firebase Project** | Local Firebase Emulator Suite + SQLite dry-run | Dedicated DEV project | Dedicated PROD project |
-| **Service Accounts** | Local developer ADC (read-only or emulator) | `sa-api-dev`, `sa-worker-dev`, `sa-cicd-dev` | `sa-api-prod`, `sa-worker-prod`, `sa-cicd-prod` |
+| **GCP / Firebase Project** | Local Firebase Emulator Suite + SQLite dry-run | Not yet created (requires approval gate) | Not yet created (requires approval gate) |
+| **Region & Billing** | Local only (`$0` cloud spend) | Unassigned; Blaze plan required only when App Hosting is approved | Unassigned; Blaze plan + hard budget alerts required before enabling |
+| **Service Accounts** | Local developer ADC / emulator | Target: dedicated least-privilege runtime & CI identities | Target: dedicated least-privilege runtime & CI identities |
 | **Secrets Management** | `.env.local` (git-ignored) | Secret Manager (DEV project scope) | Secret Manager (PROD project scope, rotation enforced) |
 | **Cloud Run `minInstances`** | N/A | `0` (scale to zero to minimize cost) | `0` initially; `1` for `core-api` when active daily learners > 100 |
 | **Cloud Run `maxInstances`** | N/A | `3` (strict cost cap) | `10` (with budget alerts) |

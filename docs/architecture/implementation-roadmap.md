@@ -3,16 +3,28 @@
 | Metadata | Value |
 | :--- | :--- |
 | **Document ID** | `ARCH-ROADMAP-006` |
-| **Version** | `1.0.0` |
-| **Last Updated** | `2026-10-21` |
+| **Version** | `1.1.0` |
+| **Last Updated** | `2026-10-22` |
 | **Status** | `Proposed (For Architectural Review)` |
 | **Companion Docs** | [`system-overview.md`](./system-overview.md), [`0001-cloud-architecture.md`](./decisions/0001-cloud-architecture.md), [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0004-notebook-isolation.md`](./decisions/0004-notebook-isolation.md) |
 
 ---
 
+## 0. Current Cloud Infrastructure Status & Approval-Gated Provisioning Policy
+
+> [!IMPORTANT]
+> **Unprovisioned Cloud Infrastructure Status**:
+> - **No Firebase or Google Cloud projects have been created for this product.**
+> - **Project IDs, regions, billing configuration, APIs, and `DEV`/`PROD` environments are not yet established.** Placeholders such as `${GCP_PROJECT_ID_DEV}` and `${GCP_PROJECT_ID_PROD}` are parameterized templates for future use, not active cloud resources.
+> - **Pull Request #1 (`docs/task-002-system-architecture`) does not—and must not—create projects, enable billing, enable cloud APIs/services, deploy resources, or commit environment credentials.**
+> - **Cloud provisioning is a separate, explicit approval-gated milestone** (required before Stage 7 cloud deployment).
+> - **Blaze Plan & Cost Controls**: Because **Firebase App Hosting requires the Google Cloud Blaze (pay-as-you-go) billing plan**, explicit cost controls, Cloud Billing budget alerts, Cloud Run `max-instances` caps, and per-user/project LLM token circuit breakers must be reviewed and approved before enabling billing or provisioning cloud infrastructure.
+
+---
+
 ## 1. Staged Implementation Sequence Overview
 
-The implementation of the AI Research & Learning System is organized into **nine sequential stages**. No stage may advance to production without passing its measurable completion checks and automated CI gates.
+The implementation of the AI Research & Learning System is organized into **nine sequential stages**, plus an explicit **Approval-Gated Cloud Provisioning Milestone** prior to Stage 7 cloud deployment. Stages 1 through 6 can be developed and verified locally using offline test suites and the local Firebase Emulator Suite before any cloud project is created. No stage may advance without passing its measurable completion checks and automated CI gates.
 
 ```mermaid
 flowchart TD
@@ -107,16 +119,19 @@ flowchart TD
 ### Stage 5 — Source-Grounded Search and AI Tutoring
 - **Dependencies**: Stages 3 and 4.
 - **Scope**:
-  - Implement the replaceable `ModelProvider` and `VectorIndex` abstractions (`768`-dimension embeddings in Firestore `knowledge_chunks` using `find_nearest`).
-  - Implement hybrid search (`POST /api/v1/search`) and the source-grounded AI Tutor (`POST /api/v1/tutor/ask`) powered by `WF-03-ANALYSIS`.
-  - Enforce deterministic citation verification (`G-01`), quote-span verification (`G-02`), and epistemic status tagging (`ESTABLISHED_EVIDENCE`, `AUTHOR_OPINION`, `PRELIMINARY_RESEARCH`, `GENERATED_INTERPRETATION`).
+  - Execute a **benchmark-based embedding model selection step**: evaluate active candidate embedding models on a representative AI/math retrieval benchmark before locking the initial `embedding_space_version`, rather than hardcoding a fixed model or dimension (`text-embedding-004` is excluded as deprecated/shut down).
+  - Implement the replaceable `ModelProvider` and `VectorIndex` abstractions in `core-api`, keeping the embedding provider, model identifier, model version, vector dimension (up to Firestore's documented maximum of `2,048` dimensions; not a default), and `embedding_space_version` configurable and recorded on every `KnowledgeChunk` and `AgentRun`.
+  - Implement the re-embedding and vector index migration workflow for future embedding model upgrades (`embedding_space_version` bump, dual-version backfill, composite vector index creation, and cutover).
+  - Implement hybrid search (`POST /api/v1/search`) and the source-grounded AI Tutor (`POST /api/v1/tutor/ask`) powered by `WF-03-ANALYSIS`, requiring an identified principal, abuse controls, and quotas.
+  - Enforce deterministic citation verification (`G-01`), quote-span and license/excerpt permission verification (`G-02` / `G-03`, where `permits_verbatim_excerpts == false` or `legal_uncertainty_status == 'UNVERIFIED_REQUIRES_HUMAN_REVIEW'` blocks verbatim quotes), and epistemic status tagging (`ESTABLISHED_EVIDENCE`, `AUTHOR_OPINION`, `PRELIMINARY_RESEARCH`, `GENERATED_INTERPRETATION`).
 - **Acceptance Criteria**:
-  - Every tutor response includes structured `claims[]` and `citations[]` pointing to active `ResourceVersion` locators.
-  - Any claim with a fabricated citation ID or unverified quote is deterministically rejected (`ERR_GROUNDING_UNVERIFIED_CITATION`).
+  - Every `KnowledgeChunk` records `embedding_provider`, `embedding_model_id`, `embedding_model_version`, `embedding_dimension`, and `embedding_space_version`.
+  - Every tutor response includes structured `claims[]` and `citations[]` pointing to active `ResourceVersion` locators, and suppresses `quoted_span` whenever `permits_verbatim_excerpts == false`.
+  - Any claim with a fabricated citation ID or unverified/unpermitted quote is deterministically rejected (`ERR_GROUNDING_UNVERIFIED_CITATION`).
 - **Key Risks & Mitigations**:
-  - *Risk*: LLM hallucinating citations or conflating generated analogies with primary theorems. *Mitigation*: Post-generation deterministic verifier (`G-01`, `G-02`, `G-04`) rejects unverified claims before the response leaves `core-api`.
+  - *Risk*: LLM hallucinating citations, conflating generated analogies with primary theorems, or upstream embedding model deprecation. *Mitigation*: Post-generation deterministic verifier (`G-01`, `G-02`, `G-03`, `G-04`) and configurable `embedding_space_version` re-embedding pipeline.
 - **Measurable Completion Checks**:
-  - `100%` citation resolution rate (`citation_precision == 1.0`) and `>= 0.90` groundedness score across the golden evaluation benchmark suite.
+  - `100%` citation resolution rate (`citation_precision == 1.0`), `0` unpermitted verbatim quotes, and `>= 0.90` groundedness score across the golden evaluation benchmark suite.
 
 ---
 
@@ -124,7 +139,7 @@ flowchart TD
 - **Dependencies**: Stage 5.
 - **Scope**:
   - Implement `WF-04-LEARNING-PATH` (topological prerequisite sorting from foundational mathematics to deep learning and research) and `WF-05-EVALUATION` (exercise grading, misconception diagnosis, and source-grounded remediation).
-  - Implement `NotebookArtifact` (`nb_...`) and `ExperimentResult` (`exp_...`) metadata cataloging and static `.ipynb` validation (`nbformat`).
+  - Implement `NotebookArtifact` (`nb_...`) and `ExperimentResult` (`exp_...`) metadata cataloging and static `.ipynb` validation (`nbformat`). Client-side `Pyodide` execution is deferred; Stages 6–8 provide static rendered notebooks and downloadable `.ipynb` artifacts.
 - **Acceptance Criteria**:
   - Generated learning paths satisfy topological ordering across all `REQUIRES` edges (`prerequisite_violation_count == 0`).
   - Learner assessment evaluations cite specific source passages for every remediation tip.
@@ -135,11 +150,12 @@ flowchart TD
 
 ---
 
-### Stage 7 — Web Application and Cloud Deployment
-- **Dependencies**: Stage 6.
+### Stage 7 — Web Application and Approval-Gated Cloud Deployment
+- **Dependencies**: Stage 6 **AND explicit human approval of the Cloud Provisioning & Cost-Control Milestone** (creating `DEV`/`PROD` projects, configuring Blaze billing budgets and hard quotas, selecting regions, and enabling required APIs).
 - **Scope**:
-  - Build the Next.js responsive web application (`Next.js App Router`) with Concept Graph Explorer, Resource & Transcript Reader (with timestamp synchronization), Source-Cited AI Tutor UI (showing distinct Source Evidence Cards and epistemic badges), and Static Notebook Viewer.
-  - Configure containerized deployment of `core-api` (Cloud Run Service), `ingestion-worker` (Cloud Run Job), and Next.js frontend (Firebase App Hosting via `apphosting.yaml`) across isolated `DEV` and `PROD` environments using GitHub Actions and Workload Identity Federation (WIF).
+  - Build the Next.js responsive web application (`Next.js App Router`) with Concept Graph Explorer, Resource & Transcript Reader (with timestamp synchronization), Source-Cited AI Tutor UI (showing distinct Source Evidence Cards and epistemic badges), and Static Notebook Viewer with downloadable `.ipynb` artifacts (client-side `Pyodide` execution remains deferred).
+  - Enforce endpoint authentication policies: read-only catalog access may be unauthenticated only if the catalog is deliberately published; user progress and protected endpoints require authentication; AI tutor endpoints require an identified principal, abuse controls, and quotas (Firebase Anonymous Auth may be used for low-friction testing after infrastructure exists, but must never bypass cost controls).
+  - After cloud provisioning approval, configure containerized deployment of `core-api` (Cloud Run Service), `ingestion-worker` (Cloud Run Job), and Next.js frontend (Firebase App Hosting via `apphosting.yaml`) across isolated `DEV` and `PROD` environments using GitHub Actions and Workload Identity Federation (WIF).
 - **Acceptance Criteria**:
   - End-to-end user journey works in `DEV` and `PROD` with Firebase Auth, rate limiting, structured logging, and budget alerts active.
   - Original source quotes and attribution banners are visually separated from AI-generated explanations on all screens.
@@ -180,12 +196,12 @@ flowchart TD
 
 ---
 
-## 3. Cloud Environment, Identity, CI/CD, Monitoring, Quotas, and Cost Controls
+## 3. Target Cloud Environment, Identity, CI/CD, Monitoring, Quotas, and Cost Controls (Post-Provisioning)
 
-### 3.1 DEV and PROD Cloud Project Separation
-No cloud project IDs are hardcoded in source files. All deployment manifests parameterize the project via `${GCP_PROJECT_ID}`:
-- **`DEV` Project (`${GCP_PROJECT_ID_DEV}`)**: Used for integration testing, staging previews on pull requests, and dry-run ingestion of small resource batches. Uses lower quotas and stricter instance caps (`max-instances = 2`).
-- **`PROD` Project (`${GCP_PROJECT_ID_PROD}`)**: Used exclusively for serving verified canonical knowledge to learners. Deployed only from tagged releases or merges to `main` after CI verification and human approval gates.
+### 3.1 Target DEV and PROD Cloud Project Separation (Unprovisioned Blueprint)
+No Firebase or Google Cloud projects exist today, and no cloud project IDs, regions, billing accounts, or APIs have been established. When the approval-gated cloud provisioning milestone is authorized, all deployment manifests will parameterize the target project via `${GCP_PROJECT_ID}`:
+- **`DEV` Project (`${GCP_PROJECT_ID_DEV}`, unprovisioned template)**: Target environment for integration testing, staging previews on pull requests, and dry-run ingestion of small resource batches. Uses lower quotas and stricter instance caps (`max-instances = 2`).
+- **`PROD` Project (`${GCP_PROJECT_ID_PROD}`, unprovisioned template)**: Target environment for serving verified canonical knowledge to learners. Deployed only from tagged releases or merges to `main` after CI verification and human approval gates.
 
 ### 3.2 Identity Boundaries & Least-Privilege IAM
 

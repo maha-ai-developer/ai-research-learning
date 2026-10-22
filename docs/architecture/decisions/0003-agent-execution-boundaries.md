@@ -3,7 +3,7 @@
 | Metadata | Value |
 | :--- | :--- |
 | **ADR ID** | `ADR-0003` |
-| **Date** | `2026-10-21` |
+| **Date** | `2026-10-22` |
 | **Status** | `Proposed` |
 | **Related Docs** | [`agent-workflows.md`](../agent-workflows.md), [`data-model.md`](../data-model.md) |
 
@@ -34,8 +34,8 @@ An AI research and learning system faces three acute reliability and governance 
 3. **Deterministic Post-Generation Verification Gates (`G-01` through `G-05`)**:
    - Before any agent output is persisted or returned to a learner, deterministic Python validators (not an LLM judge alone) verify:
      - **`G-01` Citation Resolution**: Every `citation_id` resolves to an existing, active `ResourceVersion` and `KnowledgeChunk` retrieved during that specific `AgentRun` (`run_...`).
-     - **`G-02` Quote-Span Verification**: Every `quoted_span` matches the normalized substring in the source chunk (`>= 0.95` token overlap) and valid page/timestamp locator bounds.
-     - **`G-03` License & Redistribution Gate**: Blocks storage or display of full text when `redistribution_allowed == false`.
+     - **`G-02` Quote-Span & Excerpt Permission Verification**: Every non-null `quoted_span` is permitted **only** when the source `ResourceVersion` has `permits_verbatim_excerpts == true` and `legal_uncertainty_status != 'UNVERIFIED_REQUIRES_HUMAN_REVIEW'`, and matches the normalized substring in the source chunk (`>= 0.95` token overlap) with valid page/timestamp locator bounds. There is no automatic character-length "fair use" exemption; when `permits_verbatim_excerpts == false`, `quoted_span` must be `null` and the citation relies on metadata, page/timestamp locators, and outbound source links.
+     - **`G-03` License, Redistribution & Legal Uncertainty Gate**: Blocks storage or display of full text, media, or verbatim excerpts unless an open license or explicit permission has been verified, and flags any `UNVERIFIED_REQUIRES_HUMAN_REVIEW` resource for human review rather than guessing copyright status automatically.
      - **`G-04` Epistemic Consistency Gate**: Enforces epistemic downgrade rules.
      - **`G-05` DAG Cycle & Prerequisite Gate**: Rejects any concept relation or learning path with cycle or topological order violations.
 4. **Human-in-the-Loop (HITL) Approval for Canonical Curriculum Changes**:

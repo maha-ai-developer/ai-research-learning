@@ -2,7 +2,7 @@
 
 **Document ID:** `ARCH-DATA-002`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-21  
+**Last Updated:** 2026-10-22  
 **Related ADR:** `docs/architecture/decisions/0002-knowledge-data-model.md`
 
 ---
@@ -97,14 +97,16 @@ Represents an authoritative external provider and its technical/legal ingestion 
     "min_enforced_delay_seconds": 1.0,
     "max_requests_per_run": 25,
     "last_policy_check_at": "2026-10-20T00:48:38Z",
-    "policy_snapshot_gcs_uri": "gs://ai-research-audit-dev/policies/SRC-HINTON/2026-10-20T004838Z-robots.txt"
+    "policy_snapshot_gcs_uri": "gs://<unprovisioned-audit-bucket>/policies/SRC-HINTON/2026-10-20T004838Z-robots.txt"
   },
   "default_rights": {
     "copyright_holder": "Geoffrey Hinton / respective publishers",
     "default_license_status": "ALL_RIGHTS_RESERVED_METADATA_ONLY",
     "permits_metadata_indexing": true,
     "permits_full_text_storage": false,
+    "permits_verbatim_excerpts": false,
     "permits_media_rehosting": false,
+    "legal_uncertainty_status": "REQUIRES_EXPLICIT_LICENSE_OR_PERMISSION",
     "attribution_template": "Geoffrey Hinton, University of Toronto ({canonical_url})"
   },
   "status": "ACTIVE",
@@ -156,7 +158,8 @@ Unifies papers, articles, 3Blue1Brown educational lessons, videos, lectures, int
     "permits_full_text_storage": false,
     "permits_verbatim_excerpts": false,
     "permits_transcript_storage": false,
-    "rights_notes": "Blog text copyright Yoshua Bengio; retain metadata and outbound arXiv links only unless explicit reuse permission is recorded."
+    "legal_uncertainty_status": "UNVERIFIED_REUSE_RIGHTS_DEFAULT_CLOSED",
+    "rights_notes": "Blog text copyright Yoshua Bengio; retain metadata and outbound arXiv links only unless explicit reuse permission or open license is verified."
   },
   "storage_policy": {
     "text_storage_status": "metadata-only",
@@ -172,7 +175,7 @@ Unifies papers, articles, 3Blue1Brown educational lessons, videos, lectures, int
 
 ### 4.3 Transcripts and Timestamped Segments (`transcripts/{transcript_id}` & `segments/{segment_id}`)
 
-Stores only transcripts whose acquisition method and license are explicitly authorized (e.g., CC-licensed captions, official open transcripts, or first-party lesson markdown from 3Blue1Brown where permitted).
+Stores transcript text **only** when the acquisition method and license/permission are explicitly verified (e.g., CC-licensed captions or explicit written rights-holder permission). When full transcript reuse is not licensed, the record stores timestamped concept index points and AI-generated segment summaries with `permits_verbatim_excerpts: false` and `verbatim_excerpt: null`.
 
 ```json
 {
@@ -180,10 +183,10 @@ Stores only transcripts whose acquisition method and license are explicitly auth
   "resource_id": "res_3b1b_backprop_0001",
   "source_id": "SRC-3B1B",
   "language": "en",
-  "acquisition_method": "OFFICIAL_CAPTION_TRACK_OR_PUBLIC_LESSON_SOURCE",
-  "authorization_basis": "Official 3Blue1Brown lesson caption metadata / linked educational text; full video remains hosted at canonical source.",
-  "permits_snippet_display": true,
-  "max_snippet_chars": 400,
+  "acquisition_method": "TIMESTAMP_CONCEPT_INDEX_ONLY",
+  "authorization_basis": "3Blue1Brown lesson narratives and videos are copyright 3Blue1Brown LLC (All Rights Reserved); only timestamp locators, concept tags, and AI-generated summaries are stored unless explicit reuse permission is verified.",
+  "permits_verbatim_excerpts": false,
+  "max_permitted_excerpt_chars": 0,
   "duration_seconds": 812,
   "segment_count": 48,
   "full_transcript_gcs_uri": null,
@@ -269,11 +272,11 @@ Every significant statement surfaced in research comparisons or concept synthesi
 }
 ```
 
-Representative `knowledge_chunks/{chunk_id}` document for Firestore vector retrieval:
+Representative `knowledge_chunks/{chunk_id}` document for Firestore vector retrieval (embedding provider, model ID, model version, dimension, and embedding-space version are recorded alongside every vector):
 
 ```json
 {
-  "chunk_id": "chk_ver_20261021_arxiv210604399_0001",
+  "chunk_id": "chk_ver_20261021_arxiv210604399_0001_emb_v1",
   "resource_id": "res_arxiv_2106_04399",
   "version_id": "ver_20261021_a88b99c0",
   "source_id": "SRC-ARXIV",
@@ -286,11 +289,22 @@ Representative `knowledge_chunks/{chunk_id}` document for Firestore vector retri
     "page": 1,
     "start_ms": null
   },
-  "embedding_model": "text-embedding-004",
-  "embedding_dimension": 768,
-  "embedding": [0.0142, -0.0318, 0.0091, "... (768 float values total)"]
+  "embedding_provider": "configurable-provider",
+  "embedding_model_id": "<configured-embedding-model-id>",
+  "embedding_model_version": "2026-01",
+  "embedding_dimension": 512,
+  "embedding_space_version": "emb_v1",
+  "is_current_embedding_space": true,
+  "embedding": [0.0142, -0.0318, 0.0091, "... (D float values matching embedding_dimension)"]
 }
 ```
+
+> [!IMPORTANT]
+> **Embedding Strategy & Model Lifecycle Rules:**
+> 1. **No Retired Models:** Shut-down models (such as `text-embedding-004`) must not be selected or hardcoded.
+> 2. **Configurable Provider, Model, and Dimensionality:** `embedding_provider`, `embedding_model_id`, `embedding_model_version`, `embedding_dimension`, and `embedding_space_version` are runtime-configurable parameters stored on every `knowledge_chunks` document and recorded on every `agent_runs` retrieval trace.
+> 3. **2,048 Is Firestore's Maximum Ceiling, Not the Default:** Firestore native vector search (`find_nearest`) supports a documented maximum of `2,048` dimensions. The system does **not** default to `2,048` (nor hardcode `768`). Instead, dimensionality $D \le 2048$ (e.g., `256`, `512`, `768`, or `1,024` via Matryoshka Representation Learning / configurable output dimensions) is chosen through the Stage 5 benchmark step.
+> 4. **Benchmark-Based Model Selection Step:** Before building the production `knowledge_chunks` index in Stage 5, candidate embedding models and output dimensions are evaluated offline against a curated math-and-AI retrieval benchmark (`nDCG@10`, `Recall@10` on symbol-heavy LaTeX definitions and cross-source queries, query embedding latency, and document storage/index cost).
 
 ### 4.6 Learning Paths, Exercises, Assessments, and Learner Progress
 
@@ -360,9 +374,13 @@ Learner progress document (`users/{uid}/progress/{concept_id}`):
   },
   "retrieval_evidence_summary": {
     "query_text": "How do Hinton's Boltzmann machines relate to energy functions?",
+    "embedding_space_version": "emb_v1",
+    "embedding_model_id": "<configured-embedding-model-id>",
+    "embedding_model_version": "2026-01",
+    "embedding_dimension": 512,
     "retrieved_chunk_ids": [
-      "chk_ver_20261020_hinton_bm_0001",
-      "chk_ver_20261020_wiki_bm_0002"
+      "chk_ver_20261020_hinton_bm_0001_emb_v1",
+      "chk_ver_20261020_wiki_bm_0002_emb_v1"
     ],
     "citation_validation_passed": true
   },
@@ -379,7 +397,7 @@ Learner progress document (`users/{uid}/progress/{concept_id}`):
   "concept_ids": ["cpt_chain_rule", "cpt_backpropagation"],
   "source_citations": ["cit_01JATM9K2P8X4R"],
   "license_spdx": "MIT",
-  "template_gcs_uri": "gs://ai-research-notebooks-prod/nb_micrograd_backprop_v1/template.ipynb",
+  "template_gcs_uri": "gs://<unprovisioned-notebooks-bucket>/nb_micrograd_backprop_v1/template.ipynb",
   "template_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "runtime_requirements": {
     "python_version": "3.12",
@@ -387,7 +405,7 @@ Learner progress document (`users/{uid}/progress/{concept_id}`):
     "requires_gpu": false,
     "network_egress_policy": "DENY_ALL"
   },
-  "execution_mode_supported": ["LOCAL_DOWNLOAD", "STAGE_9_SANDBOX_DISABLED"]
+  "execution_mode_supported": ["STATIC_RENDER_ONLY", "LOCAL_DOWNLOAD"]
 }
 ```
 
@@ -400,14 +418,14 @@ Learner progress document (`users/{uid}/progress/{concept_id}`):
 | Source registry, seed URLs, & policy summary | **Yes** (`sources`, `seeds`) | **Yes** (raw `robots.txt` & sitemap XML in `audit/`) | Fast runtime policy lookup in Firestore; immutable legal/compliance evidence in GCS. |
 | Canonical resource metadata & version descriptors | **Yes** (`resources`, `versions`) | Optional (raw API XML/JSON or CC-licensed HTML in `artifacts/`) | Keeps Firestore documents well below 1 MiB (`~2–10 KB` each) for low-latency filtering. |
 | Unlicensed full-text HTML, PDFs, slides, videos | **No** | **No** | Strictly prohibited by project reuse policy; only canonical URLs and metadata are stored. |
-| Authorized transcripts & segment timestamps | **Yes** (segment metadata & short permitted snippets in `transcripts/*/segments`) | **Yes** (complete `.vtt`/`.json` caption file if redistribution/storage is licensed) | Enables timestamp range and concept queries in Firestore without loading multi-megabyte files. |
-| Permitted text chunks + vector embeddings | **Yes** (`knowledge_chunks` with `768`-dim vector) | **No** | Firestore native `find_nearest` requires vector fields inside Firestore documents. |
+| Authorized transcripts & segment timestamps | **Yes** (segment metadata & licensed excerpts in `transcripts/*/segments`) | **Yes** (complete `.vtt`/`.json` caption file only if redistribution/storage is licensed) | Enables timestamp range and concept queries in Firestore without loading multi-megabyte files. |
+| Permitted text chunks + vector embeddings | **Yes** (`knowledge_chunks` with configurable $D$-dim vector, $D \le 2048$) | **No** | Firestore native `find_nearest` requires vector fields inside Firestore documents. |
 | Concept prerequisite graph (`concepts`, `concept_relations`) | **Yes** | **No** | Small document footprint (`< 5 KB`/concept); queried by ID and cached as an in-memory DAG by `core-api`. |
 | Notebook `.ipynb` files & execution output plots | Metadata only (`notebooks`, `experiments`) | **Yes** (`notebooks/` and `experiments/` buckets) | `.ipynb` JSON with embedded plots easily exceeds 1 MiB and is served via signed URLs. |
 
 ---
 
-## 6. Indexing, Deduplication, Versioning, Deletion, and Source Updates
+## 6. Indexing, Deduplication, Versioning, Re-Embedding, Deletion, and Source Updates
 
 ### 6.1 Firestore Composite & Vector Indexes (`firestore.indexes.json`)
 
@@ -416,7 +434,7 @@ Learner progress document (`users/{uid}/progress/{concept_id}`):
    - `(ai_enrichment.concept_ids ARRAY_CONTAINS, lifecycle_state ASC, published_at DESC)` — Resources teaching or researching a concept.
    - `(external_identifiers.arxiv_id ASC)` — Cross-source deduplication against arXiv preprints.
 2. **`knowledge_chunks` Vector Index:**
-   - Composite vector index on `(source_id ASC, embedding VECTOR<768, FLAT>)` and `(concept_ids ARRAY_CONTAINS, embedding VECTOR<768, FLAT>)` supporting `COSINE` distance queries via `find_nearest`.
+   - Composite vector index on `(embedding_space_version ASC, source_id ASC, embedding VECTOR<D, FLAT>)` and `(embedding_space_version ASC, concept_ids ARRAY_CONTAINS, embedding VECTOR<D, FLAT>)` supporting `COSINE` distance queries via `find_nearest`, where $D$ is the benchmark-selected dimension ($D \le 2048$, Firestore's maximum supported vector dimension).
 3. **`transcript_segments` Composite Index:**
    - `(resource_id ASC, start_ms ASC)` — Ordered timeline playback navigation.
 
@@ -431,29 +449,39 @@ Learner progress document (`users/{uid}/progress/{concept_id}`):
 2. If neither hash has changed since `current_version_id`, only `last_verified_at` and a lightweight `provenance_events` heartbeat are updated—no new `ResourceVersion` or re-embedding is triggered.
 3. If `metadata_hash` or `content_hash` changes:
    - A new immutable `resources/{resource_id}/versions/{new_version_id}` document is created.
-   - New `knowledge_chunks` are generated for `{new_version_id}`; once committed, `current_version_id` on `resources/{resource_id}` is atomically updated in a Firestore transaction and superseded chunks are marked `is_current = false` (and pruned after 30 days).
+   - New `knowledge_chunks` are generated for `{new_version_id}` under the active `embedding_space_version`; once committed, `current_version_id` on `resources/{resource_id}` is atomically updated in a Firestore transaction and superseded chunks are marked `is_current = false` (and pruned after 30 days).
 
-### 6.4 Deletion, Takedown, and Right-to-Erasure
+### 6.4 Embedding Model Changes, Re-Embedding, and Vector Index Migration
 
-1. **Source Policy Revocation or Takedown:** If a source changes `robots.txt` to `Disallow` or an author requests removal, `resources/{resource_id}.lifecycle_state` is set to `"WITHDRAWN_BY_POLICY"`, all associated `knowledge_chunks` and `transcript_segments` are purged immediately, and GCS snapshots in `artifacts/` are deleted while preserving a redacted compliance tombstone in `provenance_events`.
-2. **Learner Account Deletion:** Deleting a user in Firebase Authentication triggers a cleanup routine that deletes `users/{uid}` and all subcollections (`progress`, `assessment_attempts`, `experiments`) plus `gs://<env>-ai-research-experiments/{uid}/*` within 24 hours.
+Because vector embeddings produced by different models, model versions, or dimensionalities occupy incompatible geometric spaces, **query vectors and document vectors must never be mixed across different `embedding_space_version` identifiers**. Any change to `embedding_provider`, `embedding_model_id`, `embedding_model_version`, or `embedding_dimension` executes the following four-step zero-downtime migration:
+
+1. **Register New Embedding Space Version:** Define a new `embedding_space_version` (e.g., `emb_v2`) in configuration with its target `{embedding_provider, embedding_model_id, embedding_model_version, embedding_dimension}`.
+2. **Provision Composite Vector Index:** If `embedding_dimension` changed (e.g., from $D_1$ to $D_2 \le 2048$), deploy the updated Firestore vector index definition in `firestore.indexes.json` and wait for index state `READY`.
+3. **Backfill / Re-Embed Permitted Chunks:** Run an idempotent batch job in `ingestion-worker` that reads active `ResourceVersion` permitted text/abstracts, computes vectors using the `emb_v2` model, and writes new `knowledge_chunks` documents suffixed with `_emb_v2` (`embedding_space_version = "emb_v2"`).
+4. **Verify Recall & Cut Over Atomically:** Run the offline retrieval evaluation suite against `emb_v2`. Once verified, switch `ACTIVE_EMBEDDING_SPACE_VERSION` in `core-api` from `emb_v1` to `emb_v2` so both query embedding and Firestore `find_nearest` pre-filters (`where("embedding_space_version", "==", "emb_v2")`) cut over together, then purge retired `emb_v1` chunk documents and drop any obsolete vector index.
+
+### 6.5 Deletion, Takedown, and Right-to-Erasure
+
+1. **Source Policy Revocation or Takedown:** If a source changes `robots.txt` to `Disallow` or a rights-holder requests removal, `resources/{resource_id}.lifecycle_state` is set to `"WITHDRAWN_BY_POLICY"`, all associated `knowledge_chunks`, any cached excerpts, and `transcript_segments` are purged immediately, and GCS snapshots in `artifacts/` are deleted while preserving a minimal non-infringing tombstone in `provenance_events` so future crawls do not re-ingest the withdrawn URL.
+2. **Learner Account Deletion:** Deleting a user in Firebase Authentication triggers a cleanup routine that deletes `users/{uid}` and all subcollections (`progress`, `assessment_attempts`, `experiments`) plus `gs://<unprovisioned-experiments-bucket>/{uid}/*` within 24 hours.
 
 ---
 
-## 7. Database Sufficiency Assessment & Migration Triggers
+## 7. Database Sufficiency Assessment & Migration Hypotheses
 
 ### 7.1 Why Cloud Firestore Is Sufficient for Release 1
 
-- **Corpus Scale:** Initial sources (`SRC-HINTON`, `SRC-BENGIO`, `SRC-3B1B`, curated `SRC-ARXIV` papers, and `SRC-WIKIPEDIA` math/AI articles) comprise roughly `1,000–5,000` resources, `< 5,000` concepts, and `15,000–50,000` permitted chunks/segments.
-- **Query Patterns:** Key-value lookups by `resource_id`/`concept_id`, array-contains filtering by `concept_ids`, user-scoped subcollection reads (`users/{uid}/progress`), and pre-filtered kNN vector search (`find_nearest` up to 2,048 dimensions) map natively to Firestore without requiring multi-table SQL joins.
+- **Corpus Scale:** Initial sources (`SRC-HINTON`, `SRC-BENGIO`, `SRC-3B1B`, curated `SRC-ARXIV` papers, and `SRC-WIKIPEDIA` math/AI articles) are projected to comprise roughly `1,000–5,000` resources, `< 5,000` concepts, and `15,000–50,000` permitted chunks/segments.
+- **Query Patterns:** Key-value lookups by `resource_id`/`concept_id`, array-contains filtering by `concept_ids`, user-scoped subcollection reads (`users/{uid}/progress`), and pre-filtered kNN vector search (`find_nearest` up to Firestore's 2,048-dimension maximum) map natively to Firestore without requiring multi-table SQL joins.
 - **Cost & Operations:** Firestore scales to zero when idle, requires no VPC NAT or connection pooling proxies on Cloud Run, and enforces fine-grained security rules.
 
-### 7.2 Quantitative, Evidence-Based Triggers for Additional Databases
+### 7.2 Initial Migration Hypotheses (To Be Validated via Empirical Measurement)
 
-No additional database engine may be provisioned unless at least one of the following measurable triggers is reached and documented in a superseding ADR:
+> [!NOTE]
+> The collection sizes, latency targets, and cost thresholds below are **initial architectural hypotheses**, not universal scaling laws. Actual Firestore vector search latency, read amplification, and cost depend on embedding dimensionality $D$, pre-filter selectivity, and query concurrency. Each hypothesis must be validated using production/staging telemetry and retrieval benchmarks before provisioning any additional database engine.
 
-| Candidate Service | Trigger Condition (Measurable Evidence Required) | Migration Seam in Current Design |
+| Candidate Service | Initial Hypothesis Trigger (Validate with Empirical Measurements) | Migration Seam in Current Design |
 | :--- | :--- | :--- |
-| **Dedicated Vector Search** (Vertex AI Vector Search or Qdrant) | 1. Active `knowledge_chunks` count exceeds **100,000 vectors**, OR<br/>2. Firestore `find_nearest` p95 latency exceeds **250 ms** over a 7-day window, OR<br/>3. Hybrid retrieval requires ANN index tuning (HNSW/ScaNN recall vs. latency) unavailable in Firestore flat vector indexes. | `RetrievalRepository` interface abstracts chunk search; `chunk_id` and `resource_id` remain canonical keys. |
-| **PostgreSQL** (Cloud SQL or AlloyDB with `pgvector`) | 1. Analytical or curriculum-reporting queries require **3+ relational joins** or complex aggregations that cannot be precomputed at write time, OR<br/>2. Firestore document read/write billing exceeds **$150/month** due to high-frequency scan workloads. | Canonical JSON schemas map 1:1 to normalized relational tables (`sources`, `resources`, `resource_versions`, `concepts`, `concept_relations`, `claims`). |
-| **Dedicated Graph Database** (Spanner Graph or Neo4j) | 1. Concept graph exceeds **50,000 nodes** or **250,000 edges**, AND<br/>2. Dynamic multi-hop pathfinding queries (`> 4` hops) exceed **50 ms** p95 when using the in-memory cached adjacency list in `core-api`. | `ConceptGraphService` loads nodes/edges via a repository interface independent of Firestore storage internals. |
+| **Dedicated Vector Search** (Vertex AI Vector Search or Qdrant) | 1. Measured `find_nearest` p95 latency exceeds **250 ms** over a 7-day window under target pre-filters (hypothesized around **50,000–100,000** active vectors depending on dimension $D$), OR<br/>2. Benchmark evaluation shows flat kNN or Firestore pre-filtering limits recall/throughput compared to dedicated ANN (HNSW/ScaNN) indexing. | `RetrievalRepository` interface abstracts chunk search; `chunk_id`, `embedding_space_version`, and `resource_id` remain canonical keys. |
+| **PostgreSQL** (Cloud SQL or AlloyDB with `pgvector`) | 1. Measured analytical or curriculum-reporting workloads require **3+ relational joins** or aggregations that are impractical to precompute at write time, OR<br/>2. Measured Firestore document read/write billing exceeds budget expectations under real traffic. | Canonical JSON schemas map 1:1 to normalized relational tables (`sources`, `resources`, `resource_versions`, `concepts`, `concept_relations`, `claims`). |
+| **Dedicated Graph Database** (Spanner Graph or Neo4j) | 1. Measured multi-hop prerequisite pathfinding queries (`> 4` hops) exceed **50 ms** p95 when using the in-memory cached adjacency list in `core-api` as the concept graph grows. | `ConceptGraphService` loads nodes/edges via a repository interface independent of Firestore storage internals. |

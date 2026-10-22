@@ -3,7 +3,7 @@
 | Metadata | Value |
 | :--- | :--- |
 | **ADR ID** | `ADR-0004` |
-| **Date** | `2026-10-21` |
+| **Date** | `2026-10-22` |
 | **Status** | `Proposed` |
 | **Related Docs** | [`client-and-lab.md`](../client-and-lab.md), [`implementation-roadmap.md`](../implementation-roadmap.md) |
 
@@ -20,11 +20,12 @@ Interactive Jupyter notebooks (`.ipynb`) are central to learning mathematical fo
 
 ## 2. Decision
 
-1. **Strict Separation of Notebook Authoring/Viewing (Stages 6–8) from Code Execution (Stage 9)**:
+1. **Strict Separation of Notebook Authoring/Viewing (Stages 6–8) from Interactive Code Execution (Stage 9), Deferring Client-Side `Pyodide`**:
    - **Never Execute Notebook Code in `core-api`**: `core-api` treats `.ipynb` files strictly as inert JSON documents parsed and validated via `nbformat`.
-   - **Stages 6–8 Delivery Mode**: Curated notebooks (`nb_<slug>_v<N>`) and pre-recorded `ExperimentResult` runs (`exp_<ulid>`) are stored in Cloud Storage (`notebooks/` and `experiments/`), rendered as static read-only cells with interactive plot previews in the Next.js and Flutter clients, and accompanied by one-click `.ipynb` download and external "Open in Google Colab" links.
+   - **Defer Client-Side `Pyodide` Execution**: Client-side in-browser WebAssembly execution (`Pyodide` / `JupyterLite`) is explicitly **deferred**. Stages 6–8 focus strictly on **static rendered notebooks and downloadable `.ipynb` notebook artifacts** (plus pre-recorded `ExperimentResult` telemetry), avoiding premature browser runtime complexity and keeping all interactive code execution consolidated in the Stage 9 isolated lab milestone.
+   - **Stages 6–8 Delivery Mode**: Curated notebooks (`nb_<slug>_v<N>`) and pre-recorded `ExperimentResult` runs (`exp_<ulid>`) are stored in Cloud Storage (`notebooks/` and `experiments/`), rendered as static read-only cells with pre-computed plot previews in the Next.js and Flutter clients, and accompanied by downloadable `.ipynb` artifacts.
 2. **Deferred Stage 9 Isolated Execution Architecture (`lab-execution-gateway`)**:
-   - Cloud-hosted notebook execution is deferred until **Stage 9** and implemented behind a separate service (`lab-execution-gateway`) that dispatches code to **ephemeral, single-tenant gVisor-sandboxed containers** enforcing six mandatory security controls:
+   - Interactive code execution belongs to the **Stage 9 isolated lab milestone** and is implemented behind a separate service (`lab-execution-gateway`) that dispatches code to **ephemeral, single-tenant gVisor-sandboxed containers** enforcing six mandatory security controls:
      1. **Authentication & Quota Gate**: Requires a verified Firebase ID Token (`email_verified == true`) and enforces a strict per-user daily execution quota (e.g., max `30 minutes` compute/day).
      2. **System Call Sandboxing**: Runs under Cloud Run Gen2 / gVisor user-space kernel interception as an unprivileged `nobody` (`UID 65534`) user with a read-only root filesystem and size-bounded `tmpfs` (`/tmp`, max `256 MiB`).
      3. **Zero Cloud IAM Identity**: The sandbox container runs with **no GCP service account permissions** and blocks all traffic to the GCE metadata server (`169.254.169.254`).
@@ -40,7 +41,7 @@ Interactive Jupyter notebooks (`.ipynb`) are central to learning mathematical fo
 | :--- | :--- | :--- |
 | **A. In-Process `exec()` / Subprocess Kernel Inside `core-api`** | Zero extra infrastructure. | **Catastrophic security risk**: exposes `sa-core-api` service account credentials, Firestore write access, and shared container memory to arbitrary user code. Explicitly forbidden. |
 | **B. Multi-Tenant Shared JupyterHub Server Without Network Isolation** | Familiar JupyterLab interface. | Shared kernel hosts or unisolated outbound network access allow cross-user side-channel attacks, SSRF, and crypto-mining abuse. |
-| **C. Browser-Only WebAssembly Execution (`Pyodide` / `JupyterLite`)** | Runs 100% on the learner's device; zero server compute cost or server RCE risk. | Viable and recommended as a **client-side enhancement** for lightweight `numpy`/`matplotlib` exercises in Stages 7–8, but cannot replace server-side isolated execution in Stage 9 when deterministic hardware benchmarks or C++/PyTorch extensions not supported by WASM are needed. |
+| **C. Browser-Only WebAssembly Execution (`Pyodide` / `JupyterLite`) in Stages 6–8** | Runs on the learner's device; zero server compute cost. | **Deferred**: Adds heavy client bundle size (`> 20 MiB` WASM/wheel downloads), mobile memory pressure, and divergent package compatibility (`torch`/C-extensions) before the core static notebook catalog is proven. We start with static notebooks and downloadable `.ipynb` artifacts in Stages 6–8; interactive code execution belongs to the Stage 9 isolated lab milestone. |
 
 ---
 
