@@ -6,19 +6,19 @@
 | **Version** | `1.1.0` |
 | **Last Updated** | `2026-10-22` |
 | **Status** | `Proposed (For Architectural Review)` |
-| **Companion Docs** | [`system-overview.md`](./system-overview.md), [`0001-cloud-architecture.md`](./decisions/0001-cloud-architecture.md), [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0004-notebook-isolation.md`](./decisions/0004-notebook-isolation.md) |
+| **Companion Docs** | [`system-overview.md`](./system-overview.md), [`cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md), [`0001-cloud-architecture.md`](./decisions/0001-cloud-architecture.md), [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0004-notebook-isolation.md`](./decisions/0004-notebook-isolation.md) |
 
 ---
 
-## 0. Current Cloud Infrastructure Status & Approval-Gated Provisioning Policy
+## 0. Current Cloud Infrastructure Status, Local-First Milestone & Approval-Gated Provisioning Policy
 
 > [!IMPORTANT]
-> **Unprovisioned Cloud Infrastructure Status**:
+> **Unprovisioned Cloud Infrastructure Status & Local-First Rollout**:
 > - **No Firebase or Google Cloud projects have been created for this product.**
-> - **Project IDs, regions, billing configuration, APIs, and `DEV`/`PROD` environments are not yet established.** Placeholders such as `${GCP_PROJECT_ID_DEV}` and `${GCP_PROJECT_ID_PROD}` are parameterized templates for future use, not active cloud resources.
-> - **Pull Request #1 (`docs/task-002-system-architecture`) does not—and must not—create projects, enable billing, enable cloud APIs/services, deploy resources, or commit environment credentials.**
-> - **Cloud provisioning is a separate, explicit approval-gated milestone** (required before Stage 7 cloud deployment).
-> - **Blaze Plan & Cost Controls**: Because **Firebase App Hosting requires the Google Cloud Blaze (pay-as-you-go) billing plan**, explicit cost controls, Cloud Billing budget alerts, Cloud Run `max-instances` caps, and per-user/project LLM token circuit breakers must be reviewed and approved before enabling billing or provisioning cloud infrastructure.
+> - **Project IDs (`maha-airl-dev-01` and `maha-airl-prod-01` recorded as unprovisioned candidates only), regions, billing configuration, APIs, and `DEV`/`PROD` environments are not yet established.** Global namespace availability, account access, and billing permissions must be checked before project creation. Placeholders such as `${GCP_PROJECT_ID_DEV}` and `${GCP_PROJECT_ID_PROD}` are parameterized templates for future use, not active cloud resources.
+> - **Pull Requests #1 and #2 do not—and must not—create projects, enable billing, enable cloud APIs/services, deploy resources, or commit environment credentials.**
+> - **Local-First Milestone (Stages 1–6) & `DEV`-First Cloud Rollout (Stage 7)**: Stages 1 through 6 are developed and verified locally using the **Firebase Local Emulator Suite** and **local SQLite** (`data/research_inventory.sqlite`) with zero cloud billing dependency. Cloud provisioning and billing authorization are deferred until a separate approval gate prior to Stage 7, followed by a **`DEV`-first rollout** (`PROD` remains unprovisioned and unavailable until release readiness has been demonstrated in `DEV`). See [`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md) for the complete pre-provisioning plan.
+> - **Blaze Plan & Cost Controls**: Because **Firebase App Hosting requires the Google Cloud Blaze (pay-as-you-go) billing plan** and may incur charges across multiple underlying services (Cloud Build, Cloud Run SSR in the primary region, Artifact Registry, Cloud CDN/bandwidth, and Secret Manager), and because Cloud Billing budgets (`$5/month DEV`, `$15/month PROD`) are **notification thresholds only, not maximum spending guarantees**, explicit service-specific caps (`max-instances`), API quotas, and per-user/project LLM token circuit breakers must be reviewed and approved before enabling billing or provisioning cloud infrastructure.
 
 ---
 
@@ -150,17 +150,18 @@ flowchart TD
 
 ---
 
-### Stage 7 — Web Application and Approval-Gated Cloud Deployment
-- **Dependencies**: Stage 6 **AND explicit human approval of the Cloud Provisioning & Cost-Control Milestone** (creating `DEV`/`PROD` projects, configuring Blaze billing budgets and hard quotas, selecting regions, and enabling required APIs).
+### Stage 7 — Web Application and Approval-Gated Cloud Deployment (`DEV`-First Rollout)
+- **Dependencies**: Stage 6 (completed and verified against the local Firebase Emulator Suite and local SQLite `data/research_inventory.sqlite`) **AND explicit human approval of the Cloud Provisioning & Cost-Control Milestone** ([`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md)).
 - **Scope**:
   - Build the Next.js responsive web application (`Next.js App Router`) with Concept Graph Explorer, Resource & Transcript Reader (with timestamp synchronization), Source-Cited AI Tutor UI (showing distinct Source Evidence Cards and epistemic badges), and Static Notebook Viewer with downloadable `.ipynb` artifacts (client-side `Pyodide` execution remains deferred).
   - Enforce endpoint authentication policies: read-only catalog access may be unauthenticated only if the catalog is deliberately published; user progress and protected endpoints require authentication; AI tutor endpoints require an identified principal, abuse controls, and quotas (Firebase Anonymous Auth may be used for low-friction testing after infrastructure exists, but must never bypass cost controls).
-  - After cloud provisioning approval, configure containerized deployment of `core-api` (Cloud Run Service), `ingestion-worker` (Cloud Run Job), and Next.js frontend (Firebase App Hosting via `apphosting.yaml`) across isolated `DEV` and `PROD` environments using GitHub Actions and Workload Identity Federation (WIF).
+  - Follow a **`DEV`-first rollout**: after cloud provisioning approval, provision and validate the `DEV` environment first (`${GCP_PROJECT_ID_DEV}`, candidate `maha-airl-dev-01`), keeping `PROD` (`${GCP_PROJECT_ID_PROD}`, candidate `maha-airl-prod-01`) unprovisioned/unavailable until release readiness is demonstrated in `DEV`.
+  - Configure containerized deployment under the approved regional topology (**provisional Option A**: data and Python compute `Firestore`, `Cloud Storage`, `Cloud Run` `core-api` and `ingestion-worker`, and `Artifact Registry` in `asia-south1`, with Firebase App Hosting in `asia-southeast1` and a **direct client-to-Mumbai-API request path** for dynamic web/Flutter operations because App Hosting's primary region processes uncached requests even with Cloud CDN enabled; or **fallback Option C**: all services including Next.js hosted directly on Cloud Run in `asia-south1`; no region is finalized yet) using GitHub Actions and Workload Identity Federation (WIF).
 - **Acceptance Criteria**:
-  - End-to-end user journey works in `DEV` and `PROD` with Firebase Auth, rate limiting, structured logging, and budget alerts active.
+  - End-to-end user journey works in `DEV` first (and subsequently in `PROD` only after `DEV` release readiness sign-off) with Firebase Auth, rate limiting, structured logging, service quotas, and budget alert notifications active.
   - Original source quotes and attribution banners are visually separated from AI-generated explanations on all screens.
 - **Key Risks & Mitigations**:
-  - *Risk*: Unexpected cloud or LLM API spend. *Mitigation*: Cloud Run `max-instances` caps, per-user token-bucket rate limits, and automated billing budget alerts at 50%/80%/100%.
+  - *Risk*: Unexpected cloud or LLM API spend (especially since Cloud Billing budgets are notification thresholds only, not hard spending caps, and Firebase App Hosting requires Blaze across multiple underlying services). *Mitigation*: `DEV`-first rollout, Cloud Run `max-instances` caps, API consumer quota overrides, per-user token-bucket rate limits, and application-level daily token circuit breakers alongside billing budget alerts (`$5/month DEV`, `$15/month PROD` at 50%/80%/100%).
 - **Measurable Completion Checks**:
   - Web Core Web Vitals pass in Lighthouse audit; accessibility score `>= 90`; CI/CD deploys cleanly via WIF with zero long-lived service account keys.
 
@@ -198,39 +199,46 @@ flowchart TD
 
 ## 3. Target Cloud Environment, Identity, CI/CD, Monitoring, Quotas, and Cost Controls (Post-Provisioning)
 
-### 3.1 Target DEV and PROD Cloud Project Separation (Unprovisioned Blueprint)
-No Firebase or Google Cloud projects exist today, and no cloud project IDs, regions, billing accounts, or APIs have been established. When the approval-gated cloud provisioning milestone is authorized, all deployment manifests will parameterize the target project via `${GCP_PROJECT_ID}`:
-- **`DEV` Project (`${GCP_PROJECT_ID_DEV}`, unprovisioned template)**: Target environment for integration testing, staging previews on pull requests, and dry-run ingestion of small resource batches. Uses lower quotas and stricter instance caps (`max-instances = 2`).
-- **`PROD` Project (`${GCP_PROJECT_ID_PROD}`, unprovisioned template)**: Target environment for serving verified canonical knowledge to learners. Deployed only from tagged releases or merges to `main` after CI verification and human approval gates.
+See [`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md) for the complete operational specification, candidate project ID checks, regional topology options, and service-specific quota/spend-cap limitations.
+
+### 3.1 Target DEV and PROD Cloud Project Separation & Regional Topology (Unprovisioned Blueprint)
+No Firebase or Google Cloud projects exist today, and no cloud project IDs, regions, billing accounts, or APIs have been established. Stages 1–6 run locally against the **Firebase Local Emulator Suite** and **local SQLite** (`data/research_inventory.sqlite`). When the approval-gated cloud provisioning milestone is authorized, rollout proceeds **`DEV`-first** and all deployment manifests parameterize the target project via `${GCP_PROJECT_ID}`:
+- **`DEV` Project (`${GCP_PROJECT_ID_DEV}`, candidate ID `maha-airl-dev-01` — unprovisioned candidate only)**: Provisioned first once cloud testing is justified after local emulator verification. Used for integration testing, staging previews, and capped dry-run ingestion (`--limit 25`) with strict instance caps (`max-instances = 2`).
+- **`PROD` Project (`${GCP_PROJECT_ID_PROD}`, candidate ID `maha-airl-prod-01` — unprovisioned candidate only)**: Remains unprovisioned and unavailable until release readiness has been demonstrated in `DEV` and a separate production approval gate is passed.
+- **Provisional Regional Topology (Unfinalized)**: **Option A** is the provisional recommendation (`asia-south1` Mumbai for Firestore, Cloud Storage, Cloud Run `core-api` and `ingestion-worker`, and Artifact Registry; `asia-southeast1` Singapore for Firebase App Hosting, with a **direct client-to-Mumbai-API request path** for dynamic web/Flutter calls because App Hosting's primary region executes uncached SSR requests). **Option C** (hosting the Next.js container directly on Cloud Run in `asia-south1`) is preserved as a single-region fallback.
 
 ### 3.2 Identity Boundaries & Least-Privilege IAM
 
 | Identity / Principal | Target Environment | Permitted Roles / Permissions | Explicit Denials |
 | :--- | :--- | :--- | :--- |
-| `sa-github-deployer` (via Workload Identity Federation) | `DEV` / `PROD` | `roles/run.admin`, `roles/firebaseapphosting.admin`, `roles/artifactregistry.writer`, `roles/iam.serviceAccountUser` (scoped to runtime SAs) | No static JSON keys; branch-restricted to `main` for `PROD`. |
-| `sa-core-api` | Cloud Run `core-api` | `roles/datastore.user` (Firestore), `roles/storage.objectViewer` (`artifacts/`, `notebooks/`), `roles/storage.objectCreator` (`experiments/`), `roles/aiplatform.user` | Cannot write to `audit/` bucket prefix; cannot invoke Cloud Run Admin APIs. |
-| `sa-ingestion-worker` | Cloud Run Job `ingestion-worker` | `roles/datastore.user`, `roles/storage.objectCreator` (`audit/`, `artifacts/`), `roles/aiplatform.user` | No public ingress URL; triggered only by Cloud Scheduler or `admin` workflow. |
+| `sa-cicd-deployer` (via Workload Identity Federation) | `DEV` / `PROD` | `roles/run.admin`, `roles/firebaseapphosting.admin`, `roles/artifactregistry.writer`, `roles/firebaserules.admin`, `roles/datastore.indexAdmin`, `roles/iam.serviceAccountUser` (scoped to runtime SAs) | No static JSON keys; branch-restricted to `main` / release tags for `PROD`. |
+| `sa-core-api` | Cloud Run `core-api` | `roles/datastore.user` (Firestore), `roles/storage.objectViewer` (`artifacts/`, `notebooks/`), `roles/storage.objectCreator` (`experiments/`), `roles/aiplatform.user`, `roles/secretmanager.secretAccessor` (scoped) | Cannot write to `audit/` bucket prefix; cannot invoke Cloud Run Admin APIs. |
+| `sa-ingestion-worker` | Cloud Run Job `ingestion-worker` | `roles/datastore.user`, `roles/storage.objectAdmin` (`audit/`, `artifacts/`, `notebooks/`), `roles/aiplatform.user`, `roles/secretmanager.secretAccessor` (scoped) | No public ingress URL; triggered only by Cloud Scheduler (`sa-scheduler-invoker`) or `admin` workflow. |
+| `sa-apphosting-web` | Firebase App Hosting (`web`) | `roles/firebaseapphosting.computeRunner`, `roles/secretmanager.secretAccessor` (scoped to web public/SSR config only) | No direct `roles/datastore.user` or `roles/storage.objectAdmin`; dynamic requests route via `core-api`. |
 | `sa-lab-sandbox` (Stage 9) | Ephemeral Sandbox | **None** (`0` GCP IAM permissions; metadata server blocked) | No access to Firestore, GCS, Vertex AI, or internal VPC services. |
 
 ### 3.3 CI/CD Pipeline Architecture (GitHub Actions + Firebase App Hosting)
 1. **Pull Request Gate (`.github/workflows/ci.yml`)**:
    - Runs offline Python unit tests (`python3 -m unittest discover -s tests -v`), bytecode compilation checks, schema contract tests, and security rule tests.
    - Zero live external scraping or cloud mutations during PR checks.
-2. **Staging Deployment (`DEV`)**:
+2. **Staging Deployment (`DEV` — First Cloud Rollout Target)**:
    - Authenticates to `${GCP_PROJECT_ID_DEV}` via OIDC Workload Identity Federation (`google-github-actions/auth`).
-   - Builds and deploys `core-api` and `ingestion-worker` images, and triggers Firebase App Hosting preview rollout.
-3. **Production Promotion (`PROD`)**:
-   - Requires protected GitHub Environment approval (`production`), green staging smoke tests, and verified provenance audit checks before rolling out to `${GCP_PROJECT_ID_PROD}`.
+   - Builds and deploys `core-api` and `ingestion-worker` images, and triggers Firebase App Hosting rollout (or Cloud Run web rollout under Option C).
+3. **Production Promotion (`PROD` — Gated on `DEV` Release Readiness)**:
+   - Requires demonstrated release readiness in `DEV`, protected GitHub Environment approval (`production`), green staging smoke tests, and verified provenance audit checks before rolling out to `${GCP_PROJECT_ID_PROD}`.
 
 ### 3.4 Monitoring, Quotas, and Cost Controls
 
+> [!WARNING]
+> **Budget Notification Limitation & Multi-Service Blaze Costs**: Cloud Billing budgets (`$5/month DEV`, `$15/month PROD`) are **notification thresholds only, not maximum spending guarantees**, and are subject to multi-hour billing telemetry delays. Furthermore, Firebase App Hosting requires the Blaze plan and can incur costs across Cloud Build, Cloud Run SSR, Artifact Registry, Cloud CDN/bandwidth, and Secret Manager, while GCP API consumer quota overrides take 15–30 minutes to propagate and exclude storage/egress. No single control guarantees a strict total-bill ceiling; defense-in-depth technical limits are mandatory (see [`../operations/cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md)).
+
 | Control Layer | Configuration (`DEV`) | Configuration (`PROD`) | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Cloud Run Scaling** | `min-instances: 0`, `max-instances: 2` | `min-instances: 0`, `max-instances: 10` | Scale-to-zero idle cost; hard ceiling against traffic spikes. |
-| **API Rate Limiting** | `30 req/min` (Search), `5 req/min` (Tutor) per UID | `60 req/min` (Search), `15 req/min` (Tutor) per UID | Prevents automated scraping and bounds LLM token spend. |
-| **LLM Daily Token Quota** | `100,000` tokens/day project cap | `2,000,000` tokens/day project cap + per-UID cap | Hard circuit breaker (`503 ERR_UPSTREAM_MODEL_UNAVAILABLE`) if daily token budget is exhausted; falls back to deterministic search. |
-| **Cloud Storage Lifecycle** | Delete temporary staging files after `7 days` | Transition `audit/` raw snapshots to Nearline after `30 days` and Coldline after `90 days` | Minimizes long-term storage cost while preserving provenance. |
-| **Cloud Billing Budgets** | Alert thresholds at `50%`, `80%`, `100%` of monthly DEV budget | Alert thresholds at `50%`, `80%`, `100%` of monthly PROD budget | Pub/Sub notification + email alert to project administrators. |
+| **Cloud Run Scaling** | `min-instances: 0`, `max-instances: 2` (`core-api` & App Hosting) | `min-instances: 0`, `max-instances: 5–10` (`core-api`), `3` (App Hosting) | Scale-to-zero idle cost; hard instance ceiling against traffic spikes. |
+| **API Rate Limiting & Quotas** | `30 req/min` (Search), `5 req/min` (Tutor) per UID + GCP API consumer quota overrides | `60 req/min` (Search), `15 req/min` (Tutor) per UID + GCP API consumer quota overrides | Prevents automated scraping and bounds LLM/API spend (noting 15–30 min quota override propagation delay). |
+| **LLM Daily Token Quota** | `100,000` tokens/day project cap | `500,000–2,000,000` tokens/day project cap + per-UID cap | Application-level hard circuit breaker (`503 ERR_UPSTREAM_MODEL_UNAVAILABLE`) if daily token budget is exhausted; falls back to deterministic search. |
+| **Cloud Storage Lifecycle** | Delete temporary staging/audit files after `7–30 days`; abort incomplete multipart uploads after `1 day` | Transition `audit/` raw snapshots after `30–90 days`; abort incomplete multipart uploads after `1 day` | Minimizes long-term storage cost while preserving provenance. |
+| **Cloud Billing Budgets (Notification Only)** | Notification thresholds at `50%`, `80%`, `100%` of `$5/month` (`DEV`) | Notification thresholds at `50%`, `80%`, `100%` of `$15/month` (`PROD`) | Email + Pub/Sub notifications to project administrators (**does not automatically cap spend or disable billing**). |
 | **Observability Alerts** | Log-based errors in Cloud Logging | P1 alert on `citation_verification_failures_total > 0` or `5xx > 2%` over 5 min | Immediate visibility into grounding regressions or service outages. |
 
 ---
