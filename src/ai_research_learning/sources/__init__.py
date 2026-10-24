@@ -8,7 +8,10 @@ Provides a unified, policy-gated connector contract across:
 - SRC-WIKIPEDIA (`WikipediaSourceAdapter`)
 """
 from .arxiv_adapter import (
+    ARXIV_EXECUTION_BOUNDARY_MODE,
+    ARXIV_MAX_CONCURRENCY,
     ARXIV_MAX_RESULTS_LIMIT,
+    ARXIV_MIN_INTERVAL_SECONDS,
     ARXIV_POLICY_BASIS,
     ARXIV_POLICY_PROFILE_ID,
     ARXIV_POLICY_VERSION,
@@ -60,7 +63,10 @@ from .pilot import (
 from .wikipedia_adapter import WikipediaSourceAdapter
 
 __all__ = [
+    "ARXIV_EXECUTION_BOUNDARY_MODE",
+    "ARXIV_MAX_CONCURRENCY",
     "ARXIV_MAX_RESULTS_LIMIT",
+    "ARXIV_MIN_INTERVAL_SECONDS",
     "ARXIV_POLICY_BASIS",
     "ARXIV_POLICY_PROFILE_ID",
     "ARXIV_POLICY_VERSION",

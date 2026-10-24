@@ -1,15 +1,19 @@
 """arXiv official Atom API metadata adapter (SRC-ARXIV).
 
-Follows docs/architecture/source-adapter-contract.md Section 5.4:
+Follows docs/architecture/source-adapter-contract.md Section 4.4 and ADR-0005:
 - Uses https://export.arxiv.org/api/query (never HTML scraping or PDF downloading)
-- Enforces single-connection sequential requests with >= 3.0s delay
+- Enforces single-connection sequential requests (max_concurrency = 1) with >= 3.0s delay
+  across the entire local process (`LOCAL_SINGLE_WORKER_SERIALIZED` execution boundary)
+- Fails closed without retry storms on HTTP 401/403/451/429/503
 - Parses Atom XML entries into metadata + abstract envelopes
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import re
+import threading
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -50,11 +54,15 @@ ARXIV_ID_RE = re.compile(r"^(?:\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})(?:v
 
 ARXIV_POLICY_PROFILE_ID = "ARXIV_OFFICIAL_ATOM_API_V1"
 ARXIV_POLICY_VERSION = "ADR-0005/2026-10-24"
+ARXIV_EXECUTION_BOUNDARY_MODE = "LOCAL_SINGLE_WORKER_SERIALIZED"
+ARXIV_MIN_INTERVAL_SECONDS = 3.0
+ARXIV_MAX_CONCURRENCY = 1
 ARXIV_POLICY_BASIS = (
     "Official arXiv API Terms of Use (https://info.arxiv.org/help/api/tou.html) and "
     "arXiv API User's Manual (https://info.arxiv.org/help/api/user-manual.html) for "
-    "https://export.arxiv.org/api/query; RFC 9309 robots.txt Disallow: / preserved as "
-    "blocking general HTML and PDF crawling on export.arxiv.org."
+    "https://export.arxiv.org/api/query (>= 3.0s between consecutive requests, single "
+    "active connection across all project-controlled machines); RFC 9309 robots.txt "
+    "Disallow: / preserved as blocking general HTML and PDF crawling on export.arxiv.org."
 )
 ARXIV_MAX_RESULTS_LIMIT = 50
 ALLOWED_ARXIV_QUERY_KEYS = {
@@ -65,6 +73,100 @@ ALLOWED_ARXIV_QUERY_KEYS = {
     "sortBy",
     "sortOrder",
 }
+
+
+class _ArxivProcessRateLimitGate:
+    """Process-wide single-connection and >= 3.0s interval gate for export.arxiv.org.
+
+    Per https://info.arxiv.org/help/api/tou.html:
+    - Make no more than one request every three seconds (>= 3.0s).
+    - Limit requests to a single connection at a time (max_concurrency = 1).
+
+    In the current `LOCAL_SINGLE_WORKER_SERIALIZED` execution boundary, this gate ensures
+    that even if multiple `ArxivSourceAdapter` or `OriginRateLimiter` instances are created
+    or invoked concurrently across threads in the same Python process, all requests to
+    `https://export.arxiv.org` are strictly serialized through a single lock with >= 3.0s
+    spacing between consecutive calls.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_request_at_by_clock: dict[Callable[[], float], float] = {}
+        self._in_flight: int = 0
+        self._max_in_flight: int = 0
+
+    @contextmanager
+    def acquire_slot(
+        self,
+        *,
+        rate_limiter: OriginRateLimiter,
+        origin_key: str,
+        min_delay_seconds: float,
+    ) -> Iterator[float]:
+        effective_delay = max(ARXIV_MIN_INTERVAL_SECONDS, float(min_delay_seconds))
+        normalized_origin = rate_limiter._normalize_origin_key(origin_key)
+        clock_fn = rate_limiter._clock_fn
+        with self._lock:
+            now = clock_fn()
+            gate_prev = self._last_request_at_by_clock.get(clock_fn)
+            limiter_prev = rate_limiter.last_request_at(normalized_origin)
+            candidates = [t for t in (gate_prev, limiter_prev) if t is not None]
+            last_at = max(candidates) if candidates else None
+
+            slept = 0.0
+            if last_at is not None:
+                elapsed = now - last_at
+                if elapsed < effective_delay:
+                    slept = effective_delay - elapsed
+                    rate_limiter._sleep_fn(slept)
+                    now = clock_fn()
+
+            self._last_request_at_by_clock[clock_fn] = now
+            with rate_limiter._lock:
+                rate_limiter._last_request_at[normalized_origin] = now
+                active = rate_limiter._in_flight_by_origin.get(normalized_origin, 0) + 1
+                rate_limiter._in_flight_by_origin[normalized_origin] = active
+                if active > rate_limiter._max_in_flight_by_origin.get(normalized_origin, 0):
+                    rate_limiter._max_in_flight_by_origin[normalized_origin] = active
+
+            self._in_flight += 1
+            if self._in_flight > self._max_in_flight:
+                self._max_in_flight = self._in_flight
+
+            try:
+                yield slept
+            finally:
+                completed_at = clock_fn()
+                self._in_flight = max(0, self._in_flight - 1)
+                self._last_request_at_by_clock[clock_fn] = max(
+                    self._last_request_at_by_clock.get(clock_fn, completed_at),
+                    completed_at,
+                )
+                with rate_limiter._lock:
+                    rate_limiter._in_flight_by_origin[normalized_origin] = max(
+                        0, rate_limiter._in_flight_by_origin.get(normalized_origin, 1) - 1
+                    )
+                    rate_limiter._last_request_at[normalized_origin] = max(
+                        rate_limiter._last_request_at.get(normalized_origin, completed_at),
+                        completed_at,
+                    )
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    @property
+    def max_in_flight(self) -> int:
+        return self._max_in_flight
+
+    def reset_for_tests(self) -> None:
+        with self._lock:
+            self._last_request_at_by_clock.clear()
+            self._in_flight = 0
+            self._max_in_flight = 0
+
+
+_ARXIV_PROCESS_GATE = _ArxivProcessRateLimitGate()
 
 
 def _collapse_ws(value: str | None) -> str | None:
@@ -101,7 +203,9 @@ class ArxivSourceAdapter(SourceAdapter):
     api_endpoint = "https://export.arxiv.org/api/query"
     robots_url = "https://export.arxiv.org/robots.txt"
     terms_of_use_url = "https://info.arxiv.org/help/api/tou.html"
-    min_delay_seconds = 3.0
+    min_delay_seconds = ARXIV_MIN_INTERVAL_SECONDS
+    max_concurrency = ARXIV_MAX_CONCURRENCY
+    execution_boundary_mode = ARXIV_EXECUTION_BOUNDARY_MODE
 
     default_arxiv_candidates: tuple[dict[str, str], ...] = (
         {
@@ -140,6 +244,22 @@ class ArxivSourceAdapter(SourceAdapter):
         )
         self.api_terms_verified = api_terms_verified
         self.batch_queries = batch_queries
+        self._halted_error: PolicyBlockedError | RateLimitError | None = None
+
+    @contextmanager
+    def _acquire_origin_slot(self, url_or_origin: str, min_delay_seconds: float) -> Iterator[float]:
+        """Serialize all export.arxiv.org calls through the process-wide single-connection gate."""
+        origin_key = (
+            origin_of(url_or_origin)
+            if "://" in url_or_origin
+            else url_or_origin.strip().lower().rstrip("/")
+        )
+        with _ARXIV_PROCESS_GATE.acquire_slot(
+            rate_limiter=self.rate_limiter,
+            origin_key=origin_key,
+            min_delay_seconds=max(ARXIV_MIN_INTERVAL_SECONDS, self.min_delay_seconds, min_delay_seconds),
+        ) as slept:
+            yield slept
 
     def build_query_url(self, arxiv_id: str) -> str:
         clean_id = extract_arxiv_id(arxiv_id)
@@ -223,15 +343,18 @@ class ArxivSourceAdapter(SourceAdapter):
                 "Descriptive User-Agent header with project URL; single-connection sequential requests"
             ),
             rate_limit_behavior=(
-                "Mandatory >= 3.0s delay between sequential requests on a single connection per "
-                "arXiv API Terms of Use; abort immediately on HTTP 429/503"
+                "Mandatory >= 3.0s delay between consecutive requests on a single connection "
+                "(max_concurrency = 1) across all project-controlled machines per arXiv API Terms of Use "
+                f"(runtime mode: {ARXIV_EXECUTION_BOUNDARY_MODE}); abort immediately without retry storm on HTTP 401/403/451/429/503"
             ),
             unresolved_questions=[
-                "Full PDF and TeX source bundles have per-submission licenses (CC BY, CC BY-SA, or arXiv non-exclusive license); pilot stores metadata and abstract only, never PDFs."
+                "Full PDF and TeX source bundles have per-submission licenses (CC BY, CC BY-SA, or arXiv non-exclusive license); pilot stores metadata and abstract only, never PDFs.",
+                "Multi-process or distributed cloud deployment of SRC-ARXIV is prohibited until either a single dedicated serialized API worker (max_instances=1, concurrency=1) or a shared global rate-limit coordinator is implemented.",
             ],
             base_restrictions=[
                 "Use official Atom API (https://export.arxiv.org/api/query) only; do not scrape HTML or download PDFs",
-                "Enforce >= 3.0s minimum delay between requests on a single connection",
+                "Enforce >= 3.0s minimum delay between consecutive requests on a single active connection (max_concurrency = 1) across all project-controlled machines",
+                f"Enforce runtime execution boundary {ARXIV_EXECUTION_BOUNDARY_MODE}; do not deploy multiple uncoordinated processes/machines against arXiv API",
             ],
         )
 
@@ -511,8 +634,30 @@ class ArxivSourceAdapter(SourceAdapter):
                 candidate=candidate,
             )
 
-        effective_delay = max(3.0, self.min_delay_seconds, active_policy.effective_delay_seconds)
-        self.rate_limiter.wait(origin_of(query_url), effective_delay)
+        # Fail closed without retry storms if a previous call on this adapter was blocked or rate-limited
+        if self._halted_error is not None:
+            if isinstance(self._halted_error, RateLimitError):
+                raise RateLimitError(
+                    f"arXiv adapter circuit breaker active after prior HTTP {self._halted_error.http_status} "
+                    f"rate limit; refusing further API requests to prevent retry storm",
+                    source_id=self.source_id,
+                    url=query_url,
+                    http_status=self._halted_error.http_status,
+                    retry_after_seconds=self._halted_error.retry_after_seconds,
+                )
+            raise PolicyBlockedError(
+                f"arXiv adapter circuit breaker active after prior HTTP {self._halted_error.http_status} "
+                f"block; refusing further API requests to prevent retry storm",
+                source_id=self.source_id,
+                url=query_url,
+                http_status=self._halted_error.http_status,
+            )
+
+        effective_delay = max(
+            ARXIV_MIN_INTERVAL_SECONDS,
+            self.min_delay_seconds,
+            active_policy.effective_delay_seconds,
+        )
 
         req_headers = {
             "User-Agent": self.user_agent,
@@ -525,95 +670,106 @@ class ArxivSourceAdapter(SourceAdapter):
 
         response: requests.Response | None = None
         try:
-            response = self.session.get(
-                query_url,
-                headers=req_headers,
-                timeout=self.timeout_seconds,
-                allow_redirects=False,
-                stream=True,
-            )
-            status_code = response.status_code
-            headers_dict = dict(response.headers or {})
+            with self._acquire_origin_slot(origin_of(query_url), effective_delay):
+                response = self.session.get(
+                    query_url,
+                    headers=req_headers,
+                    timeout=self.timeout_seconds,
+                    allow_redirects=False,
+                    stream=True,
+                )
+                status_code = response.status_code
+                headers_dict = dict(response.headers or {})
 
-            if status_code == 304:
+                if status_code == 304:
+                    response.close()
+                    response = None
+                    self._record_http_event(
+                        purpose="METADATA_FETCH",
+                        url=query_url,
+                        http_status=304,
+                        outcome="not-modified-304",
+                    )
+                    raise NotModifiedResponse(query_url, headers_dict)
+
+                if status_code in REDIRECT_STATUSES:
+                    location = headers_dict.get("Location") or ""
+                    response.close()
+                    response = None
+                    next_url = urljoin(query_url, location) if location else ""
+                    self._record_http_event(
+                        purpose="METADATA_FETCH",
+                        url=query_url,
+                        http_status=status_code,
+                        outcome="blocked-redirect-out-of-scope",
+                    )
+                    raise ScopeViolationError(
+                        f"arXiv API endpoint returned redirect (HTTP {status_code} -> {next_url or 'missing Location'}); "
+                        f"cross-host and non-API redirects are blocked by {ARXIV_POLICY_PROFILE_ID}",
+                        source_id=self.source_id,
+                        url=query_url,
+                    )
+
+                if status_code in {429, 503}:
+                    retry_after = parse_retry_after(headers_dict.get("Retry-After"))
+                    response.close()
+                    response = None
+                    self._record_http_event(
+                        purpose="METADATA_FETCH",
+                        url=query_url,
+                        http_status=status_code,
+                        outcome="rate-limited",
+                    )
+                    rate_err = RateLimitError(
+                        f"arXiv API returned HTTP {status_code} rate limit",
+                        source_id=self.source_id,
+                        url=query_url,
+                        http_status=status_code,
+                        retry_after_seconds=retry_after,
+                    )
+                    self._halted_error = rate_err
+                    raise rate_err
+
+                if status_code in {401, 403, 451}:
+                    response.close()
+                    response = None
+                    self._record_http_event(
+                        purpose="METADATA_FETCH",
+                        url=query_url,
+                        http_status=status_code,
+                        outcome="policy-or-access-blocked",
+                    )
+                    block_err = PolicyBlockedError(
+                        f"arXiv API blocked request with HTTP {status_code}",
+                        source_id=self.source_id,
+                        url=query_url,
+                        http_status=status_code,
+                    )
+                    self._halted_error = block_err
+                    raise block_err
+
+                if status_code < 200 or status_code >= 300:
+                    response.close()
+                    response = None
+                    self._record_http_event(
+                        purpose="METADATA_FETCH",
+                        url=query_url,
+                        http_status=status_code,
+                        outcome=f"http-error-{status_code}",
+                    )
+                    raise TransientFetchError(
+                        f"arXiv API returned HTTP {status_code}",
+                        source_id=self.source_id,
+                        url=query_url,
+                        http_status=status_code,
+                        is_retryable=status_code >= 500,
+                    )
+
+                raw_bytes = self._read_limited(response)
+                encoding = getattr(response, "encoding", None) or "utf-8"
+                body_text = raw_bytes.decode(encoding, errors="replace")
                 response.close()
-                self._record_http_event(
-                    purpose="METADATA_FETCH",
-                    url=query_url,
-                    http_status=304,
-                    outcome="not-modified-304",
-                )
-                raise NotModifiedResponse(query_url, headers_dict)
-
-            if status_code in REDIRECT_STATUSES:
-                location = headers_dict.get("Location") or ""
-                response.close()
-                next_url = urljoin(query_url, location) if location else ""
-                self._record_http_event(
-                    purpose="METADATA_FETCH",
-                    url=query_url,
-                    http_status=status_code,
-                    outcome="blocked-redirect-out-of-scope",
-                )
-                raise ScopeViolationError(
-                    f"arXiv API endpoint returned redirect (HTTP {status_code} -> {next_url or 'missing Location'}); "
-                    f"cross-host and non-API redirects are blocked by {ARXIV_POLICY_PROFILE_ID}",
-                    source_id=self.source_id,
-                    url=query_url,
-                )
-
-            if status_code in {429, 503}:
-                retry_after = parse_retry_after(headers_dict.get("Retry-After"))
-                response.close()
-                self._record_http_event(
-                    purpose="METADATA_FETCH",
-                    url=query_url,
-                    http_status=status_code,
-                    outcome="rate-limited",
-                )
-                raise RateLimitError(
-                    f"arXiv API returned HTTP {status_code} rate limit",
-                    source_id=self.source_id,
-                    url=query_url,
-                    http_status=status_code,
-                    retry_after_seconds=retry_after,
-                )
-
-            if status_code in {401, 403, 451}:
-                response.close()
-                self._record_http_event(
-                    purpose="METADATA_FETCH",
-                    url=query_url,
-                    http_status=status_code,
-                    outcome="policy-or-access-blocked",
-                )
-                raise PolicyBlockedError(
-                    f"arXiv API blocked request with HTTP {status_code}",
-                    source_id=self.source_id,
-                    url=query_url,
-                    http_status=status_code,
-                )
-
-            if status_code < 200 or status_code >= 300:
-                response.close()
-                self._record_http_event(
-                    purpose="METADATA_FETCH",
-                    url=query_url,
-                    http_status=status_code,
-                    outcome=f"http-error-{status_code}",
-                )
-                raise TransientFetchError(
-                    f"arXiv API returned HTTP {status_code}",
-                    source_id=self.source_id,
-                    url=query_url,
-                    http_status=status_code,
-                    is_retryable=status_code >= 500,
-                )
-
-            raw_bytes = self._read_limited(response)
-            encoding = getattr(response, "encoding", None) or "utf-8"
-            body_text = raw_bytes.decode(encoding, errors="replace")
-            response.close()
+                response = None
 
             self._record_http_event(
                 purpose="METADATA_FETCH",
@@ -814,6 +970,9 @@ class ArxivSourceAdapter(SourceAdapter):
                 "policy_profile_id": (active_policy.policy_profile_id if active_policy else ARXIV_POLICY_PROFILE_ID),
                 "policy_version": (active_policy.policy_version if active_policy else ARXIV_POLICY_VERSION),
                 "approved_api_endpoint": self.api_endpoint,
+                "execution_boundary_mode": ARXIV_EXECUTION_BOUNDARY_MODE,
+                "min_interval_seconds": ARXIV_MIN_INTERVAL_SECONDS,
+                "max_concurrency": ARXIV_MAX_CONCURRENCY,
             },
             discovered_links=[],
         )

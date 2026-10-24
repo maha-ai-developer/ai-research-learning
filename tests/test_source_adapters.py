@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -21,6 +22,9 @@ for p in (str(ROOT_DIR), str(SRC_DIR)):
 import collect  # noqa: E402
 from knowledge_store import KnowledgeStore  # noqa: E402
 from ai_research_learning.sources import (  # noqa: E402
+    ARXIV_EXECUTION_BOUNDARY_MODE,
+    ARXIV_MAX_CONCURRENCY,
+    ARXIV_MIN_INTERVAL_SECONDS,
     ARXIV_POLICY_PROFILE_ID,
     ARXIV_POLICY_VERSION,
     DEFAULT_PROJECT_USER_AGENT,
@@ -40,6 +44,7 @@ from ai_research_learning.sources import (  # noqa: E402
     WikipediaSourceAdapter,
     is_identified_user_agent,
 )
+from ai_research_learning.sources.arxiv_adapter import _ARXIV_PROCESS_GATE  # noqa: E402
 
 
 class FakeResponse:
@@ -777,6 +782,176 @@ class PolicyAndSafetyBoundaryTests(unittest.TestCase):
         self.assertFalse(policy_api_disallowed.is_metadata_collection_permitted)
         self.assertEqual(policy_api_disallowed.status, "BLOCKED")
 
+    def test_arxiv_concurrent_calls_serialized_single_connection_and_three_second_interval(self) -> None:
+        """Verify concurrent arXiv calls across threads and adapter instances are serialized
+        with max_in_flight == 1 and >= 3.0s between consecutive requests."""
+        _ARXIV_PROCESS_GATE.reset_for_tests()
+        self.assertEqual(ARXIV_EXECUTION_BOUNDARY_MODE, "LOCAL_SINGLE_WORKER_SERIALIZED")
+        self.assertEqual(ARXIV_MAX_CONCURRENCY, 1)
+        self.assertEqual(ARXIV_MIN_INTERVAL_SECONDS, 3.0)
+
+        shared_clock = FakeClock()
+        # Even if two callers construct separate OriginRateLimiter and ArxivSourceAdapter instances
+        # in the same process, the process-wide gate must serialize them on a single schedule.
+        limiter_a = OriginRateLimiter(sleep_fn=shared_clock.sleep, clock_fn=shared_clock.clock)
+        limiter_b = OriginRateLimiter(sleep_fn=shared_clock.sleep, clock_fn=shared_clock.clock)
+
+        url_1 = "https://export.arxiv.org/api/query?id_list=1207.0580&max_results=1"
+        url_2 = "https://export.arxiv.org/api/query?id_list=1409.0473&max_results=1"
+        url_3 = "https://export.arxiv.org/api/query?id_list=1207.0580,1409.0473&max_results=2"
+
+        active_connections = 0
+        max_observed_connections = 0
+        call_timestamps: list[tuple[str, float]] = []
+        state_lock = threading.Lock()
+        barrier = threading.Barrier(3)
+
+        class ConcurrentTrackingSession:
+            def get(
+                self,
+                url: str,
+                *,
+                headers: dict[str, str] | None = None,
+                timeout: int = 15,
+                allow_redirects: bool = False,
+                stream: bool = True,
+            ) -> FakeResponse:
+                nonlocal active_connections, max_observed_connections
+                with state_lock:
+                    active_connections += 1
+                    if active_connections > max_observed_connections:
+                        max_observed_connections = active_connections
+                    call_timestamps.append((url, shared_clock.clock()))
+
+                # Simulate in-flight request duration advancing the clock by 0.4s while active
+                shared_clock.now += 0.4
+
+                with state_lock:
+                    active_connections -= 1
+
+                if url == "https://export.arxiv.org/robots.txt":
+                    return FakeResponse(
+                        status_code=200,
+                        body="User-agent: *\nDisallow: /\n",
+                        headers={"Content-Type": "text/plain"},
+                    )
+                return FakeResponse(
+                    status_code=200,
+                    body=SAMPLE_ARXIV_ATOM_XML,
+                    headers={"Content-Type": "application/atom+xml"},
+                )
+
+        tracking_session = ConcurrentTrackingSession()
+        adapter_a = ArxivSourceAdapter(session=tracking_session, rate_limiter=limiter_a, batch_queries=False)
+        adapter_b = ArxivSourceAdapter(session=tracking_session, rate_limiter=limiter_b, batch_queries=False)
+
+        # Audit policy once at t=100.0 (finishes at t=100.4)
+        policy = adapter_a.audit_policy()
+        self.assertTrue(policy.is_metadata_collection_permitted)
+
+        errors: list[Exception] = []
+
+        def worker(adapter: ArxivSourceAdapter, url: str) -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                adapter.fetch_metadata(
+                    SourceCandidate(source_id="SRC-ARXIV", url=url),
+                    policy=policy,
+                )
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(adapter_a, url_1)),
+            threading.Thread(target=worker, args=(adapter_b, url_2)),
+            threading.Thread(target=worker, args=(adapter_a, url_3)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+        self.assertEqual(errors, [])
+        # Strictly 1 active connection at any point in time
+        self.assertEqual(max_observed_connections, 1)
+        self.assertEqual(_ARXIV_PROCESS_GATE.max_in_flight, 1)
+        self.assertEqual(_ARXIV_PROCESS_GATE.in_flight, 0)
+        self.assertEqual(limiter_a.max_in_flight("https://export.arxiv.org"), 1)
+        self.assertEqual(limiter_b.max_in_flight("https://export.arxiv.org"), 1)
+
+        # Verify all 4 requests (1 robots.txt + 3 API calls) were spaced by >= 3.0s
+        self.assertEqual(len(call_timestamps), 4)
+        starts = [ts for _, ts in call_timestamps]
+        for idx in range(1, len(starts)):
+            interval = starts[idx] - starts[idx - 1]
+            self.assertGreaterEqual(
+                interval,
+                3.0,
+                f"Expected >= 3.0s interval between request {idx - 1} and {idx}, got {interval:.3f}s",
+            )
+
+    def test_arxiv_blocked_or_rate_limited_response_prevents_retry_storm(self) -> None:
+        """Verify HTTP 403/429/503 responses fail closed immediately and latch the circuit
+        breaker so subsequent calls do not trigger a retry storm."""
+        _ARXIV_PROCESS_GATE.reset_for_tests()
+        url_1 = "https://export.arxiv.org/api/query?id_list=1207.0580&max_results=1"
+        url_2 = "https://export.arxiv.org/api/query?id_list=1409.0473&max_results=1"
+
+        for status_code, expected_exc in (
+            (429, RateLimitError),
+            (503, RateLimitError),
+            (403, PolicyBlockedError),
+        ):
+            with self.subTest(status_code=status_code):
+                clock = FakeClock()
+                limiter = OriginRateLimiter(sleep_fn=clock.sleep, clock_fn=clock.clock)
+                session = FakeSession(
+                    {
+                        "https://export.arxiv.org/robots.txt": FakeResponse(
+                            status_code=200,
+                            body="User-agent: *\nDisallow: /\n",
+                        ),
+                        url_1: FakeResponse(
+                            status_code=status_code,
+                            body="Rate limited or blocked",
+                            headers={"Retry-After": "60"},
+                        ),
+                        url_2: FakeResponse(
+                            status_code=200,
+                            body=SAMPLE_ARXIV_ATOM_XML,
+                            headers={"Content-Type": "application/atom+xml"},
+                        ),
+                    }
+                )
+                adapter = ArxivSourceAdapter(
+                    session=session,
+                    rate_limiter=limiter,
+                    batch_queries=False,
+                )
+                policy = adapter.audit_policy()
+                self.assertEqual(len(session.calls), 1)  # robots.txt only
+
+                # First metadata call receives HTTP 429/503/403 and fails closed after 1 attempt (no retries)
+                with self.assertRaises(expected_exc):
+                    adapter.fetch_metadata(
+                        SourceCandidate(source_id="SRC-ARXIV", url=url_1),
+                        policy=policy,
+                    )
+                self.assertEqual(len(session.calls), 2)
+
+                # Subsequent call on the same adapter is halted by the circuit breaker BEFORE making any HTTP call
+                with self.assertRaises(expected_exc) as halted_ctx:
+                    adapter.fetch_metadata(
+                        SourceCandidate(source_id="SRC-ARXIV", url=url_2),
+                        policy=policy,
+                    )
+                self.assertIn("circuit breaker", str(halted_ctx.exception))
+                self.assertEqual(
+                    len(session.calls),
+                    2,
+                    "Circuit breaker must prevent any further HTTP requests after 403/429/503",
+                )
+
 
 class PilotCoordinatorAndIdempotencyTests(unittest.TestCase):
     """Test PilotCoordinator SQLite persistence, idempotency, caps, and provenance events."""
@@ -963,6 +1138,49 @@ class PilotCoordinatorAndIdempotencyTests(unittest.TestCase):
             event_types = {e["event_type"] for e in events}
             self.assertIn("ADAPTER_SOURCE_BLOCKED_BY_POLICY", event_types)
             self.assertIn("ADAPTER_RATE_LIMITED", event_types)
+
+    def test_pilot_coordinator_halts_arxiv_source_on_429_or_403_without_retry_storm(self) -> None:
+        _ARXIV_PROCESS_GATE.reset_for_tests()
+        url_1 = "https://export.arxiv.org/api/query?id_list=1207.0580&max_results=1"
+        url_2 = "https://export.arxiv.org/api/query?id_list=1409.0473&max_results=1"
+        session = FakeSession(
+            {
+                "https://export.arxiv.org/robots.txt": FakeResponse(
+                    status_code=200,
+                    body="User-agent: *\nDisallow: /\n",
+                ),
+                url_1: FakeResponse(
+                    status_code=503,
+                    body="Service Unavailable - Rate Limit Exceeded",
+                    headers={"Retry-After": "120"},
+                ),
+                url_2: FakeResponse(
+                    status_code=200,
+                    body=SAMPLE_ARXIV_ATOM_XML,
+                    headers={"Content-Type": "application/atom+xml"},
+                ),
+            }
+        )
+        arxiv_adapter = ArxivSourceAdapter(
+            session=session,
+            rate_limiter=self.limiter,
+            batch_queries=False,
+        )
+        with KnowledgeStore(db_path=self.db_path) as store:
+            coordinator = PilotCoordinator(store, adapters=[arxiv_adapter])
+            summary = coordinator.run_metadata_pilot(
+                seed_manifest=[],
+                max_per_source=2,
+                max_total=2,
+            )
+            self.assertEqual(summary.inserted_count, 0)
+            self.assertEqual(summary.error_count, 1)
+            # Only robots.txt + url_1 were called; url_2 was never attempted after HTTP 503
+            called_urls = [u for u, _ in session.calls]
+            self.assertEqual(
+                called_urls,
+                ["https://export.arxiv.org/robots.txt", url_1],
+            )
 
     def test_cli_default_remains_offline_dry_run(self) -> None:
         with patch("requests.Session.get") as mocked_get:

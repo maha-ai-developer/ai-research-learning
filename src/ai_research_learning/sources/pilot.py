@@ -864,6 +864,11 @@ class PilotCoordinator:
                                 error_message=str(err),
                             )
                         )
+                        # Fail closed without retry storms for this source on rate-limit or HTTP access block
+                        if isinstance(err, RateLimitError) or (
+                            err.error_class == "POLICY_BLOCKED" and err.http_status in {401, 403, 451}
+                        ):
+                            break
 
                         # Abort remaining candidates for this source on HTTP 429/503 rate limiting
                         if isinstance(err, RateLimitError):

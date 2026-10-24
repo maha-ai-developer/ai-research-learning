@@ -12,11 +12,13 @@ produce normalized resource envelopes that a coordinator persists through
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import contextlib
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 import urllib.robotparser
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -490,7 +492,7 @@ class HttpRequestEvent:
 
 
 class OriginRateLimiter:
-    """Per-origin sequential rate limiter enforcing source-specific minimum delays."""
+    """Per-origin sequential rate limiter enforcing source-specific minimum delays and a single active connection."""
 
     def __init__(
         self,
@@ -499,22 +501,89 @@ class OriginRateLimiter:
     ) -> None:
         self._sleep_fn = sleep_fn
         self._clock_fn = clock_fn
+        self._lock = threading.RLock()
+        self._origin_locks: dict[str, threading.RLock] = {}
         self._last_request_at: dict[str, float] = {}
+        self._in_flight_by_origin: dict[str, int] = {}
+        self._max_in_flight_by_origin: dict[str, int] = {}
+
+    @staticmethod
+    def _normalize_origin_key(origin: str) -> str:
+        return origin.rstrip("/").lower()
+
+    def _get_origin_lock(self, origin: str) -> threading.RLock:
+        key = self._normalize_origin_key(origin)
+        with self._lock:
+            lock = self._origin_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._origin_locks[key] = lock
+            return lock
 
     def wait(self, origin: str, min_delay_seconds: float) -> float:
         """Wait if needed before issuing a request to `origin`. Returns seconds slept."""
-        key = origin.rstrip("/").lower()
+        key = self._normalize_origin_key(origin)
         enforced_delay = max(0.0, float(min_delay_seconds))
-        now = self._clock_fn()
-        slept = 0.0
-        if key in self._last_request_at:
-            elapsed = now - self._last_request_at[key]
-            remaining = enforced_delay - elapsed
-            if remaining > 0:
-                self._sleep_fn(remaining)
-                slept = remaining
-        self._last_request_at[key] = self._clock_fn()
-        return slept
+        origin_lock = self._get_origin_lock(key)
+        with origin_lock:
+            now = self._clock_fn()
+            slept = 0.0
+            with self._lock:
+                last_at = self._last_request_at.get(key)
+            if last_at is not None:
+                elapsed = now - last_at
+                remaining = enforced_delay - elapsed
+                if remaining > 0:
+                    self._sleep_fn(remaining)
+                    slept = remaining
+            with self._lock:
+                self._last_request_at[key] = self._clock_fn()
+            return slept
+
+    def record_request_completed(self, origin: str, timestamp: float | None = None) -> None:
+        """Record completion timestamp for `origin` so inter-request spacing includes transfer duration."""
+        key = self._normalize_origin_key(origin)
+        now = self._clock_fn() if timestamp is None else float(timestamp)
+        with self._lock:
+            prev = self._last_request_at.get(key)
+            self._last_request_at[key] = max(prev, now) if prev is not None else now
+
+    def last_request_at(self, origin: str) -> float | None:
+        """Return the last recorded request timestamp for `origin`, if any."""
+        key = self._normalize_origin_key(origin)
+        with self._lock:
+            return self._last_request_at.get(key)
+
+    def in_flight(self, origin: str) -> int:
+        """Return the number of currently active in-flight requests for `origin`."""
+        key = self._normalize_origin_key(origin)
+        with self._lock:
+            return self._in_flight_by_origin.get(key, 0)
+
+    def max_in_flight(self, origin: str) -> int:
+        """Return the peak concurrent in-flight requests observed for `origin`."""
+        key = self._normalize_origin_key(origin)
+        with self._lock:
+            return self._max_in_flight_by_origin.get(key, 0)
+
+    @contextlib.contextmanager
+    def connection_slot(self, origin: str, min_delay_seconds: float) -> Iterator[float]:
+        """Acquire an exclusive per-origin connection slot across rate-limit wait and active HTTP transfer."""
+        key = self._normalize_origin_key(origin)
+        origin_lock = self._get_origin_lock(key)
+        with origin_lock:
+            slept = self.wait(key, min_delay_seconds)
+            with self._lock:
+                active = self._in_flight_by_origin.get(key, 0) + 1
+                self._in_flight_by_origin[key] = active
+                if active > self._max_in_flight_by_origin.get(key, 0):
+                    self._max_in_flight_by_origin[key] = active
+            try:
+                yield slept
+            finally:
+                with self._lock:
+                    self._in_flight_by_origin[key] = max(0, self._in_flight_by_origin.get(key, 1) - 1)
+                self.record_request_completed(key)
 
 
 class SourceAdapter(ABC):
@@ -544,6 +613,12 @@ class SourceAdapter(ABC):
         self.request_log: list[HttpRequestEvent] = []
         self._cached_policy: PolicyAuditResult | None = None
         self._response_cache: dict[str, RawMetadataPayload] = {}
+
+    @contextlib.contextmanager
+    def _acquire_origin_slot(self, origin: str, min_delay_seconds: float) -> Iterator[float]:
+        """Acquire a rate-limited, single-connection execution slot for `origin`."""
+        with self.rate_limiter.connection_slot(origin, min_delay_seconds) as slept:
+            yield slept
 
     def _record_http_event(
         self,
@@ -639,59 +714,70 @@ class SourceAdapter(ABC):
         current_url = robots_url
         robots_host = host_of(robots_url)
         response: requests.Response | None = None
+        raw_body: bytes | None = None
+        response_encoding: str = "utf-8"
+        response_headers: dict[str, str] = {}
+        status_code: int | None = None
         try:
             for _ in range(MAX_REDIRECTS + 1):
-                self.rate_limiter.wait(origin_of(current_url), self.min_delay_seconds)
-                response = self.session.get(
-                    current_url,
-                    headers={
-                        "User-Agent": self.user_agent,
-                        "Accept": "text/plain,text/html;q=0.5,*/*;q=0.1",
-                    },
-                    timeout=self.timeout_seconds,
-                    allow_redirects=False,
-                    stream=True,
-                )
-                status_code = response.status_code
-                if status_code in REDIRECT_STATUSES:
-                    location = (response.headers or {}).get("Location")
-                    response.close()
-                    if not location:
-                        self._record_http_event(
-                            purpose="POLICY_AUDIT",
-                            url=current_url,
-                            http_status=status_code,
-                            outcome="redirect-missing-location",
-                        )
-                        raise PolicyBlockedError(
-                            "robots.txt redirect missing Location header",
-                            source_id=self.source_id,
-                            url=current_url,
-                            http_status=status_code,
-                        )
-                    next_url = canonicalize_url(urljoin(current_url, location))
-                    if host_of(next_url) != robots_host:
-                        self._record_http_event(
-                            purpose="POLICY_AUDIT",
-                            url=current_url,
-                            http_status=status_code,
-                            outcome="blocked-cross-host-redirect",
-                        )
-                        raise PolicyBlockedError(
-                            f"robots.txt redirected across hosts to {next_url}; fail-closed",
-                            source_id=self.source_id,
-                            url=current_url,
-                            http_status=status_code,
-                        )
-                    self._record_http_event(
-                        purpose="POLICY_AUDIT",
-                        url=current_url,
-                        http_status=status_code,
-                        outcome="redirect-followed",
+                with self._acquire_origin_slot(origin_of(current_url), self.min_delay_seconds):
+                    response = self.session.get(
+                        current_url,
+                        headers={
+                            "User-Agent": self.user_agent,
+                            "Accept": "text/plain,text/html;q=0.5,*/*;q=0.1",
+                        },
+                        timeout=self.timeout_seconds,
+                        allow_redirects=False,
+                        stream=True,
                     )
-                    current_url = next_url
-                    continue
-                break
+                    status_code = response.status_code
+                    response_headers = dict(getattr(response, "headers", {}) or {})
+                    response_encoding = getattr(response, "encoding", None) or "utf-8"
+                    if status_code in REDIRECT_STATUSES:
+                        location = response_headers.get("Location")
+                        response.close()
+                        response = None
+                        if not location:
+                            self._record_http_event(
+                                purpose="POLICY_AUDIT",
+                                url=current_url,
+                                http_status=status_code,
+                                outcome="redirect-missing-location",
+                            )
+                            raise PolicyBlockedError(
+                                "robots.txt redirect missing Location header",
+                                source_id=self.source_id,
+                                url=current_url,
+                                http_status=status_code,
+                            )
+                        next_url = canonicalize_url(urljoin(current_url, location))
+                        if host_of(next_url) != robots_host:
+                            self._record_http_event(
+                                purpose="POLICY_AUDIT",
+                                url=current_url,
+                                http_status=status_code,
+                                outcome="blocked-cross-host-redirect",
+                            )
+                            raise PolicyBlockedError(
+                                f"robots.txt redirected across hosts to {next_url}; fail-closed",
+                                source_id=self.source_id,
+                                url=current_url,
+                                http_status=status_code,
+                            )
+                        self._record_http_event(
+                            purpose="POLICY_AUDIT",
+                            url=current_url,
+                            http_status=status_code,
+                            outcome="redirect-followed",
+                        )
+                        current_url = next_url
+                        continue
+                    if 200 <= status_code < 300:
+                        raw_body = self._read_limited(response)
+                    response.close()
+                    response = None
+                    break
             else:
                 raise PolicyBlockedError(
                     "Too many redirects while fetching robots.txt",
@@ -699,11 +785,9 @@ class SourceAdapter(ABC):
                     url=robots_url,
                 )
 
-            assert response is not None
-            status_code = response.status_code
+            assert status_code is not None
             if status_code in {429, 503}:
-                retry_after = parse_retry_after((response.headers or {}).get("Retry-After"))
-                response.close()
+                retry_after = parse_retry_after(response_headers.get("Retry-After"))
                 self._record_http_event(
                     purpose="POLICY_AUDIT",
                     url=current_url,
@@ -736,10 +820,8 @@ class SourceAdapter(ABC):
                 return policy
 
             if 200 <= status_code < 300:
-                raw = self._read_limited(response)
-                encoding = getattr(response, "encoding", None) or "utf-8"
-                text = raw.decode(encoding, errors="replace")
-                response.close()
+                assert raw_body is not None
+                text = raw_body.decode(response_encoding, errors="replace")
 
                 # Guard against binary or completely malformed non-text responses
                 if "\x00" in text:
@@ -859,7 +941,8 @@ class SourceAdapter(ABC):
             # Any other HTTP status (e.g. 401, 403, 404, 500) -> fail closed for HTML policy audit
             # unless explicitly handled by RFC 9309, wait: Task 012 says:
             # "If a site policy cannot be fetched or interpreted reliably, fail closed for that source's HTML collection and explain the blocker."
-            response.close()
+            if response is not None:
+                response.close()
             self._record_http_event(
                 purpose="POLICY_AUDIT",
                 url=current_url,
