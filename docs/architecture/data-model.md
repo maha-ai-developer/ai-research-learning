@@ -409,6 +409,14 @@ Learner progress document (`users/{uid}/progress/{concept_id}`):
 }
 ```
 
+### 4.9 Discovered-Link Candidates and Offline Curation Review Records (`discovered_link_candidates` & `discovered_link_reviews`)
+
+Links extracted during HTML or API metadata collection are persisted in the local SQLite store (`discovered_link_candidates`, introduced in Migration `4` and extended for offline human curation in Migration `5` / `0005_discovered_link_curation_reviews`).
+
+- **Review States (`review_status`):** `PENDING_REVIEW`, `ACCEPTED_FOR_REFERENCE`, `APPROVED_FOR_MANIFEST`, `REJECTED`, `DEFERRED`.
+- **Separation of Curation and Fetching:** Recording a discovery or a human curation review decision (`ACCEPTED_FOR_REFERENCE`, `APPROVED_FOR_MANIFEST`, etc.) **never** triggers a network fetch and **never** sets `fetch_permission_granted = 1`. Any future metadata fetch must pass the source-specific policy gate (`robots.txt` or official API terms) independently.
+- **Preserved Audit Lineage:** Every candidate preserves `original_url`, `normalized_url`, `referring_resource_id`, `referring_source_id`, `from_url`, `host_domain`, and `domain_classification` (`INTERNAL` or `EXTERNAL`), plus latest review metadata (`reviewed_by`, `reviewed_at`, `review_reason`, `review_count`, `last_review_event_id`) and an append-only audit trail in `discovered_link_reviews` linked to `provenance_events` (`CANDIDATE_LINK_REVIEWED`).
+
 ---
 
 ## 5. Firestore vs. Cloud Storage Partitioning Summary

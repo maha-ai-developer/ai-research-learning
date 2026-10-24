@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import csv
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
+import io
+import ipaddress
 import json
 from pathlib import Path
 import re
@@ -37,7 +40,34 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SEED_PATH = ROOT / "seed_urls.json"
 DEFAULT_DB_PATH = ROOT / "data" / "runtime" / "inventory.sqlite"
 
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 5
+
+VALID_CANDIDATE_REVIEW_STATUSES: tuple[str, ...] = (
+    "PENDING_REVIEW",
+    "ACCEPTED_FOR_REFERENCE",
+    "APPROVED_FOR_MANIFEST",
+    "REJECTED",
+    "DEFERRED",
+)
+VALID_DOMAIN_CLASSIFICATIONS: tuple[str, ...] = ("INTERNAL", "EXTERNAL")
+
+_HOST_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+_HOST_TLD_RE = re.compile(r"^(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$")
+_PROHIBITED_EXACT_HOSTS = frozenset(
+    {
+        "localhost",
+        "metadata.google.internal",
+        "metadata",
+        "instance-data",
+    }
+)
+_PROHIBITED_HOST_SUFFIXES: tuple[str, ...] = (
+    ".localhost",
+    ".local",
+    ".internal",
+    ".home.arpa",
+    ".localdomain",
+)
 
 
 def utc_now() -> str:
@@ -53,14 +83,17 @@ def sha256_hex(value: str) -> str:
 def validate_and_canonicalize_url(url: Any) -> str:
     """Validate an HTTP/HTTPS URL and return its deterministic canonical form.
 
-    Raises ValueError if the input is not a valid HTTP(S) URL with a host.
+    Rejects unsafe schemes, embedded credentials, malformed URLs/hosts, and
+    prohibited destinations (loopback, private networks, link-local / cloud
+    metadata endpoints, reserved/multicast/unspecified IPs, and internal TLDs).
+    Raises ValueError if the input is not a valid public HTTP(S) URL.
     """
     if not isinstance(url, str):
         raise ValueError("URL must be a string")
     cleaned = url.strip()
     if not cleaned:
         raise ValueError("URL cannot be empty")
-    if any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
         raise ValueError(f"URL contains whitespace or control characters: {url!r}")
 
     parsed = urlsplit(cleaned)
@@ -69,7 +102,9 @@ def validate_and_canonicalize_url(url: Any) -> str:
         raise ValueError(f"URL must use http or https scheme, got {parsed.scheme!r}: {url!r}")
     if not parsed.netloc:
         raise ValueError(f"URL is missing network host (netloc): {url!r}")
-    if parsed.username or parsed.password:
+    if "\\" in parsed.netloc or "\\" in parsed.scheme:
+        raise ValueError(f"URL contains malformed backslash in authority: {url!r}")
+    if parsed.username or parsed.password or "@" in parsed.netloc:
         raise ValueError(f"URL must not contain embedded credentials: {url!r}")
 
     try:
@@ -78,13 +113,44 @@ def validate_and_canonicalize_url(url: Any) -> str:
         raise ValueError(f"URL has invalid port: {url!r}") from exc
 
     hostname = (parsed.hostname or "").lower().strip()
-    if not hostname or "." not in hostname and hostname != "localhost":
+    if not hostname:
         raise ValueError(f"URL has invalid hostname {hostname!r}: {url!r}")
 
-    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443) or port is None:
-        netloc = hostname
+    if hostname in _PROHIBITED_EXACT_HOSTS or hostname.endswith(_PROHIBITED_HOST_SUFFIXES):
+        raise ValueError(f"URL points to prohibited destination host {hostname!r}: {url!r}")
+
+    try:
+        ip_obj = ipaddress.ip_address(hostname)
+    except ValueError:
+        ip_obj = None
+
+    if ip_obj is not None:
+        mapped_v4 = getattr(ip_obj, "ipv4_mapped", None)
+        for addr in (ip_obj, mapped_v4) if mapped_v4 is not None else (ip_obj,):
+            if (
+                addr.is_private
+                or addr.is_loopback
+                or addr.is_link_local
+                or addr.is_multicast
+                or addr.is_reserved
+                or addr.is_unspecified
+            ):
+                raise ValueError(
+                    f"URL points to prohibited destination IP address {hostname!r}: {url!r}"
+                )
+        host_for_netloc = f"[{hostname}]" if isinstance(ip_obj, ipaddress.IPv6Address) else hostname
     else:
-        netloc = f"{hostname}:{port}"
+        if "." not in hostname:
+            raise ValueError(f"URL has invalid hostname {hostname!r}: {url!r}")
+        labels = hostname.split(".")
+        if any(not _HOST_LABEL_RE.match(lbl) for lbl in labels) or not _HOST_TLD_RE.match(labels[-1]):
+            raise ValueError(f"URL has invalid or prohibited hostname {hostname!r}: {url!r}")
+        host_for_netloc = hostname
+
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443) or port is None:
+        netloc = host_for_netloc
+    else:
+        netloc = f"{host_for_netloc}:{port}"
 
     path = parsed.path or "/"
     return urlunsplit((scheme, netloc, path, parsed.query, ""))
@@ -106,6 +172,24 @@ def compute_candidate_link_id(referring_resource_id: str, normalized_url: str) -
         raise ValueError("normalized_url must be a non-empty string")
     digest = sha256_hex(f"{referring_resource_id.strip()}:{normalized_url.strip()}")[:16]
     return f"cand_{digest}"
+
+
+def compute_candidate_review_id(
+    candidate_id: str,
+    review_number: int,
+    new_review_status: str,
+    reviewer: str,
+    reason: str,
+    reviewed_at: str,
+) -> str:
+    """Compute deterministic candidate review audit ID: `rev_<yyyymmdd>_<sha256_10>_r<n>`."""
+    date_part = (reviewed_at or utc_now())[:10].replace("-", "")
+    if not re.fullmatch(r"\d{8}", date_part):
+        date_part = datetime.now(timezone.utc).strftime("%Y%m%d")
+    digest = sha256_hex(
+        f"{candidate_id}:{review_number}:{new_review_status}:{reviewer}:{reason}:{reviewed_at}"
+    )[:10]
+    return f"rev_{date_part}_{digest}_r{review_number}"
 
 
 def compute_version_id(
@@ -923,11 +1007,213 @@ def _migration_4_discovered_link_candidates(conn: sqlite3.Connection) -> None:
             continue
 
 
+DISCOVERED_LINK_CURATION_V5_SQL = """
+CREATE TABLE discovered_link_candidates_v5 (
+    candidate_id            TEXT PRIMARY KEY,
+    referring_resource_id   TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+    referring_source_id     TEXT NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
+    from_manifest_id        TEXT,
+    from_url                TEXT NOT NULL,
+    raw_href                TEXT NOT NULL,
+    original_url            TEXT NOT NULL,
+    normalized_url          TEXT NOT NULL,
+    host_domain             TEXT NOT NULL,
+    is_internal             INTEGER NOT NULL DEFAULT 0 CHECK (is_internal IN (0, 1)),
+    domain_classification   TEXT NOT NULL CHECK (domain_classification IN ('INTERNAL', 'EXTERNAL')),
+    target_scope            TEXT NOT NULL,
+    recommended_decision    TEXT NOT NULL,
+    policy_state            TEXT NOT NULL DEFAULT 'UNVERIFIED_EXTERNAL_CANDIDATE',
+    review_status           TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
+                                CHECK (review_status IN (
+                                    'PENDING_REVIEW',
+                                    'ACCEPTED_FOR_REFERENCE',
+                                    'APPROVED_FOR_MANIFEST',
+                                    'REJECTED',
+                                    'DEFERRED'
+                                )),
+    fetch_permission_granted INTEGER NOT NULL DEFAULT 0 CHECK (fetch_permission_granted IN (0, 1)),
+    promoted_resource_id    TEXT REFERENCES resources(resource_id) ON DELETE SET NULL,
+    link_text               TEXT,
+    rel                     TEXT,
+    first_seen_at           TEXT NOT NULL,
+    last_seen_at            TEXT NOT NULL,
+    seen_count              INTEGER NOT NULL DEFAULT 1 CHECK (seen_count >= 1),
+    first_run_id            TEXT,
+    last_run_id             TEXT,
+    provenance_event_id     TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL,
+    reviewed_by             TEXT,
+    reviewed_at             TEXT,
+    review_reason           TEXT,
+    review_count            INTEGER NOT NULL DEFAULT 0 CHECK (review_count >= 0),
+    last_review_event_id    TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL,
+    UNIQUE (referring_resource_id, normalized_url)
+);
+
+CREATE TABLE IF NOT EXISTS discovered_link_reviews (
+    review_id               TEXT PRIMARY KEY,
+    candidate_id            TEXT NOT NULL REFERENCES discovered_link_candidates(candidate_id) ON DELETE CASCADE,
+    referring_resource_id   TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+    referring_source_id     TEXT NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
+    original_url            TEXT NOT NULL,
+    normalized_url          TEXT NOT NULL,
+    domain_classification   TEXT NOT NULL CHECK (domain_classification IN ('INTERNAL', 'EXTERNAL')),
+    previous_review_status  TEXT NOT NULL CHECK (previous_review_status IN (
+                                'PENDING_REVIEW',
+                                'ACCEPTED_FOR_REFERENCE',
+                                'APPROVED_FOR_MANIFEST',
+                                'REJECTED',
+                                'DEFERRED'
+                            )),
+    new_review_status       TEXT NOT NULL CHECK (new_review_status IN (
+                                'PENDING_REVIEW',
+                                'ACCEPTED_FOR_REFERENCE',
+                                'APPROVED_FOR_MANIFEST',
+                                'REJECTED',
+                                'DEFERRED'
+                            )),
+    reviewer                TEXT NOT NULL,
+    review_reason           TEXT NOT NULL,
+    reviewed_at             TEXT NOT NULL,
+    fetch_permission_granted INTEGER NOT NULL DEFAULT 0 CHECK (fetch_permission_granted = 0),
+    provenance_event_id     TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL
+);
+"""
+
+
+def _migration_5_discovered_link_curation_reviews(conn: sqlite3.Connection) -> None:
+    """Forward-only migration 5: expand `discovered_link_candidates` for curation decisions and create `discovered_link_reviews`."""
+    conn.execute("DROP TABLE IF EXISTS discovered_link_candidates_v5")
+    conn.execute(
+        """
+        CREATE TABLE discovered_link_candidates_v5 (
+            candidate_id            TEXT PRIMARY KEY,
+            referring_resource_id   TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+            referring_source_id     TEXT NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
+            from_manifest_id        TEXT,
+            from_url                TEXT NOT NULL,
+            raw_href                TEXT NOT NULL,
+            original_url            TEXT NOT NULL,
+            normalized_url          TEXT NOT NULL,
+            host_domain             TEXT NOT NULL,
+            is_internal             INTEGER NOT NULL DEFAULT 0 CHECK (is_internal IN (0, 1)),
+            domain_classification   TEXT NOT NULL CHECK (domain_classification IN ('INTERNAL', 'EXTERNAL')),
+            target_scope            TEXT NOT NULL,
+            recommended_decision    TEXT NOT NULL,
+            policy_state            TEXT NOT NULL DEFAULT 'UNVERIFIED_EXTERNAL_CANDIDATE',
+            review_status           TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
+                                        CHECK (review_status IN (
+                                            'PENDING_REVIEW',
+                                            'ACCEPTED_FOR_REFERENCE',
+                                            'APPROVED_FOR_MANIFEST',
+                                            'REJECTED',
+                                            'DEFERRED'
+                                        )),
+            fetch_permission_granted INTEGER NOT NULL DEFAULT 0 CHECK (fetch_permission_granted IN (0, 1)),
+            promoted_resource_id    TEXT REFERENCES resources(resource_id) ON DELETE SET NULL,
+            link_text               TEXT,
+            rel                     TEXT,
+            first_seen_at           TEXT NOT NULL,
+            last_seen_at            TEXT NOT NULL,
+            seen_count              INTEGER NOT NULL DEFAULT 1 CHECK (seen_count >= 1),
+            first_run_id            TEXT,
+            last_run_id             TEXT,
+            provenance_event_id     TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL,
+            reviewed_by             TEXT,
+            reviewed_at             TEXT,
+            review_reason           TEXT,
+            review_count            INTEGER NOT NULL DEFAULT 0 CHECK (review_count >= 0),
+            last_review_event_id    TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL,
+            UNIQUE (referring_resource_id, normalized_url)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO discovered_link_candidates_v5 (
+            candidate_id, referring_resource_id, referring_source_id,
+            from_manifest_id, from_url, raw_href, original_url,
+            normalized_url, host_domain, is_internal, domain_classification,
+            target_scope, recommended_decision, policy_state, review_status,
+            fetch_permission_granted, promoted_resource_id, link_text, rel,
+            first_seen_at, last_seen_at, seen_count,
+            first_run_id, last_run_id, provenance_event_id,
+            reviewed_by, reviewed_at, review_reason, review_count, last_review_event_id
+        )
+        SELECT
+            candidate_id, referring_resource_id, referring_source_id,
+            from_manifest_id, from_url, raw_href, original_url,
+            normalized_url, host_domain, is_internal, domain_classification,
+            target_scope, recommended_decision, policy_state, review_status,
+            fetch_permission_granted, promoted_resource_id, link_text, rel,
+            first_seen_at, last_seen_at, seen_count,
+            first_run_id, last_run_id, provenance_event_id,
+            NULL, NULL, NULL, 0, NULL
+          FROM discovered_link_candidates
+        """
+    )
+    conn.execute("DROP TABLE discovered_link_candidates")
+    conn.execute("ALTER TABLE discovered_link_candidates_v5 RENAME TO discovered_link_candidates")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_resource ON discovered_link_candidates(referring_resource_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_source ON discovered_link_candidates(referring_source_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_url ON discovered_link_candidates(normalized_url)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_host ON discovered_link_candidates(host_domain, domain_classification)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_review ON discovered_link_candidates(review_status, fetch_permission_granted)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS discovered_link_reviews (
+            review_id               TEXT PRIMARY KEY,
+            candidate_id            TEXT NOT NULL REFERENCES discovered_link_candidates(candidate_id) ON DELETE CASCADE,
+            referring_resource_id   TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+            referring_source_id     TEXT NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
+            original_url            TEXT NOT NULL,
+            normalized_url          TEXT NOT NULL,
+            domain_classification   TEXT NOT NULL CHECK (domain_classification IN ('INTERNAL', 'EXTERNAL')),
+            previous_review_status  TEXT NOT NULL CHECK (previous_review_status IN (
+                                        'PENDING_REVIEW',
+                                        'ACCEPTED_FOR_REFERENCE',
+                                        'APPROVED_FOR_MANIFEST',
+                                        'REJECTED',
+                                        'DEFERRED'
+                                    )),
+            new_review_status       TEXT NOT NULL CHECK (new_review_status IN (
+                                        'PENDING_REVIEW',
+                                        'ACCEPTED_FOR_REFERENCE',
+                                        'APPROVED_FOR_MANIFEST',
+                                        'REJECTED',
+                                        'DEFERRED'
+                                    )),
+            reviewer                TEXT NOT NULL,
+            review_reason           TEXT NOT NULL,
+            reviewed_at             TEXT NOT NULL,
+            fetch_permission_granted INTEGER NOT NULL DEFAULT 0 CHECK (fetch_permission_granted = 0),
+            provenance_event_id     TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_link_reviews_candidate ON discovered_link_reviews(candidate_id, reviewed_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_discovered_link_reviews_status ON discovered_link_reviews(new_review_status, reviewed_at)"
+    )
+
+
 MIGRATIONS: tuple[tuple[int, str, str, Any], ...] = (
     (1, "0001_legacy_collector_tables", LEGACY_COLLECTOR_TABLES_SQL, _migration_1_legacy_tables),
     (2, "0002_canonical_knowledge_store_v1", CANONICAL_SCHEMA_V2_SQL, _migration_2_canonical_schema),
     (3, "0003_seed_canonical_sources_and_backfill", "SEED_CANONICAL_SOURCES_V3", _migration_3_seed_sources_and_backfill),
     (4, "0004_discovered_link_candidates", DISCOVERED_LINK_CANDIDATES_V4_SQL, _migration_4_discovered_link_candidates),
+    (5, "0005_discovered_link_curation_reviews", DISCOVERED_LINK_CURATION_V5_SQL, _migration_5_discovered_link_curation_reviews),
 )
 
 
@@ -2063,7 +2349,7 @@ class KnowledgeStore:
             if internal_flag
             else "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH"
         )
-        if review_status not in ("PENDING_REVIEW", "APPROVED_FOR_MANIFEST", "REJECTED", "DEFERRED"):
+        if review_status not in VALID_CANDIDATE_REVIEW_STATUSES:
             raise ValueError(f"Invalid review_status: {review_status!r}")
 
         candidate_id = compute_candidate_link_id(referring_resource_id, canonical_target_url)
@@ -2209,33 +2495,609 @@ class KnowledgeStore:
             raise ValueError("Specify candidate_id or both referring_resource_id and normalized_url")
         return dict(row) if row is not None else None
 
+    CANDIDATE_EXPORT_COLUMNS: tuple[str, ...] = (
+        "candidate_id",
+        "referring_resource_id",
+        "referring_source_id",
+        "from_manifest_id",
+        "from_url",
+        "raw_href",
+        "original_url",
+        "normalized_url",
+        "host_domain",
+        "is_internal",
+        "domain_classification",
+        "target_scope",
+        "recommended_decision",
+        "policy_state",
+        "review_status",
+        "fetch_permission_granted",
+        "promoted_resource_id",
+        "link_text",
+        "rel",
+        "first_seen_at",
+        "last_seen_at",
+        "seen_count",
+        "first_run_id",
+        "last_run_id",
+        "provenance_event_id",
+        "reviewed_by",
+        "reviewed_at",
+        "review_reason",
+        "review_count",
+        "last_review_event_id",
+    )
+
+    @staticmethod
+    def _build_candidate_filter_clause(
+        *,
+        referring_resource_id: str | None = None,
+        referring_source_id: str | None = None,
+        host_domain: str | None = None,
+        domain_classification: str | None = None,
+        review_status: str | None = None,
+    ) -> tuple[str, list[Any], dict[str, str | None]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        norm_resource_id = referring_resource_id.strip() if referring_resource_id is not None else None
+        norm_source_id = referring_source_id.strip() if referring_source_id is not None else None
+        norm_domain = host_domain.strip().lower().rstrip(".") if host_domain is not None else None
+        norm_classification = (
+            domain_classification.strip().upper() if domain_classification is not None else None
+        )
+        norm_status = review_status.strip().upper() if review_status is not None else None
+
+        if norm_resource_id:
+            clauses.append("referring_resource_id = ?")
+            params.append(norm_resource_id)
+        if norm_source_id:
+            clauses.append("referring_source_id = ?")
+            params.append(norm_source_id)
+        if norm_domain:
+            clauses.append("LOWER(host_domain) = ?")
+            params.append(norm_domain)
+        if norm_classification:
+            if norm_classification not in VALID_DOMAIN_CLASSIFICATIONS:
+                raise ValueError(
+                    f"Invalid domain_classification {domain_classification!r}; "
+                    f"expected one of {VALID_DOMAIN_CLASSIFICATIONS}"
+                )
+            clauses.append("domain_classification = ?")
+            params.append(norm_classification)
+        if norm_status:
+            if norm_status not in VALID_CANDIDATE_REVIEW_STATUSES:
+                raise ValueError(
+                    f"Invalid review_status {review_status!r}; "
+                    f"expected one of {VALID_CANDIDATE_REVIEW_STATUSES}"
+                )
+            clauses.append("review_status = ?")
+            params.append(norm_status)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        filters = {
+            "referring_resource_id": norm_resource_id or None,
+            "referring_source_id": norm_source_id or None,
+            "host_domain": norm_domain or None,
+            "domain_classification": norm_classification or None,
+            "review_status": norm_status or None,
+        }
+        return where_sql, params, filters
+
+    def count_discovered_link_candidates(
+        self,
+        *,
+        referring_resource_id: str | None = None,
+        referring_source_id: str | None = None,
+        host_domain: str | None = None,
+        domain_classification: str | None = None,
+        review_status: str | None = None,
+    ) -> int:
+        """Count persisted discovered link candidates matching optional filters."""
+        where_sql, params, _ = self._build_candidate_filter_clause(
+            referring_resource_id=referring_resource_id,
+            referring_source_id=referring_source_id,
+            host_domain=host_domain,
+            domain_classification=domain_classification,
+            review_status=review_status,
+        )
+        row = self.conn.execute(
+            f"SELECT COUNT(*) FROM discovered_link_candidates {where_sql}",
+            tuple(params),
+        ).fetchone()
+        return int(row[0]) if row is not None else 0
+
     def list_discovered_link_candidates(
         self,
         *,
         referring_resource_id: str | None = None,
         referring_source_id: str | None = None,
+        host_domain: str | None = None,
         domain_classification: str | None = None,
         review_status: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """List persisted discovered link candidates with optional filtering."""
+        """List persisted discovered link candidates with optional filtering and pagination."""
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
+        if limit is not None and limit <= 0:
+            raise ValueError(f"limit must be > 0 when provided, got {limit}")
+
+        where_sql, params, _ = self._build_candidate_filter_clause(
+            referring_resource_id=referring_resource_id,
+            referring_source_id=referring_source_id,
+            host_domain=host_domain,
+            domain_classification=domain_classification,
+            review_status=review_status,
+        )
+        sql = f"SELECT * FROM discovered_link_candidates {where_sql} ORDER BY first_seen_at ASC, candidate_id ASC"
+        query_params = list(params)
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            query_params.extend([limit, offset])
+        elif offset > 0:
+            sql += " LIMIT -1 OFFSET ?"
+            query_params.append(offset)
+
+        rows = self.conn.execute(sql, tuple(query_params)).fetchall()
+        return [dict(r) for r in rows]
+
+    def query_discovered_link_candidates(
+        self,
+        *,
+        referring_resource_id: str | None = None,
+        referring_source_id: str | None = None,
+        host_domain: str | None = None,
+        domain_classification: str | None = None,
+        review_status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Query discovered link candidates with pagination metadata and applied filters."""
+        if offset < 0:
+            raise ValueError(f"offset must be >= 0, got {offset}")
+        if limit <= 0:
+            raise ValueError(f"limit must be > 0, got {limit}")
+
+        where_sql, params, filters = self._build_candidate_filter_clause(
+            referring_resource_id=referring_resource_id,
+            referring_source_id=referring_source_id,
+            host_domain=host_domain,
+            domain_classification=domain_classification,
+            review_status=review_status,
+        )
+        total_row = self.conn.execute(
+            f"SELECT COUNT(*) FROM discovered_link_candidates {where_sql}",
+            tuple(params),
+        ).fetchone()
+        total_count = int(total_row[0]) if total_row is not None else 0
+
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM discovered_link_candidates
+            {where_sql}
+            ORDER BY first_seen_at ASC, candidate_id ASC
+            LIMIT ? OFFSET ?
+            """,
+            tuple([*params, limit, offset]),
+        ).fetchall()
+        items = [dict(r) for r in rows]
+        return {
+            "total_count": total_count,
+            "returned_count": len(items),
+            "limit": limit,
+            "offset": offset,
+            "has_more": (offset + len(items)) < total_count,
+            "filters": filters,
+            "items": items,
+        }
+
+    def summarize_discovered_link_candidates(
+        self,
+        *,
+        referring_source_id: str | None = None,
+        host_domain: str | None = None,
+        domain_classification: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a summary of pending, accepted-for-reference, rejected, and other candidate counts."""
+        where_sql, params, filters = self._build_candidate_filter_clause(
+            referring_source_id=referring_source_id,
+            host_domain=host_domain,
+            domain_classification=domain_classification,
+        )
+
+        by_review_status: dict[str, int] = {status: 0 for status in VALID_CANDIDATE_REVIEW_STATUSES}
+        for row in self.conn.execute(
+            f"""
+            SELECT review_status, COUNT(*) AS cnt
+              FROM discovered_link_candidates
+              {where_sql}
+             GROUP BY review_status
+             ORDER BY review_status ASC
+            """,
+            tuple(params),
+        ).fetchall():
+            by_review_status[str(row["review_status"])] = int(row["cnt"])
+
+        by_classification: dict[str, int] = {cls: 0 for cls in VALID_DOMAIN_CLASSIFICATIONS}
+        for row in self.conn.execute(
+            f"""
+            SELECT domain_classification, COUNT(*) AS cnt
+              FROM discovered_link_candidates
+              {where_sql}
+             GROUP BY domain_classification
+             ORDER BY domain_classification ASC
+            """,
+            tuple(params),
+        ).fetchall():
+            by_classification[str(row["domain_classification"])] = int(row["cnt"])
+
+        by_source: dict[str, int] = {}
+        for row in self.conn.execute(
+            f"""
+            SELECT referring_source_id, COUNT(*) AS cnt
+              FROM discovered_link_candidates
+              {where_sql}
+             GROUP BY referring_source_id
+             ORDER BY referring_source_id ASC
+            """,
+            tuple(params),
+        ).fetchall():
+            by_source[str(row["referring_source_id"])] = int(row["cnt"])
+
+        by_domain: dict[str, int] = {}
+        for row in self.conn.execute(
+            f"""
+            SELECT host_domain, COUNT(*) AS cnt
+              FROM discovered_link_candidates
+              {where_sql}
+             GROUP BY host_domain
+             ORDER BY cnt DESC, host_domain ASC
+            """,
+            tuple(params),
+        ).fetchall():
+            by_domain[str(row["host_domain"])] = int(row["cnt"])
+
+        fetch_perm_clause = (
+            f"{where_sql} AND fetch_permission_granted = 1"
+            if where_sql
+            else "WHERE fetch_permission_granted = 1"
+        )
+        fetch_perm_row = self.conn.execute(
+            f"SELECT COUNT(*) FROM discovered_link_candidates {fetch_perm_clause}",
+            tuple(params),
+        ).fetchone()
+        fetch_permission_granted_count = int(fetch_perm_row[0]) if fetch_perm_row is not None else 0
+
+        review_events_row = self.conn.execute(
+            "SELECT COUNT(*) FROM discovered_link_reviews"
+        ).fetchone()
+        review_events_count = int(review_events_row[0]) if review_events_row is not None else 0
+
+        total_candidates = sum(by_review_status.values())
+        return {
+            "total_candidates": total_candidates,
+            "pending_count": by_review_status["PENDING_REVIEW"],
+            "accepted_for_reference_count": by_review_status["ACCEPTED_FOR_REFERENCE"],
+            "approved_for_manifest_count": by_review_status["APPROVED_FOR_MANIFEST"],
+            "rejected_count": by_review_status["REJECTED"],
+            "deferred_count": by_review_status["DEFERRED"],
+            "by_review_status": by_review_status,
+            "by_domain_classification": by_classification,
+            "by_source": by_source,
+            "by_host_domain": by_domain,
+            "fetch_permission_granted_count": fetch_permission_granted_count,
+            "review_events_count": review_events_count,
+            "filters": {
+                "referring_source_id": filters["referring_source_id"],
+                "host_domain": filters["host_domain"],
+                "domain_classification": filters["domain_classification"],
+            },
+        }
+
+    def export_discovered_link_candidates(
+        self,
+        *,
+        export_format: str = "json",
+        output_path: Path | str | None = None,
+        referring_resource_id: str | None = None,
+        referring_source_id: str | None = None,
+        host_domain: str | None = None,
+        domain_classification: str | None = None,
+        review_status: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> str:
+        """Export filtered discovered link candidates to CSV or JSON without network access."""
+        fmt = (export_format or "").strip().lower()
+        if fmt not in ("csv", "json"):
+            raise ValueError(f"Unsupported export_format {export_format!r}; expected 'csv' or 'json'")
+
+        candidates = self.list_discovered_link_candidates(
+            referring_resource_id=referring_resource_id,
+            referring_source_id=referring_source_id,
+            host_domain=host_domain,
+            domain_classification=domain_classification,
+            review_status=review_status,
+            limit=limit,
+            offset=offset,
+        )
+
+        ordered_rows = [
+            {col: row.get(col) for col in self.CANDIDATE_EXPORT_COLUMNS}
+            for row in candidates
+        ]
+
+        if fmt == "json":
+            serialized = json.dumps(ordered_rows, indent=2, ensure_ascii=False) + "\n"
+        else:
+            buffer = io.StringIO()
+            writer = csv.DictWriter(
+                buffer,
+                fieldnames=list(self.CANDIDATE_EXPORT_COLUMNS),
+                lineterminator="\n",
+            )
+            writer.writeheader()
+            for row in ordered_rows:
+                writer.writerow(row)
+            serialized = buffer.getvalue()
+
+        if output_path is not None:
+            target = Path(output_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(serialized, encoding="utf-8")
+
+        return serialized
+
+    def review_discovered_link_candidate(
+        self,
+        *,
+        decision: str,
+        reviewer: str,
+        reason: str,
+        candidate_id: str | None = None,
+        referring_resource_id: str | None = None,
+        normalized_url: str | None = None,
+        reviewed_at: str | None = None,
+        run_id: str | None = None,
+        acquisition_method: str = "HUMAN_CURATION_REVIEW",
+    ) -> dict[str, Any]:
+        """Record an offline human curation review decision for a discovered link candidate.
+
+        Safety invariants:
+        - Never performs any network request.
+        - Never grants fetch permission (`fetch_permission_granted` remains `0`).
+          Accepting a candidate for reference (`ACCEPTED_FOR_REFERENCE`) or approving
+          it for manifest consideration (`APPROVED_FOR_MANIFEST`) does NOT authorize
+          automated fetching; any future fetch must pass the source-specific policy gate.
+        - Preserves `original_url` and `referring_resource_id` / `from_url` for auditability.
+        - Validates candidate URLs against unsafe schemes, embedded credentials,
+          malformed syntax, and prohibited destinations before allowing non-rejection
+          review states.
+        - Idempotent when repeating the exact same `(decision, reviewer, reason)` on a
+          candidate already in that state.
+        """
+        clean_decision = (decision or "").strip().upper()
+        if clean_decision not in VALID_CANDIDATE_REVIEW_STATUSES:
+            raise ValueError(
+                f"Invalid review decision {decision!r}; expected one of {VALID_CANDIDATE_REVIEW_STATUSES}"
+            )
+        clean_reviewer = (reviewer or "").strip()
+        if not clean_reviewer:
+            raise ValueError("reviewer must be a non-empty string")
+        clean_reason = (reason or "").strip()
+        if not clean_reason:
+            raise ValueError("reason must be a non-empty string")
+
+        existing = self.get_discovered_link_candidate(
+            candidate_id=candidate_id,
+            referring_resource_id=referring_resource_id,
+            normalized_url=normalized_url,
+        )
+        if existing is None:
+            lookup_desc = (
+                f"candidate_id={candidate_id!r}"
+                if candidate_id is not None
+                else f"referring_resource_id={referring_resource_id!r}, normalized_url={normalized_url!r}"
+            )
+            raise KeyError(f"Discovered link candidate not found ({lookup_desc})")
+
+        resolved_candidate_id = str(existing["candidate_id"])
+        orig_url = str(existing.get("original_url") or "").strip()
+        norm_url = str(existing.get("normalized_url") or "").strip()
+        from_url = str(existing.get("from_url") or "").strip()
+        ref_res_id = str(existing.get("referring_resource_id") or "").strip()
+
+        if not orig_url or not norm_url or not from_url or not ref_res_id:
+            raise ValueError(
+                f"Candidate {resolved_candidate_id} is missing required audit fields "
+                "(original_url, normalized_url, from_url, or referring_resource_id)"
+            )
+
+        url_validation_error: str | None = None
+        try:
+            canonical_from = validate_and_canonicalize_url(from_url)
+            canonical_orig = validate_and_canonicalize_url(orig_url)
+            canonical_norm = validate_and_canonicalize_url(norm_url)
+            if canonical_orig != canonical_norm or canonical_norm != norm_url:
+                url_validation_error = (
+                    f"normalized_url {norm_url!r} does not match canonicalized original_url {canonical_orig!r}"
+                )
+            elif canonical_from != from_url:
+                url_validation_error = (
+                    f"from_url {from_url!r} does not match canonicalized form {canonical_from!r}"
+                )
+        except ValueError as exc:
+            url_validation_error = str(exc)
+
+        if url_validation_error is not None and clean_decision != "REJECTED":
+            raise ValueError(
+                f"Cannot set review_status={clean_decision!r} on candidate {resolved_candidate_id} "
+                f"with unsafe or malformed URL: {url_validation_error}"
+            )
+
+        is_internal = bool(int(existing["is_internal"]))
+        if clean_decision == "REJECTED":
+            new_policy_state = "CURATION_REJECTED_NO_FETCH"
+        elif clean_decision == "ACCEPTED_FOR_REFERENCE":
+            new_policy_state = (
+                "SAME_ORIGIN_ACCEPTED_REFERENCE_ONLY_NO_FETCH"
+                if is_internal
+                else "CURATION_ACCEPTED_REFERENCE_ONLY_NO_FETCH"
+            )
+        elif clean_decision == "APPROVED_FOR_MANIFEST":
+            new_policy_state = (
+                "SAME_ORIGIN_MANIFEST_CANDIDATE_REQUIRES_POLICY_GATE_NO_AUTO_FETCH"
+                if is_internal
+                else "EXTERNAL_MANIFEST_CANDIDATE_REQUIRES_POLICY_GATE_NO_AUTO_FETCH"
+            )
+        elif clean_decision == "DEFERRED":
+            new_policy_state = "CURATION_DEFERRED_NO_FETCH"
+        else:
+            new_policy_state = (
+                "SAME_ORIGIN_CANDIDATE_NOT_AUTO_FETCHED"
+                if is_internal
+                else "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH"
+            )
+
+        # Idempotent no-op when repeating the exact same decision, reviewer, and reason
+        if (
+            existing.get("review_status") == clean_decision
+            and existing.get("reviewed_by") == clean_reviewer
+            and existing.get("review_reason") == clean_reason
+            and int(existing.get("fetch_permission_granted") or 0) == 0
+            and existing.get("policy_state") == new_policy_state
+        ):
+            unchanged = dict(existing)
+            unchanged["operation"] = "unchanged"
+            unchanged["review_id"] = existing.get("last_review_event_id")
+            return unchanged
+
+        now = reviewed_at or utc_now()
+        previous_review_status = str(existing["review_status"])
+        previous_policy_state = str(existing["policy_state"])
+        new_review_count = int(existing.get("review_count") or 0) + 1
+
+        with self.transaction() as conn:
+            prov = self.record_provenance(
+                event_type="CANDIDATE_LINK_REVIEWED",
+                acquisition_method=acquisition_method,
+                actor=clean_reviewer,
+                status=f"review-{clean_decision.lower()}",
+                source_id=str(existing["referring_source_id"]),
+                resource_id=ref_res_id,
+                run_id=run_id,
+                manifest_id=existing.get("from_manifest_id"),
+                source_url=from_url,
+                final_url=norm_url,
+                details={
+                    "candidate_id": resolved_candidate_id,
+                    "referring_resource_id": ref_res_id,
+                    "referring_source_id": existing["referring_source_id"],
+                    "from_url": from_url,
+                    "original_url": orig_url,
+                    "normalized_url": norm_url,
+                    "host_domain": existing["host_domain"],
+                    "domain_classification": existing["domain_classification"],
+                    "previous_review_status": previous_review_status,
+                    "new_review_status": clean_decision,
+                    "previous_policy_state": previous_policy_state,
+                    "new_policy_state": new_policy_state,
+                    "fetch_permission_granted": False,
+                    "reviewer": clean_reviewer,
+                    "reason": clean_reason,
+                    "reviewed_at": now,
+                    "review_count": new_review_count,
+                },
+                recorded_at=now,
+            )
+            prov_event_id = prov["event_id"]
+            review_id = compute_candidate_review_id(
+                resolved_candidate_id,
+                new_review_count,
+                clean_decision,
+                clean_reviewer,
+                clean_reason,
+                now,
+            )
+
+            conn.execute(
+                """
+                INSERT INTO discovered_link_reviews(
+                    review_id, candidate_id, referring_resource_id, referring_source_id,
+                    original_url, normalized_url, domain_classification,
+                    previous_review_status, new_review_status,
+                    reviewer, review_reason, reviewed_at,
+                    fetch_permission_granted, provenance_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                """,
+                (
+                    review_id,
+                    resolved_candidate_id,
+                    ref_res_id,
+                    str(existing["referring_source_id"]),
+                    orig_url,
+                    norm_url,
+                    str(existing["domain_classification"]),
+                    previous_review_status,
+                    clean_decision,
+                    clean_reviewer,
+                    clean_reason,
+                    now,
+                    prov_event_id,
+                ),
+            )
+
+            conn.execute(
+                """
+                UPDATE discovered_link_candidates
+                   SET review_status = ?,
+                       policy_state = ?,
+                       fetch_permission_granted = 0,
+                       reviewed_by = ?,
+                       reviewed_at = ?,
+                       review_reason = ?,
+                       review_count = ?,
+                       last_review_event_id = ?
+                 WHERE candidate_id = ?
+                """,
+                (
+                    clean_decision,
+                    new_policy_state,
+                    clean_reviewer,
+                    now,
+                    clean_reason,
+                    new_review_count,
+                    prov_event_id,
+                    resolved_candidate_id,
+                ),
+            )
+
+        updated = self.get_discovered_link_candidate(candidate_id=resolved_candidate_id)
+        assert updated is not None
+        updated["operation"] = "reviewed"
+        updated["review_id"] = review_id
+        updated["review_provenance_event_id"] = prov_event_id
+        return updated
+
+    def list_discovered_link_reviews(
+        self,
+        *,
+        candidate_id: str | None = None,
+        reviewer: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List immutable curation review history records from `discovered_link_reviews`."""
         clauses: list[str] = []
         params: list[Any] = []
-        if referring_resource_id is not None:
-            clauses.append("referring_resource_id = ?")
-            params.append(referring_resource_id)
-        if referring_source_id is not None:
-            clauses.append("referring_source_id = ?")
-            params.append(referring_source_id)
-        if domain_classification is not None:
-            clauses.append("domain_classification = ?")
-            params.append(domain_classification)
-        if review_status is not None:
-            clauses.append("review_status = ?")
-            params.append(review_status)
-
+        if candidate_id is not None:
+            clauses.append("candidate_id = ?")
+            params.append(candidate_id.strip())
+        if reviewer is not None:
+            clauses.append("reviewer = ?")
+            params.append(reviewer.strip())
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         rows = self.conn.execute(
-            f"SELECT * FROM discovered_link_candidates {where_sql} ORDER BY first_seen_at ASC, candidate_id ASC",
+            f"SELECT * FROM discovered_link_reviews {where_sql} ORDER BY reviewed_at ASC, review_id ASC",
             tuple(params),
         ).fetchall()
         return [dict(r) for r in rows]
@@ -2613,6 +3475,7 @@ def main(argv: list[str] | None = None) -> int:
                     "resources",
                     "resource_versions",
                     "discovered_link_candidates",
+                    "discovered_link_reviews",
                     "provenance_events",
                     "collection_runs",
                     "documents",
