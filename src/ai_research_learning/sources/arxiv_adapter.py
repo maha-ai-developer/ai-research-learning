@@ -8,15 +8,21 @@ Follows docs/architecture/source-adapter-contract.md Section 5.4:
 from __future__ import annotations
 
 import re
-from typing import Any
-from urllib.parse import urlencode, urlsplit
+import time
+from typing import Any, Callable, Sequence
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 import xml.etree.ElementTree as ET
 
 import requests
 
 from .base import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_PROJECT_USER_AGENT,
+    DEFAULT_TIMEOUT_SECONDS,
+    REDIRECT_STATUSES,
     NormalizedResourceEnvelope,
     NotModifiedResponse,
+    OriginRateLimiter,
     ParseError,
     PolicyAuditResult,
     PolicyBlockedError,
@@ -41,6 +47,24 @@ ATOM_NS = {
 }
 
 ARXIV_ID_RE = re.compile(r"^(?:\d{4}\.\d{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/\d{7})(?:v\d+)?$", re.I)
+
+ARXIV_POLICY_PROFILE_ID = "ARXIV_OFFICIAL_ATOM_API_V1"
+ARXIV_POLICY_VERSION = "ADR-0005/2026-10-24"
+ARXIV_POLICY_BASIS = (
+    "Official arXiv API Terms of Use (https://info.arxiv.org/help/api/tou.html) and "
+    "arXiv API User's Manual (https://info.arxiv.org/help/api/user-manual.html) for "
+    "https://export.arxiv.org/api/query; RFC 9309 robots.txt Disallow: / preserved as "
+    "blocking general HTML and PDF crawling on export.arxiv.org."
+)
+ARXIV_MAX_RESULTS_LIMIT = 50
+ALLOWED_ARXIV_QUERY_KEYS = {
+    "id_list",
+    "search_query",
+    "start",
+    "max_results",
+    "sortBy",
+    "sortOrder",
+}
 
 
 def _collapse_ws(value: str | None) -> str | None:
@@ -94,12 +118,54 @@ class ArxivSourceAdapter(SourceAdapter):
         },
     )
 
+    def __init__(
+        self,
+        *,
+        user_agent: str = DEFAULT_PROJECT_USER_AGENT,
+        session: requests.Session | None = None,
+        rate_limiter: OriginRateLimiter | None = None,
+        timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        api_terms_verified: bool = True,
+        batch_queries: bool = True,
+    ) -> None:
+        super().__init__(
+            user_agent=user_agent,
+            session=session,
+            rate_limiter=rate_limiter,
+            timeout_seconds=timeout_seconds,
+            max_bytes=max_bytes,
+            sleep_fn=sleep_fn,
+        )
+        self.api_terms_verified = api_terms_verified
+        self.batch_queries = batch_queries
+
     def build_query_url(self, arxiv_id: str) -> str:
         clean_id = extract_arxiv_id(arxiv_id)
         query = urlencode({"id_list": clean_id, "max_results": 1})
         return f"{self.api_endpoint}?{query}"
 
+    def build_batch_query_url(
+        self,
+        arxiv_ids: Sequence[str],
+        *,
+        max_results: int | None = None,
+    ) -> str:
+        """Build a single bounded arXiv Atom API query URL for one or more arXiv IDs."""
+        clean_ids = [extract_arxiv_id(item) for item in arxiv_ids if str(item).strip()]
+        if not clean_ids:
+            raise ValueError("arxiv_ids must contain at least one valid arXiv identifier")
+        bounded_max = max_results if max_results is not None else len(clean_ids)
+        if bounded_max < 1 or bounded_max > ARXIV_MAX_RESULTS_LIMIT:
+            raise ValueError(
+                f"max_results must be between 1 and {ARXIV_MAX_RESULTS_LIMIT}, got {bounded_max}"
+            )
+        query = urlencode({"id_list": ",".join(clean_ids), "max_results": bounded_max})
+        return f"{self.api_endpoint}?{query}"
+
     def is_url_in_scope(self, url: str) -> bool:
+        """Return True ONLY for valid bounded GET queries to https://export.arxiv.org/api/query."""
         try:
             normalized = canonicalize_url(url)
         except ValueError:
@@ -107,28 +173,58 @@ class ArxivSourceAdapter(SourceAdapter):
         if is_binary_asset_url(normalized) or "/pdf/" in normalized.lower():
             return False
         parsed = urlsplit(normalized)
-        return (
-            parsed.scheme == "https"
-            and (parsed.hostname or "").lower() == "export.arxiv.org"
-            and parsed.path == "/api/query"
-        )
+        if (
+            parsed.scheme != "https"
+            or (parsed.hostname or "").lower() != "export.arxiv.org"
+            or parsed.port not in (None, 443)
+            or parsed.path != "/api/query"
+        ):
+            return False
+        if not parsed.query:
+            return False
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        if not params or any(key not in ALLOWED_ARXIV_QUERY_KEYS for key in params):
+            return False
+
+        id_list_vals = [v.strip() for v in params.get("id_list", []) if v.strip()]
+        search_query_vals = [v.strip() for v in params.get("search_query", []) if v.strip()]
+        if not id_list_vals and not search_query_vals:
+            return False
+
+        for raw_list in id_list_vals:
+            parts = [p.strip() for p in raw_list.split(",") if p.strip()]
+            if not parts or any(not ARXIV_ID_RE.match(p) for p in parts):
+                return False
+
+        if "max_results" in params:
+            try:
+                max_res = int(params["max_results"][0])
+            except (ValueError, IndexError):
+                return False
+            if max_res < 1 or max_res > ARXIV_MAX_RESULTS_LIMIT:
+                return False
+
+        return True
 
     def audit_policy(self, *, force_refresh: bool = False) -> PolicyAuditResult:
-        """Audit export.arxiv.org robots.txt and API terms before querying."""
+        """Audit export.arxiv.org robots.txt for general HTML crawling and apply ADR-0005 API profile."""
         if self._cached_policy is not None and not force_refresh:
             return self._cached_policy
-        probe_url = self.build_query_url("1207.0580")
-        return self._fetch_robots_policy(
+
+        html_probe_url = "https://export.arxiv.org/abs/1207.0580"
+        api_probe_url = self.build_query_url("1207.0580")
+
+        robots_policy = self._fetch_robots_policy(
             robots_url=self.robots_url,
             terms_of_use_url=self.terms_of_use_url,
-            probe_urls=[probe_url],
-            allowed_scope=["https://export.arxiv.org/api/query?*"],
+            probe_urls=[html_probe_url],
+            allowed_scope=[f"{self.api_endpoint}?*"],
             required_identification=(
                 "Descriptive User-Agent header with project URL; single-connection sequential requests"
             ),
             rate_limit_behavior=(
-                "Mandatory >= 3.0s delay between sequential requests per arXiv API Terms of Use; "
-                "abort on HTTP 429/503"
+                "Mandatory >= 3.0s delay between sequential requests on a single connection per "
+                "arXiv API Terms of Use; abort immediately on HTTP 429/503"
             ),
             unresolved_questions=[
                 "Full PDF and TeX source bundles have per-submission licenses (CC BY, CC BY-SA, or arXiv non-exclusive license); pilot stores metadata and abstract only, never PDFs."
@@ -139,19 +235,208 @@ class ArxivSourceAdapter(SourceAdapter):
             ],
         )
 
+        # Fail closed if API terms verification flag is revoked/changed
+        if not self.api_terms_verified:
+            blocked_policy = PolicyAuditResult(
+                source_id=self.source_id,
+                adapter_id=self.adapter_id,
+                display_name=self.display_name,
+                origin=self.origin,
+                policy_url=self.robots_url,
+                terms_of_use_url=self.terms_of_use_url,
+                status="BLOCKED",
+                metadata_collection_decision="DENIED",
+                http_status=robots_policy.http_status,
+                observed_crawl_delay_seconds=robots_policy.observed_crawl_delay_seconds,
+                effective_delay_seconds=max(3.0, self.min_delay_seconds, robots_policy.effective_delay_seconds),
+                required_identification=robots_policy.required_identification,
+                rate_limit_behavior=robots_policy.rate_limit_behavior,
+                allowed_scope=robots_policy.allowed_scope,
+                observed_restrictions=robots_policy.observed_restrictions
+                + ["arXiv API Terms of Use verification flag is false or terms changed; failing closed"],
+                unresolved_questions=robots_policy.unresolved_questions,
+                sitemap_urls=robots_policy.sitemap_urls,
+                evidence_summary=(
+                    "Fail-closed: arXiv API Terms of Use verification is false or terms changed; "
+                    "refusing to apply API policy profile."
+                ),
+                checked_at_utc=robots_policy.checked_at_utc,
+                policy_profile_id=ARXIV_POLICY_PROFILE_ID,
+                policy_version=ARXIV_POLICY_VERSION,
+                policy_basis=ARXIV_POLICY_BASIS,
+                approved_api_endpoint=self.api_endpoint,
+                robots_crawl_status="DISALLOWED_BY_ROBOTS_TXT",
+                general_html_crawling_permitted=False,
+                robot_parser=robots_policy.robot_parser,
+                allowed_api_url_validator=None,
+            )
+            self._cached_policy = blocked_policy
+            return blocked_policy
+
+        # If robots.txt fetch itself failed (e.g., network error, 403/429/500, corrupt bytes, or bad User-Agent), fail closed
+        if (
+            robots_policy.http_status is None
+            or not (200 <= robots_policy.http_status < 300)
+            or robots_policy.robot_parser is None
+        ):
+            robots_policy.policy_profile_id = ARXIV_POLICY_PROFILE_ID
+            robots_policy.policy_version = ARXIV_POLICY_VERSION
+            robots_policy.policy_basis = ARXIV_POLICY_BASIS
+            robots_policy.approved_api_endpoint = self.api_endpoint
+            robots_policy.robots_crawl_status = "UNVERIFIED_OR_HTTP_ERROR"
+            robots_policy.general_html_crawling_permitted = False
+            self._cached_policy = robots_policy
+            return robots_policy
+
+        parser = robots_policy.robot_parser
+        general_html_allowed = bool(
+            parser.can_fetch(self.user_agent, html_probe_url)
+            and parser.can_fetch("*", html_probe_url)
+        )
+        robots_crawl_status = (
+            "ALLOWED_BY_ROBOTS_TXT"
+            if general_html_allowed
+            else "DISALLOWED_BY_ROBOTS_TXT (Disallow: / blocks general HTML/PDF crawling on export.arxiv.org)"
+        )
+
+        # If robots.txt contains an explicit /api disallow rule, fail closed even for the API profile
+        robot_entries = list(getattr(parser, "entries", []))
+        default_entry = getattr(parser, "default_entry", None)
+        if default_entry is not None:
+            robot_entries.append(default_entry)
+        explicit_api_disallow = any(
+            not getattr(rule, "allowance", True)
+            and str(getattr(rule, "path", "")).lower().startswith("/api")
+            for entry in robot_entries
+            for rule in getattr(entry, "rulelines", [])
+        ) or any(
+            "/api" in r.lower() and "disallow" in r.lower()
+            for r in robots_policy.observed_restrictions
+        )
+        if explicit_api_disallow and not (
+            parser.can_fetch(self.user_agent, api_probe_url)
+            and parser.can_fetch("*", api_probe_url)
+        ):
+            robots_policy.status = "BLOCKED"
+            robots_policy.metadata_collection_decision = "DENIED"
+            robots_policy.policy_profile_id = ARXIV_POLICY_PROFILE_ID
+            robots_policy.policy_version = ARXIV_POLICY_VERSION
+            robots_policy.policy_basis = ARXIV_POLICY_BASIS
+            robots_policy.approved_api_endpoint = self.api_endpoint
+            robots_policy.robots_crawl_status = "EXPLICIT_API_DISALLOW_IN_ROBOTS_TXT"
+            robots_policy.general_html_crawling_permitted = False
+            robots_policy.allowed_api_url_validator = None
+            robots_policy.observed_restrictions.append(
+                "Explicit Disallow rule targeting /api in export.arxiv.org/robots.txt; failing closed"
+            )
+            robots_policy.evidence_summary = (
+                "Fail-closed: export.arxiv.org/robots.txt contains an explicit Disallow rule targeting /api."
+            )
+            self._cached_policy = robots_policy
+            return robots_policy
+
+        effective_delay = max(3.0, self.min_delay_seconds)
+        restrictions = [
+            r
+            for r in robots_policy.observed_restrictions
+            if r != "Target scope disallowed by robots.txt rules"
+        ]
+        if not general_html_allowed:
+            restrictions.append(
+                "export.arxiv.org/robots.txt serves Disallow: / for general HTML/PDF crawlers; general HTML crawling is NOT permitted"
+            )
+        restrictions.append(
+            f"Explicit API policy profile {ARXIV_POLICY_PROFILE_ID} ({ARXIV_POLICY_VERSION}) permits ONLY "
+            f"GET {self.api_endpoint} with >= {effective_delay:.1f}s delay and single connection"
+        )
+
+        if self.request_log and self.request_log[-1].purpose == "POLICY_AUDIT":
+            self.request_log[-1].outcome = "policy-verified-arxiv-api-profile-ok"
+
+        evidence_summary = (
+            f"export.arxiv.org/robots.txt (HTTP {robots_policy.http_status}) "
+            f"{'disallows general HTML crawling (Disallow: /)' if not general_html_allowed else 'verified'}; "
+            f"metadata collection is permitted ONLY for {self.api_endpoint} under explicit policy profile "
+            f"{ARXIV_POLICY_PROFILE_ID} ({ARXIV_POLICY_VERSION}) per official arXiv API Terms of Use "
+            f"(>= {effective_delay:.1f}s delay, single connection)."
+        )
+
+        api_policy = PolicyAuditResult(
+            source_id=self.source_id,
+            adapter_id=self.adapter_id,
+            display_name=self.display_name,
+            origin=self.origin,
+            policy_url=self.robots_url,
+            terms_of_use_url=self.terms_of_use_url,
+            status="OK",
+            metadata_collection_decision="PERMITTED",
+            http_status=robots_policy.http_status,
+            observed_crawl_delay_seconds=robots_policy.observed_crawl_delay_seconds,
+            effective_delay_seconds=effective_delay,
+            required_identification=robots_policy.required_identification,
+            rate_limit_behavior=robots_policy.rate_limit_behavior,
+            allowed_scope=[self.api_endpoint],
+            observed_restrictions=restrictions,
+            unresolved_questions=robots_policy.unresolved_questions,
+            sitemap_urls=robots_policy.sitemap_urls,
+            evidence_summary=evidence_summary,
+            checked_at_utc=robots_policy.checked_at_utc,
+            policy_profile_id=ARXIV_POLICY_PROFILE_ID,
+            policy_version=ARXIV_POLICY_VERSION,
+            policy_basis=ARXIV_POLICY_BASIS,
+            approved_api_endpoint=self.api_endpoint,
+            robots_crawl_status=robots_crawl_status,
+            general_html_crawling_permitted=general_html_allowed,
+            robot_parser=parser,
+            allowed_api_url_validator=self.is_url_in_scope,
+        )
+        self._cached_policy = api_policy
+        return api_policy
+
     def discover_candidates(
         self,
         *,
         seed_manifest: list[dict[str, Any]] | None = None,
         limit: int = 2,
+        batch_query: bool | None = None,
     ) -> list[SourceCandidate]:
-        """Return up to `limit` curated arXiv API query candidates."""
+        """Return up to `limit` curated arXiv API query candidates.
+
+        When `limit > 1` and `batch_query` is True (default), combines the curated IDs
+        into a single bounded API query (`id_list=1207.0580,1409.0473&max_results=2`)
+        so a single HTTP request retrieves up to `limit` metadata records.
+        """
         max_items = max(0, int(limit))
         if max_items == 0:
             return []
 
+        selected_items = list(self.default_arxiv_candidates[:max_items])
+        use_batch = self.batch_queries if batch_query is None else batch_query
+        if use_batch and len(selected_items) > 1:
+            batch_ids = [item["external_id"] for item in selected_items]
+            return [
+                SourceCandidate(
+                    source_id=self.source_id,
+                    url=self.build_batch_query_url(batch_ids, max_results=len(batch_ids)),
+                    title_hint="; ".join(
+                        item.get("title_hint") or item["external_id"] for item in selected_items
+                    ),
+                    resource_type_hint="preprint_paper_metadata",
+                    manifest_id=None,
+                    external_id=",".join(batch_ids),
+                    priority=selected_items[0].get("priority", "P0"),
+                    observed_from="Curated foundational arXiv seed batch",
+                    extra={
+                        "domain_scope": "First-party API",
+                        "information_to_inventory": "arXiv ID, Title, Authors, Abstract, Categories, Published/Updated Dates, DOI",
+                        "collection_decision": "Fetch Atom API Metadata & Abstract Only (No PDF Download)",
+                        "batch_items": {item["external_id"]: dict(item) for item in selected_items},
+                    },
+                )
+            ]
+
         candidates: list[SourceCandidate] = []
-        for item in self.default_arxiv_candidates[:max_items]:
+        for item in selected_items:
             arxiv_id = item["external_id"]
             candidates.append(
                 SourceCandidate(
@@ -260,6 +545,23 @@ class ArxivSourceAdapter(SourceAdapter):
                 )
                 raise NotModifiedResponse(query_url, headers_dict)
 
+            if status_code in REDIRECT_STATUSES:
+                location = headers_dict.get("Location") or ""
+                response.close()
+                next_url = urljoin(query_url, location) if location else ""
+                self._record_http_event(
+                    purpose="METADATA_FETCH",
+                    url=query_url,
+                    http_status=status_code,
+                    outcome="blocked-redirect-out-of-scope",
+                )
+                raise ScopeViolationError(
+                    f"arXiv API endpoint returned redirect (HTTP {status_code} -> {next_url or 'missing Location'}); "
+                    f"cross-host and non-API redirects are blocked by {ARXIV_POLICY_PROFILE_ID}",
+                    source_id=self.source_id,
+                    url=query_url,
+                )
+
             if status_code in {429, 503}:
                 retry_after = parse_retry_after(headers_dict.get("Retry-After"))
                 response.close()
@@ -363,30 +665,14 @@ class ArxivSourceAdapter(SourceAdapter):
                 is_retryable=True,
             ) from exc
 
-    def normalize(
+    def _normalize_entry(
         self,
+        entry: ET.Element,
         raw: RawMetadataPayload,
         *,
         policy: PolicyAuditResult | None = None,
     ) -> NormalizedResourceEnvelope:
-        """Parse an arXiv Atom XML payload into a NormalizedResourceEnvelope."""
-        try:
-            root = ET.fromstring(raw.body_text)
-        except ET.ParseError as exc:
-            raise ParseError(
-                f"Invalid Atom XML from arXiv API: {exc}",
-                source_id=self.source_id,
-                url=raw.final_url,
-            ) from exc
-
-        entry = root.find("atom:entry", ATOM_NS)
-        if entry is None:
-            raise ParseError(
-                f"arXiv Atom feed contained no <entry> elements for {raw.final_url}",
-                source_id=self.source_id,
-                url=raw.final_url,
-            )
-
+        """Normalize a single Atom `<entry>` element into a NormalizedResourceEnvelope."""
         raw_entry_id = _collapse_ws(entry.findtext("atom:id", default="", namespaces=ATOM_NS))
         title = _collapse_ws(entry.findtext("atom:title", default="", namespaces=ATOM_NS))
         summary = _collapse_ws(entry.findtext("atom:summary", default="", namespaces=ATOM_NS))
@@ -445,6 +731,21 @@ class ArxivSourceAdapter(SourceAdapter):
 
         official_links = [u for u in (abs_url, pdf_reference_url) if u]
         candidate = raw.candidate
+        batch_meta = (
+            (candidate.extra or {}).get("batch_items", {}).get(base_arxiv_id, {})
+            if candidate
+            else {}
+        )
+        observed_from = (
+            batch_meta.get("observed_from")
+            or (candidate.observed_from if candidate else None)
+            or "arXiv Atom API"
+        )
+        priority = (
+            batch_meta.get("priority")
+            or (candidate.priority if candidate else None)
+            or "P0"
+        )
         active_policy = policy or self._cached_policy
 
         completeness = {
@@ -475,9 +776,9 @@ class ArxivSourceAdapter(SourceAdapter):
             language="en",
             transcript_reference=None,
             official_links=official_links,
-            observed_from=(candidate.observed_from if candidate else "arXiv Atom API"),
+            observed_from=observed_from,
             information_to_inventory="arXiv ID, Title, Authors, Abstract, Categories, Published/Updated Dates",
-            priority=(candidate.priority if candidate else "P0"),
+            priority=priority,
             collection_decision="Fetch Atom API Metadata & Abstract Only (No PDF Download)",
             verification_status=f"Verified Atom API HTTP {raw.http_status} via {self.adapter_id}",
             robots_sitemap_status=(
@@ -510,6 +811,44 @@ class ArxivSourceAdapter(SourceAdapter):
                 "comment": comment,
                 "submission_license_url": license_url,
                 "pdf_reference_url_not_downloaded": pdf_reference_url,
+                "policy_profile_id": (active_policy.policy_profile_id if active_policy else ARXIV_POLICY_PROFILE_ID),
+                "policy_version": (active_policy.policy_version if active_policy else ARXIV_POLICY_VERSION),
+                "approved_api_endpoint": self.api_endpoint,
             },
             discovered_links=[],
         )
+
+    def normalize_all(
+        self,
+        raw: RawMetadataPayload,
+        *,
+        policy: PolicyAuditResult | None = None,
+    ) -> list[NormalizedResourceEnvelope]:
+        """Parse an arXiv Atom XML payload into one or more NormalizedResourceEnvelopes."""
+        try:
+            root = ET.fromstring(raw.body_text)
+        except ET.ParseError as exc:
+            raise ParseError(
+                f"Invalid Atom XML from arXiv API: {exc}",
+                source_id=self.source_id,
+                url=raw.final_url,
+            ) from exc
+
+        entries = root.findall("atom:entry", ATOM_NS)
+        if not entries:
+            raise ParseError(
+                f"arXiv Atom feed contained no <entry> elements for {raw.final_url}",
+                source_id=self.source_id,
+                url=raw.final_url,
+            )
+
+        return [self._normalize_entry(entry, raw, policy=policy) for entry in entries]
+
+    def normalize(
+        self,
+        raw: RawMetadataPayload,
+        *,
+        policy: PolicyAuditResult | None = None,
+    ) -> NormalizedResourceEnvelope:
+        """Parse an arXiv Atom XML payload into the first NormalizedResourceEnvelope."""
+        return self.normalize_all(raw, policy=policy)[0]

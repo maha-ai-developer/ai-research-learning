@@ -319,15 +319,37 @@ class PolicyAuditResult:
     sitemap_urls: list[str] = field(default_factory=list)
     evidence_summary: str = ""
     checked_at_utc: str = field(default_factory=utc_now)
+    policy_profile_id: str | None = None
+    policy_version: str | None = None
+    policy_basis: str | None = None
+    approved_api_endpoint: str | None = None
+    robots_crawl_status: str | None = None
+    general_html_crawling_permitted: bool | None = None
     robot_parser: urllib.robotparser.RobotFileParser | None = field(default=None, repr=False)
+    allowed_api_url_validator: Callable[[str], bool] | None = field(default=None, repr=False)
 
     @property
     def is_metadata_collection_permitted(self) -> bool:
         return self.status == "OK" and self.metadata_collection_decision == "PERMITTED"
 
+    def is_api_url_permitted(self, url: str) -> bool:
+        """Return True only if an explicit API policy profile is active and permits `url`."""
+        if not self.is_metadata_collection_permitted or self.allowed_api_url_validator is None:
+            return False
+        return bool(self.allowed_api_url_validator(url))
+
     def can_fetch_url(self, user_agent: str, url: str) -> bool:
-        """Return True only if policy audit succeeded and robots rules permit `url`."""
+        """Return True only if policy audit succeeded and robots or explicit API profile rules permit `url`."""
         if not self.is_metadata_collection_permitted:
+            return False
+        if self.allowed_api_url_validator is not None:
+            if self.allowed_api_url_validator(url):
+                return True
+            if self.robot_parser is not None:
+                return bool(
+                    self.robot_parser.can_fetch(user_agent, url)
+                    and self.robot_parser.can_fetch("*", url)
+                )
             return False
         if self.robot_parser is not None:
             return bool(
@@ -339,6 +361,7 @@ class PolicyAuditResult:
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload.pop("robot_parser", None)
+        payload.pop("allowed_api_url_validator", None)
         return payload
 
 
@@ -368,6 +391,22 @@ class DiscoveredLinkCandidate:
     rel: str | None
     target_scope: str
     decision: str
+    raw_href: str = ""
+    original_url: str = ""
+    host_domain: str = ""
+    is_internal: bool = False
+    domain_classification: str = "EXTERNAL"
+    policy_state: str = "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH"
+    review_status: str = "PENDING_REVIEW"
+    fetch_permission_granted: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.original_url:
+            self.original_url = self.link_url
+        if not self.raw_href:
+            self.raw_href = self.original_url
+        if not self.host_domain and self.link_url:
+            self.host_domain = host_of(self.link_url)
 
 
 @dataclass
@@ -430,6 +469,7 @@ class NormalizedResourceEnvelope:
     metadata_completeness: dict[str, Any] = field(default_factory=dict)
     source_specific_metadata: dict[str, Any] = field(default_factory=dict)
     discovered_links: list[DiscoveredLinkCandidate] = field(default_factory=list)
+    rejected_discovered_links: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -946,6 +986,15 @@ class SourceAdapter(ABC):
     ) -> NormalizedResourceEnvelope:
         """Normalize raw metadata payload into the canonical resource envelope."""
 
+    def normalize_all(
+        self,
+        raw: RawMetadataPayload,
+        *,
+        policy: PolicyAuditResult | None = None,
+    ) -> list[NormalizedResourceEnvelope]:
+        """Normalize raw metadata payload into one or more canonical resource envelopes."""
+        return [self.normalize(raw, policy=policy)]
+
     def collect_candidate(
         self,
         candidate: SourceCandidate,
@@ -961,3 +1010,19 @@ class SourceAdapter(ABC):
             conditional_headers=conditional_headers,
         )
         return self.normalize(raw, policy=active_policy)
+
+    def collect_candidate_envelopes(
+        self,
+        candidate: SourceCandidate,
+        *,
+        policy: PolicyAuditResult | None = None,
+        conditional_headers: dict[str, str] | None = None,
+    ) -> list[NormalizedResourceEnvelope]:
+        """Audit policy (if not provided), fetch metadata once, and return all normalized envelopes."""
+        active_policy = policy or self._cached_policy or self.audit_policy()
+        raw = self.fetch_metadata(
+            candidate,
+            policy=active_policy,
+            conditional_headers=conditional_headers,
+        )
+        return self.normalize_all(raw, policy=active_policy)

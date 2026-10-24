@@ -578,33 +578,81 @@ class ConservativeHtmlAdapter(SourceAdapter):
         )
 
         discovered_links: list[DiscoveredLinkCandidate] = []
+        rejected_discovered_links: list[dict[str, Any]] = []
         official_links: list[str] = []
         seen_links: set[str] = set()
+        seen_rejected: set[str] = set()
         manifest_id = raw.candidate.manifest_id if raw.candidate else None
 
         for a_tag in soup.find_all("a", href=True):
             href = str(a_tag.get("href") or "").strip()
-            if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            if not href or href.startswith("#"):
                 continue
+
+            rel_val = a_tag.get("rel")
+            rel_str = " ".join(rel_val) if isinstance(rel_val, list) else (str(rel_val) if rel_val else None)
+            link_text = _clean_text(a_tag.get_text(" ", strip=True), max_chars=140)
+
+            parsed_href = urlsplit(href)
+            raw_scheme = parsed_href.scheme.lower()
+            if raw_scheme and raw_scheme not in ("http", "https"):
+                if href not in seen_rejected and len(rejected_discovered_links) < 50:
+                    seen_rejected.add(href)
+                    rejected_discovered_links.append(
+                        {
+                            "from_url": raw.final_url,
+                            "from_manifest_id": manifest_id,
+                            "raw_href": href,
+                            "original_url": href,
+                            "scheme": raw_scheme,
+                            "reason": f"Rejected non-HTTP(S) or unsafe URL scheme '{raw_scheme}:'",
+                            "link_text": link_text,
+                            "rel": rel_str,
+                        }
+                    )
+                continue
+
+            original_url = urljoin(raw.final_url, href)
             try:
-                abs_url = canonicalize_url(urljoin(raw.final_url, href))
-            except ValueError:
+                abs_url = canonicalize_url(original_url)
+            except ValueError as exc:
+                if original_url not in seen_rejected and len(rejected_discovered_links) < 50:
+                    seen_rejected.add(original_url)
+                    rejected_discovered_links.append(
+                        {
+                            "from_url": raw.final_url,
+                            "from_manifest_id": manifest_id,
+                            "raw_href": href,
+                            "original_url": original_url,
+                            "scheme": raw_scheme or "invalid",
+                            "reason": f"Rejected malformed candidate URL: {exc}",
+                            "link_text": link_text,
+                            "rel": rel_str,
+                        }
+                    )
                 continue
+
             if abs_url in seen_links:
                 continue
             seen_links.add(abs_url)
 
             link_host = host_of(abs_url)
-            if link_host in self.allowed_hosts:
+            is_internal = link_host in self.allowed_hosts
+            domain_classification = "INTERNAL" if is_internal else "EXTERNAL"
+
+            if is_internal:
                 if is_binary_asset_url(abs_url):
                     target_scope = "same-host-binary-not-fetched"
                     decision = "record-citation-url-only-no-download"
+                    policy_state = "SAME_HOST_BINARY_CITATION_NO_FETCH"
                 elif self.is_url_in_scope(abs_url):
                     target_scope = "in-scope-html"
                     decision = "candidate-only-no-recursive-crawl"
+                    policy_state = "IN_SCOPE_HTML_CANDIDATE_NO_AUTO_FETCH"
                 else:
                     target_scope = "same-host-outside-prefix"
                     decision = "skip-outside-prefix"
+                    policy_state = "SAME_HOST_OUTSIDE_PREFIX_NO_FETCH"
             elif any(
                 ext_host in link_host
                 for ext_host in (
@@ -618,24 +666,32 @@ class ConservativeHtmlAdapter(SourceAdapter):
             ):
                 target_scope = "external-official-reference"
                 decision = "record-official-external-reference-only"
+                policy_state = "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH"
                 if len(official_links) < 12:
                     official_links.append(abs_url)
             else:
                 target_scope = "external-not-fetched"
                 decision = "skip-external-host"
+                policy_state = "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH"
 
             if len(discovered_links) < 50:
-                rel_val = a_tag.get("rel")
-                rel_str = " ".join(rel_val) if isinstance(rel_val, list) else (str(rel_val) if rel_val else None)
                 discovered_links.append(
                     DiscoveredLinkCandidate(
                         from_url=raw.final_url,
                         from_manifest_id=manifest_id,
                         link_url=abs_url,
-                        link_text=_clean_text(a_tag.get_text(" ", strip=True), max_chars=140),
+                        link_text=link_text,
                         rel=rel_str,
                         target_scope=target_scope,
                         decision=decision,
+                        raw_href=href,
+                        original_url=original_url,
+                        host_domain=link_host,
+                        is_internal=is_internal,
+                        domain_classification=domain_classification,
+                        policy_state=policy_state,
+                        review_status="PENDING_REVIEW",
+                        fetch_permission_granted=False,
                     )
                 )
 
@@ -649,6 +705,7 @@ class ConservativeHtmlAdapter(SourceAdapter):
             "authors": authors,
             "h1": h1_text,
             "discovered_links": discovered_links,
+            "rejected_discovered_links": rejected_discovered_links,
             "official_links": official_links,
         }
         return soup, common
@@ -744,6 +801,7 @@ class ConservativeHtmlAdapter(SourceAdapter):
             metadata_completeness=completeness,
             source_specific_metadata=source_specific,
             discovered_links=common["discovered_links"],
+            rejected_discovered_links=common["rejected_discovered_links"],
         )
 
 

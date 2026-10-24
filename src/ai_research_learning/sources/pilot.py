@@ -250,7 +250,7 @@ class PilotCoordinator:
                 (
                     policy.origin,
                     policy.policy_url,
-                    policy.status.lower(),
+                    (policy.robots_crawl_status or policy.status).lower(),
                     policy.http_status,
                     policy.observed_crawl_delay_seconds,
                     json.dumps(policy.sitemap_urls, ensure_ascii=False),
@@ -292,6 +292,13 @@ class PilotCoordinator:
                 details={
                     "policy_verification_status": policy.status,
                     "metadata_collection_decision": policy.metadata_collection_decision,
+                    "policy_profile_id": policy.policy_profile_id,
+                    "policy_version": policy.policy_version,
+                    "policy_basis": policy.policy_basis,
+                    "approved_api_endpoint": policy.approved_api_endpoint,
+                    "robots_crawl_status": policy.robots_crawl_status,
+                    "general_html_crawling_permitted": policy.general_html_crawling_permitted,
+                    "verified_at_utc": policy.checked_at_utc,
                     "observed_crawl_delay_seconds": policy.observed_crawl_delay_seconds,
                     "effective_delay_seconds": policy.effective_delay_seconds,
                     "required_identification": policy.required_identification,
@@ -514,185 +521,238 @@ class PilotCoordinator:
                     seed_manifest=seed_manifest,
                     limit=per_source_limit,
                 )[:per_source_limit]
+                source_processed = 0
 
                 for candidate in candidates:
-                    if total_attempted_fetches >= max_total:
+                    if total_attempted_fetches >= max_total or source_processed >= per_source_limit:
                         break
-                    total_attempted_fetches += 1
                     before_fetch_idx = len(adapter.request_log)
 
                     try:
-                        envelope = adapter.collect_candidate(candidate, policy=policy)
+                        envelopes = adapter.collect_candidate_envelopes(candidate, policy=policy)
                         summary.http_events.extend(adapter.request_log[before_fetch_idx:])
-
-                        manifest_id = self._ensure_source_url_row(candidate, envelope)
-                        upserted = self.store.upsert_resource(
-                            source_id=envelope.source_id,
-                            manifest_id=manifest_id,
-                            canonical_url=envelope.canonical_url,
-                            fetched_url=envelope.fetched_url,
-                            title=envelope.title,
-                            authors=envelope.authors,
-                            published_at=envelope.published_at,
-                            resource_type=envelope.resource_type,
-                            media_modality=envelope.media_modality,
-                            domain_scope=envelope.domain_scope,
-                            abstract_or_description=envelope.abstract_or_description,
-                            topic_tags=envelope.topic_tags,
-                            external_identifier=envelope.external_identifier,
-                            observed_from=envelope.observed_from,
-                            information_to_inventory=envelope.information_to_inventory,
-                            priority=envelope.priority,
-                            collection_decision=envelope.collection_decision,
-                            verification_status=envelope.verification_status,
-                            robots_sitemap_status=envelope.robots_sitemap_status,
-                            rights_status=envelope.rights_status,
-                            license_status=envelope.license_status,
-                            license_spdx=envelope.license_spdx,
-                            permitted_storage_scope=envelope.permitted_storage_scope,
-                            permits_full_text_storage=envelope.permits_full_text_storage,
-                            permits_verbatim_excerpts=envelope.permits_verbatim_excerpts,
-                            legal_uncertainty_status=envelope.legal_uncertainty_status,
-                            text_storage_status=envelope.text_storage_status,
-                            last_checked=envelope.collected_at_utc[:10],
-                            last_verified_at=envelope.collected_at_utc,
-                            discovered_at=envelope.collected_at_utc,
-                            run_id=run_id,
-                            acquisition_method=envelope.adapter_id,
-                            actor="pilot_coordinator",
-                            change_reason="metadata_pilot_collection",
+                        allowed_slice = min(
+                            per_source_limit - source_processed,
+                            max_total - total_attempted_fetches,
                         )
-
-                        operation = str(upserted["operation"])
-                        if operation == "inserted":
-                            summary.inserted_count += 1
-                        elif operation == "updated":
-                            summary.updated_count += 1
-                        else:
-                            summary.unchanged_count += 1
-                            with self.store.transaction() as conn:
-                                conn.execute(
-                                    "UPDATE resources SET last_verified_at = ?, last_checked = ? WHERE resource_id = ?",
-                                    (
-                                        envelope.collected_at_utc,
-                                        envelope.collected_at_utc[:10],
-                                        upserted["resource_id"],
-                                    ),
-                                )
-
-                        # Always record an explicit adapter-level provenance event with rich metadata
-                        self.store.record_provenance(
-                            event_type=(
-                                "ADAPTER_METADATA_COLLECTED"
-                                if operation != "unchanged"
-                                else "RESOURCE_VERIFIED_UNCHANGED"
-                            ),
-                            acquisition_method=envelope.adapter_id,
-                            actor="pilot_coordinator",
-                            status=operation,
-                            source_id=envelope.source_id,
-                            resource_id=upserted["resource_id"],
-                            version_id=upserted["current_version_id"],
-                            run_id=run_id,
-                            manifest_id=manifest_id,
-                            source_url=candidate.url,
-                            final_url=envelope.fetched_url,
-                            http_status=envelope.http_status,
-                            metadata_hash=upserted["metadata_hash"],
-                            details={
-                                "policy_verification_status": policy.status,
-                                "metadata_completeness": envelope.metadata_completeness,
-                                "source_specific_metadata": envelope.source_specific_metadata,
-                                "official_links": envelope.official_links,
-                                "etag": envelope.etag,
-                                "last_modified": envelope.last_modified_header,
-                                "discovered_link_count": len(envelope.discovered_links),
-                            },
-                            recorded_at=envelope.collected_at_utc,
-                        )
-
-                        # Persist fetch_events and discovered_links (if manifest_id exists)
-                        with self.store.transaction() as conn:
-                            conn.execute(
-                                """
-                                INSERT INTO fetch_events(
-                                    run_id, manifest_id, requested_url, final_url,
-                                    status, http_status, error, fetched_at
-                                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
-                                """,
-                                (
-                                    run_id,
-                                    manifest_id,
-                                    candidate.url,
-                                    envelope.fetched_url,
-                                    f"pilot-{operation}",
-                                    envelope.http_status,
-                                    envelope.collected_at_utc,
-                                ),
+                        for envelope in envelopes[:allowed_slice]:
+                            total_attempted_fetches += 1
+                            source_processed += 1
+                            manifest_id = self._ensure_source_url_row(candidate, envelope)
+                            upserted = self.store.upsert_resource(
+                                source_id=envelope.source_id,
+                                manifest_id=manifest_id,
+                                canonical_url=envelope.canonical_url,
+                                fetched_url=envelope.fetched_url,
+                                title=envelope.title,
+                                authors=envelope.authors,
+                                published_at=envelope.published_at,
+                                resource_type=envelope.resource_type,
+                                media_modality=envelope.media_modality,
+                                domain_scope=envelope.domain_scope,
+                                abstract_or_description=envelope.abstract_or_description,
+                                topic_tags=envelope.topic_tags,
+                                external_identifier=envelope.external_identifier,
+                                observed_from=envelope.observed_from,
+                                information_to_inventory=envelope.information_to_inventory,
+                                priority=envelope.priority,
+                                collection_decision=envelope.collection_decision,
+                                verification_status=envelope.verification_status,
+                                robots_sitemap_status=envelope.robots_sitemap_status,
+                                rights_status=envelope.rights_status,
+                                license_status=envelope.license_status,
+                                license_spdx=envelope.license_spdx,
+                                permitted_storage_scope=envelope.permitted_storage_scope,
+                                permits_full_text_storage=envelope.permits_full_text_storage,
+                                permits_verbatim_excerpts=envelope.permits_verbatim_excerpts,
+                                legal_uncertainty_status=envelope.legal_uncertainty_status,
+                                text_storage_status=envelope.text_storage_status,
+                                last_checked=envelope.collected_at_utc[:10],
+                                last_verified_at=envelope.collected_at_utc,
+                                discovered_at=envelope.collected_at_utc,
+                                run_id=run_id,
+                                acquisition_method=envelope.adapter_id,
+                                actor="pilot_coordinator",
+                                change_reason="metadata_pilot_collection",
                             )
-                            if manifest_id:
-                                conn.execute(
-                                    """
-                                    UPDATE source_urls
-                                       SET last_fetch_status = ?,
-                                           last_fetch_error = NULL,
-                                           last_fetch_at = ?,
-                                           robots_sitemap_status = COALESCE(?, robots_sitemap_status),
-                                           updated_at = ?
-                                     WHERE manifest_id = ?
-                                    """,
-                                    (
-                                        f"pilot-{operation}",
-                                        envelope.collected_at_utc,
-                                        envelope.robots_sitemap_status,
-                                        envelope.collected_at_utc,
-                                        manifest_id,
-                                    ),
-                                )
-                                for link in envelope.discovered_links:
+
+                            operation = str(upserted["operation"])
+                            if operation == "inserted":
+                                summary.inserted_count += 1
+                            elif operation == "updated":
+                                summary.updated_count += 1
+                            else:
+                                summary.unchanged_count += 1
+                                with self.store.transaction() as conn:
                                     conn.execute(
-                                        """
-                                        INSERT INTO discovered_links(
-                                            from_manifest_id, link_url, link_text, rel,
-                                            target_scope, decision, discovered_at
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                                        ON CONFLICT(from_manifest_id, link_url) DO UPDATE SET
-                                            link_text=excluded.link_text,
-                                            rel=excluded.rel,
-                                            target_scope=excluded.target_scope,
-                                            decision=excluded.decision,
-                                            discovered_at=excluded.discovered_at
-                                        """,
+                                        "UPDATE resources SET last_verified_at = ?, last_checked = ? WHERE resource_id = ?",
                                         (
-                                            manifest_id,
-                                            link.link_url,
-                                            link.link_text,
-                                            link.rel,
-                                            link.target_scope,
-                                            link.decision,
                                             envelope.collected_at_utc,
+                                            envelope.collected_at_utc[:10],
+                                            upserted["resource_id"],
                                         ),
                                     )
 
-                        summary.discovered_link_count += len(envelope.discovered_links)
-                        summary.outcomes.append(
-                            PilotItemOutcome(
-                                source_id=envelope.source_id,
-                                adapter_id=envelope.adapter_id,
-                                requested_url=candidate.url,
-                                canonical_url=envelope.canonical_url,
-                                title=envelope.title,
+                            # Always record an explicit adapter-level provenance event with rich metadata
+                            self.store.record_provenance(
+                                event_type=(
+                                    "ADAPTER_METADATA_COLLECTED"
+                                    if operation != "unchanged"
+                                    else "RESOURCE_VERIFIED_UNCHANGED"
+                                ),
+                                acquisition_method=envelope.adapter_id,
+                                actor="pilot_coordinator",
                                 status=operation,
+                                source_id=envelope.source_id,
                                 resource_id=upserted["resource_id"],
                                 version_id=upserted["current_version_id"],
-                                version_count=int(upserted["version_count"]),
+                                run_id=run_id,
+                                manifest_id=manifest_id,
+                                source_url=candidate.url,
+                                final_url=envelope.fetched_url,
                                 http_status=envelope.http_status,
-                                discovered_link_count=len(envelope.discovered_links),
-                                metadata_completeness=envelope.metadata_completeness,
+                                metadata_hash=upserted["metadata_hash"],
+                                details={
+                                    "policy_verification_status": policy.status,
+                                    "policy_profile_id": policy.policy_profile_id,
+                                    "policy_version": policy.policy_version,
+                                    "policy_basis": policy.policy_basis,
+                                    "approved_api_endpoint": policy.approved_api_endpoint,
+                                    "metadata_completeness": envelope.metadata_completeness,
+                                    "source_specific_metadata": envelope.source_specific_metadata,
+                                    "official_links": envelope.official_links,
+                                    "etag": envelope.etag,
+                                    "last_modified": envelope.last_modified_header,
+                                    "discovered_link_count": len(envelope.discovered_links),
+                                    "rejected_link_count": len(envelope.rejected_discovered_links),
+                                },
+                                recorded_at=envelope.collected_at_utc,
                             )
-                        )
+
+                            # Persist discovered_link_candidates (reviewable, un-fetched candidates)
+                            for link in envelope.discovered_links:
+                                self.store.upsert_discovered_link_candidate(
+                                    referring_resource_id=upserted["resource_id"],
+                                    referring_source_id=envelope.source_id,
+                                    from_manifest_id=manifest_id,
+                                    from_url=envelope.canonical_url,
+                                    raw_href=link.raw_href or link.original_url or link.link_url,
+                                    original_url=link.original_url or link.link_url,
+                                    normalized_url=link.link_url,
+                                    link_text=link.link_text,
+                                    rel=link.rel,
+                                    is_internal=link.is_internal,
+                                    target_scope=link.target_scope,
+                                    recommended_decision=link.decision,
+                                    policy_state=link.policy_state,
+                                    review_status=link.review_status or "PENDING_REVIEW",
+                                    fetch_permission_granted=link.fetch_permission_granted,
+                                    discovered_at=envelope.collected_at_utc,
+                                    run_id=run_id,
+                                    acquisition_method=envelope.adapter_id,
+                                    actor="pilot_coordinator",
+                                )
+
+                            for rejected in envelope.rejected_discovered_links:
+                                self.store.record_provenance(
+                                    event_type="DISCOVERED_LINK_CANDIDATE_REJECTED",
+                                    acquisition_method=envelope.adapter_id,
+                                    actor="pilot_coordinator",
+                                    status="rejected-unsafe-or-unsupported-url",
+                                    source_id=envelope.source_id,
+                                    resource_id=upserted["resource_id"],
+                                    run_id=run_id,
+                                    manifest_id=manifest_id,
+                                    source_url=envelope.canonical_url,
+                                    final_url=str(rejected.get("original_url") or rejected.get("raw_href") or ""),
+                                    details=dict(rejected),
+                                    recorded_at=envelope.collected_at_utc,
+                                )
+
+                            # Persist fetch_events and legacy discovered_links (if manifest_id exists)
+                            with self.store.transaction() as conn:
+                                conn.execute(
+                                    """
+                                    INSERT INTO fetch_events(
+                                        run_id, manifest_id, requested_url, final_url,
+                                        status, http_status, error, fetched_at
+                                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+                                    """,
+                                    (
+                                        run_id,
+                                        manifest_id,
+                                        candidate.url,
+                                        envelope.fetched_url,
+                                        f"pilot-{operation}",
+                                        envelope.http_status,
+                                        envelope.collected_at_utc,
+                                    ),
+                                )
+                                if manifest_id:
+                                    conn.execute(
+                                        """
+                                        UPDATE source_urls
+                                           SET last_fetch_status = ?,
+                                               last_fetch_error = NULL,
+                                               last_fetch_at = ?,
+                                               robots_sitemap_status = COALESCE(?, robots_sitemap_status),
+                                               updated_at = ?
+                                         WHERE manifest_id = ?
+                                        """,
+                                        (
+                                            f"pilot-{operation}",
+                                            envelope.collected_at_utc,
+                                            envelope.robots_sitemap_status,
+                                            envelope.collected_at_utc,
+                                            manifest_id,
+                                        ),
+                                    )
+                                    for link in envelope.discovered_links:
+                                        conn.execute(
+                                            """
+                                            INSERT INTO discovered_links(
+                                                from_manifest_id, link_url, link_text, rel,
+                                                target_scope, decision, discovered_at
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                            ON CONFLICT(from_manifest_id, link_url) DO UPDATE SET
+                                                link_text=excluded.link_text,
+                                                rel=excluded.rel,
+                                                target_scope=excluded.target_scope,
+                                                decision=excluded.decision,
+                                                discovered_at=excluded.discovered_at
+                                            """,
+                                            (
+                                                manifest_id,
+                                                link.link_url,
+                                                link.link_text,
+                                                link.rel,
+                                                link.target_scope,
+                                                link.decision,
+                                                envelope.collected_at_utc,
+                                            ),
+                                        )
+
+                            summary.discovered_link_count += len(envelope.discovered_links)
+                            summary.outcomes.append(
+                                PilotItemOutcome(
+                                    source_id=envelope.source_id,
+                                    adapter_id=envelope.adapter_id,
+                                    requested_url=candidate.url,
+                                    canonical_url=envelope.canonical_url,
+                                    title=envelope.title,
+                                    status=operation,
+                                    resource_id=upserted["resource_id"],
+                                    version_id=upserted["current_version_id"],
+                                    version_count=int(upserted["version_count"]),
+                                    http_status=envelope.http_status,
+                                    discovered_link_count=len(envelope.discovered_links),
+                                    metadata_completeness=envelope.metadata_completeness,
+                                )
+                            )
 
                     except NotModifiedResponse as not_mod:
+                        total_attempted_fetches += 1
+                        source_processed += 1
                         summary.http_events.extend(adapter.request_log[before_fetch_idx:])
                         summary.unchanged_count += 1
                         existing_res = self.store.get_resource(
@@ -736,6 +796,8 @@ class PilotCoordinator:
                         )
 
                     except AdapterError as err:
+                        total_attempted_fetches += 1
+                        source_processed += 1
                         summary.http_events.extend(adapter.request_log[before_fetch_idx:])
                         is_blocked = err.error_class in {"POLICY_BLOCKED", "SCOPE_VIOLATION"}
                         if is_blocked:

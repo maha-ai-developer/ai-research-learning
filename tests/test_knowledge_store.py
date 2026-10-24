@@ -30,7 +30,7 @@ class KnowledgeStoreTests(unittest.TestCase):
             with init_db(db_path) as store:
                 self.assertEqual(store.get_schema_version(), LATEST_SCHEMA_VERSION)
                 migrations = store.list_migrations()
-                self.assertEqual([m["version"] for m in migrations], [1, 2, 3])
+                self.assertEqual([m["version"] for m in migrations], [1, 2, 3, 4])
                 user_ver = store.conn.execute("PRAGMA user_version").fetchone()[0]
                 self.assertEqual(user_ver, LATEST_SCHEMA_VERSION)
                 fk_enabled = store.conn.execute("PRAGMA foreign_keys").fetchone()[0]
@@ -473,6 +473,125 @@ class KnowledgeStoreTests(unittest.TestCase):
                 self.assertEqual(collect.main(["--db", str(db_path)]), 0)
                 self.assertEqual(collect.main(["--db", str(db_path), "--init-db"]), 0)
                 self.assertEqual(collect.main(["--db", str(db_path), "--import-manifest"]), 0)
+
+    def test_discovered_link_candidates_idempotency_domain_classification_and_unsafe_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "candidates.sqlite"
+            with KnowledgeStore(db_path) as store:
+                parent = store.upsert_resource(
+                    source_id="SRC-HINTON",
+                    canonical_url="https://www.cs.toronto.edu/~hinton/index.html",
+                    title="Geoffrey Hinton Home",
+                    resource_type="Discovery index",
+                )
+                parent_id = parent["resource_id"]
+                self.assertEqual(len(store.list_resources()), 1)
+
+                # 1. Insert internal discovered link candidate
+                c1 = store.upsert_discovered_link_candidate(
+                    referring_resource_id=parent_id,
+                    referring_source_id="SRC-HINTON",
+                    from_url="https://www.cs.toronto.edu/~hinton/index.html",
+                    raw_href="/~hinton/csc321/notes.html#lec1",
+                    original_url="https://www.cs.toronto.edu/~hinton/csc321/notes.html#lec1",
+                    link_text="CSC321 Notes",
+                    is_internal=True,
+                    target_scope="Hinton in-scope HTML subpage",
+                    recommended_decision="Metadata-first candidate (do not auto-crawl)",
+                    discovered_at="2026-10-24T08:00:00+00:00",
+                    run_id="run_test_1",
+                )
+                self.assertEqual(c1["operation"], "inserted")
+                self.assertEqual(c1["seen_count"], 1)
+                self.assertEqual(c1["is_internal"], 1)
+                self.assertEqual(c1["domain_classification"], "INTERNAL")
+                self.assertEqual(c1["review_status"], "PENDING_REVIEW")
+                self.assertEqual(c1["fetch_permission_granted"], 0)
+                self.assertIsNone(c1["promoted_resource_id"])
+                self.assertEqual(
+                    c1["original_url"],
+                    "https://www.cs.toronto.edu/~hinton/csc321/notes.html#lec1",
+                )
+                self.assertEqual(
+                    c1["normalized_url"],
+                    "https://www.cs.toronto.edu/~hinton/csc321/notes.html",
+                )
+
+                # 2. Repeated discovery of same candidate updates last_seen_at and seen_count without duplicating rows
+                c1_repeat = store.upsert_discovered_link_candidate(
+                    referring_resource_id=parent_id,
+                    referring_source_id="SRC-HINTON",
+                    from_url="https://www.cs.toronto.edu/~hinton/index.html",
+                    raw_href="/~hinton/csc321/notes.html#lec2",
+                    original_url="https://www.cs.toronto.edu/~hinton/csc321/notes.html#lec2",
+                    link_text="CSC321 Notes Updated Anchor",
+                    is_internal=True,
+                    target_scope="Hinton in-scope HTML subpage",
+                    recommended_decision="Metadata-first candidate (do not auto-crawl)",
+                    discovered_at="2026-10-24T09:00:00+00:00",
+                    run_id="run_test_2",
+                )
+                self.assertEqual(c1_repeat["operation"], "updated")
+                self.assertEqual(c1_repeat["candidate_id"], c1["candidate_id"])
+                self.assertEqual(c1_repeat["seen_count"], 2)
+                self.assertEqual(c1_repeat["first_seen_at"], "2026-10-24T08:00:00+00:00")
+                self.assertEqual(c1_repeat["last_seen_at"], "2026-10-24T09:00:00+00:00")
+                # Original first-discovered audit URL is preserved
+                self.assertEqual(
+                    c1_repeat["original_url"],
+                    "https://www.cs.toronto.edu/~hinton/csc321/notes.html#lec1",
+                )
+
+                # 3. External discovered link is classified EXTERNAL without fetch permission and without promoting into resources
+                c_ext = store.upsert_discovered_link_candidate(
+                    referring_resource_id=parent_id,
+                    referring_source_id="SRC-HINTON",
+                    from_url="https://www.cs.toronto.edu/~hinton/index.html",
+                    raw_href="https://nature.com/articles/nature14539",
+                    original_url="https://nature.com/articles/nature14539",
+                    link_text="Deep Learning Nature Review",
+                    is_internal=False,
+                    target_scope="External reference / citation",
+                    recommended_decision="Record citation only (do not crawl external domain)",
+                )
+                self.assertEqual(c_ext["domain_classification"], "EXTERNAL")
+                self.assertEqual(c_ext["is_internal"], 0)
+                self.assertEqual(c_ext["fetch_permission_granted"], 0)
+                self.assertEqual(c_ext["policy_state"], "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH")
+                # Candidates must NEVER be automatically promoted into `resources`
+                self.assertEqual(len(store.list_resources()), 1)
+                self.assertEqual(len(store.list_discovered_link_candidates()), 2)
+
+                # 4. Unsafe schemes (javascript:, data:, file:, mailto:) are rejected and audited in provenance_events
+                for unsafe_url in [
+                    "javascript:alert('xss')",
+                    "data:text/html,<script>alert(1)</script>",
+                    "file:///etc/passwd",
+                    "mailto:user@example.com",
+                ]:
+                    with self.assertRaises(ValueError):
+                        store.upsert_discovered_link_candidate(
+                            referring_resource_id=parent_id,
+                            referring_source_id="SRC-HINTON",
+                            from_url="https://www.cs.toronto.edu/~hinton/index.html",
+                            raw_href=unsafe_url,
+                            original_url=unsafe_url,
+                            is_internal=False,
+                            target_scope="Unsafe test",
+                            recommended_decision="Reject",
+                        )
+
+                rejected_events = [
+                    e
+                    for e in store.list_provenance_events(resource_id=parent_id)
+                    if e["event_type"] == "DISCOVERED_LINK_CANDIDATE_REJECTED"
+                ]
+                self.assertEqual(len(rejected_events), 4)
+                recorded_originals = {
+                    json.loads(e["details_json"])["original_url"] for e in rejected_events
+                }
+                self.assertIn("javascript:alert('xss')", recorded_originals)
+                self.assertIn("file:///etc/passwd", recorded_originals)
 
 
 if __name__ == "__main__":

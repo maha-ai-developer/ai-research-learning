@@ -21,6 +21,8 @@ for p in (str(ROOT_DIR), str(SRC_DIR)):
 import collect  # noqa: E402
 from knowledge_store import KnowledgeStore  # noqa: E402
 from ai_research_learning.sources import (  # noqa: E402
+    ARXIV_POLICY_PROFILE_ID,
+    ARXIV_POLICY_VERSION,
     DEFAULT_PROJECT_USER_AGENT,
     ArxivSourceAdapter,
     BengioSourceAdapter,
@@ -113,6 +115,8 @@ SAMPLE_HINTON_HTML = """<!DOCTYPE html>
   <a href="/~hinton/csc321/notes.html">Course Notes</a>
   <a href="https://arxiv.org/abs/1207.0580">Dropout Paper on arXiv</a>
   <a href="https://example.org/unrelated">External Unrelated Link</a>
+  <a href="javascript:alert('unsafe')">Unsafe JS Link</a>
+  <a href="mailto:hinton@cs.toronto.edu">Email Link</a>
 </body>
 </html>
 """
@@ -168,6 +172,43 @@ SAMPLE_ARXIV_ATOM_XML = """<?xml version="1.0" encoding="UTF-8"?>
     <link title="pdf" href="http://arxiv.org/pdf/1207.0580v1" rel="related" type="application/pdf"/>
     <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="cs.NE" scheme="http://arxiv.org/schemas/atom"/>
     <category term="cs.NE" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+</feed>
+"""
+
+SAMPLE_ARXIV_BATCH_ATOM_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <entry>
+    <id>http://arxiv.org/abs/1207.0580v1</id>
+    <updated>2012-07-03T14:02:11Z</updated>
+    <published>2012-07-03T14:02:11Z</published>
+    <title>Improving neural networks by preventing co-adaptation of feature detectors</title>
+    <summary>When a large feedforward neural network is trained on a small training set, it typically performs poorly on held-out test data.</summary>
+    <author><name>Geoffrey E. Hinton</name></author>
+    <author><name>Nitish Srivastava</name></author>
+    <arxiv:comment>18 pages</arxiv:comment>
+    <link href="http://arxiv.org/abs/1207.0580v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/1207.0580v1" rel="related" type="application/pdf"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="cs.NE" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.NE" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/1409.0473v7</id>
+    <updated>2016-05-19T16:10:00Z</updated>
+    <published>2014-09-01T19:15:12Z</published>
+    <title>Neural Machine Translation by Jointly Learning to Align and Translate</title>
+    <summary>Neural machine translation is a recently proposed approach to machine translation.</summary>
+    <author><name>Dzmitry Bahdanau</name></author>
+    <author><name>Kyunghyun Cho</name></author>
+    <author><name>Yoshua Bengio</name></author>
+    <link href="http://arxiv.org/abs/1409.0473v7" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/1409.0473v7" rel="related" type="application/pdf"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
     <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
   </entry>
 </feed>
@@ -337,7 +378,7 @@ class SourceAdaptersNormalizationTests(unittest.TestCase):
             {
                 "https://export.arxiv.org/robots.txt": FakeResponse(
                     status_code=200,
-                    body="User-agent: *\nAllow: /api/\n",
+                    body="User-agent: *\nDisallow: /\nCrawl-delay: 15\n",
                     headers={"Content-Type": "text/plain"},
                 ),
                 q1: FakeResponse(
@@ -350,6 +391,13 @@ class SourceAdaptersNormalizationTests(unittest.TestCase):
         adapter = ArxivSourceAdapter(session=session, rate_limiter=self.limiter)
         policy = adapter.audit_policy()
         self.assertTrue(policy.is_metadata_collection_permitted)
+        self.assertEqual(policy.status, "OK")
+        self.assertEqual(policy.metadata_collection_decision, "PERMITTED")
+        self.assertIn("DISALLOWED_BY_ROBOTS_TXT", policy.robots_crawl_status or "")
+        self.assertFalse(policy.general_html_crawling_permitted)
+        self.assertEqual(policy.policy_profile_id, ARXIV_POLICY_PROFILE_ID)
+        self.assertEqual(policy.policy_version, ARXIV_POLICY_VERSION)
+        self.assertEqual(policy.approved_api_endpoint, "https://export.arxiv.org/api/query")
         self.assertGreaterEqual(policy.effective_delay_seconds, 3.0)
 
         candidates = adapter.discover_candidates(limit=1)
@@ -364,10 +412,43 @@ class SourceAdaptersNormalizationTests(unittest.TestCase):
         self.assertFalse(envelope.permits_full_text_storage)
         self.assertTrue(envelope.permits_verbatim_excerpts)
         self.assertEqual(envelope.source_specific_metadata["primary_category"], "cs.NE")
+        self.assertEqual(envelope.source_specific_metadata["policy_profile_id"], ARXIV_POLICY_PROFILE_ID)
+        self.assertEqual(envelope.source_specific_metadata["policy_version"], ARXIV_POLICY_VERSION)
         self.assertEqual(
             envelope.source_specific_metadata["pdf_reference_url_not_downloaded"],
             "http://arxiv.org/pdf/1207.0580v1",
         )
+
+    def test_arxiv_batch_query_returns_multiple_envelopes_in_single_api_call(self) -> None:
+        batch_url = "https://export.arxiv.org/api/query?id_list=1207.0580%2C1409.0473&max_results=2"
+        session = FakeSession(
+            {
+                "https://export.arxiv.org/robots.txt": FakeResponse(
+                    status_code=200,
+                    body="User-agent: *\nDisallow: /\nCrawl-delay: 15\n",
+                    headers={"Content-Type": "text/plain"},
+                ),
+                batch_url: FakeResponse(
+                    status_code=200,
+                    body=SAMPLE_ARXIV_BATCH_ATOM_XML,
+                    headers={"Content-Type": "application/atom+xml"},
+                ),
+            }
+        )
+        adapter = ArxivSourceAdapter(session=session, rate_limiter=self.limiter)
+        policy = adapter.audit_policy()
+        candidates = adapter.discover_candidates(limit=2)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].url, batch_url)
+
+        envelopes = adapter.collect_candidate_envelopes(candidates[0], policy=policy)
+        self.assertEqual(len(envelopes), 2)
+        self.assertEqual(envelopes[0].canonical_url, "https://arxiv.org/abs/1207.0580")
+        self.assertEqual(envelopes[0].external_identifier, "arXiv:1207.0580")
+        self.assertEqual(envelopes[1].canonical_url, "https://arxiv.org/abs/1409.0473")
+        self.assertEqual(envelopes[1].external_identifier, "arXiv:1409.0473")
+        # Exactly 1 robots.txt call + 1 batched API query call
+        self.assertEqual(len(session.calls), 2)
 
     def test_wikipedia_adapter_mediawiki_json_normalization(self) -> None:
         adapter = WikipediaSourceAdapter(rate_limiter=self.limiter)
@@ -604,6 +685,98 @@ class PolicyAndSafetyBoundaryTests(unittest.TestCase):
         with self.assertRaises(ParseError):
             arxiv_adapter.collect_candidate(arxiv_adapter.discover_candidates(limit=1)[0], policy=policy)
 
+    def test_arxiv_api_policy_profile_strictly_blocks_html_pdf_unapproved_hosts_and_redirects(self) -> None:
+        valid_api_url = "https://export.arxiv.org/api/query?id_list=1207.0580&max_results=1"
+        session = FakeSession(
+            {
+                "https://export.arxiv.org/robots.txt": FakeResponse(
+                    status_code=200,
+                    body="User-agent: *\nDisallow: /\nCrawl-delay: 15\n",
+                    headers={"Content-Type": "text/plain"},
+                ),
+                valid_api_url: FakeResponse(
+                    status_code=302,
+                    headers={"Location": "https://arxiv.org/abs/1207.0580"},
+                ),
+            }
+        )
+        adapter = ArxivSourceAdapter(session=session, rate_limiter=self.limiter)
+        policy = adapter.audit_policy()
+        self.assertTrue(policy.is_metadata_collection_permitted)
+        self.assertFalse(policy.general_html_crawling_permitted)
+        self.assertIn("DISALLOWED_BY_ROBOTS_TXT", policy.robots_crawl_status or "")
+        self.assertTrue(policy.is_api_url_permitted(valid_api_url))
+
+        # All non-API paths, HTML paths, PDF paths, unapproved hosts, HTTP scheme, or unbounded queries MUST be blocked
+        blocked_urls = [
+            "https://export.arxiv.org/abs/1207.0580",
+            "https://export.arxiv.org/list/cs.AI/recent",
+            "https://export.arxiv.org/pdf/1207.0580.pdf",
+            "https://export.arxiv.org/api/other?id_list=1207.0580",
+            "https://export.arxiv.org/oai2?verb=Identify",
+            "https://arxiv.org/abs/1207.0580",
+            "https://arxiv.org/api/query?id_list=1207.0580&max_results=1",
+            "http://export.arxiv.org/api/query?id_list=1207.0580&max_results=1",
+            "https://export.arxiv.org/api/query",
+            "https://export.arxiv.org/api/query?id_list=1207.0580&max_results=51",
+            "https://export.arxiv.org/api/query?id_list=not_an_id&max_results=1",
+            "https://export.arxiv.org/api/query?id_list=1207.0580&unexpected_param=1",
+            "https://example.org/api/query?id_list=1207.0580&max_results=1",
+        ]
+        for bad_url in blocked_urls:
+            with self.subTest(bad_url=bad_url):
+                self.assertFalse(adapter.is_url_in_scope(bad_url))
+                self.assertFalse(policy.is_api_url_permitted(bad_url))
+                with self.assertRaises(ScopeViolationError):
+                    adapter.fetch_metadata(
+                        SourceCandidate(source_id="SRC-ARXIV", url=bad_url),
+                        policy=policy,
+                    )
+
+        # Redirect from the approved API endpoint must also be rejected fail-closed
+        with self.assertRaises(ScopeViolationError):
+            adapter.fetch_metadata(
+                SourceCandidate(source_id="SRC-ARXIV", url=valid_api_url),
+                policy=policy,
+            )
+
+        # If API terms verification is revoked/disabled, or robots.txt explicitly disallows /api/query, fail closed
+        adapter_unverified = ArxivSourceAdapter(
+            session=FakeSession(
+                {
+                    "https://export.arxiv.org/robots.txt": FakeResponse(
+                        status_code=200,
+                        body="User-agent: *\nDisallow: /\n",
+                    ),
+                }
+            ),
+            rate_limiter=self.limiter,
+            api_terms_verified=False,
+        )
+        policy_unverified = adapter_unverified.audit_policy()
+        self.assertFalse(policy_unverified.is_metadata_collection_permitted)
+        self.assertEqual(policy_unverified.status, "BLOCKED")
+        with self.assertRaises(PolicyBlockedError):
+            adapter_unverified.fetch_metadata(
+                SourceCandidate(source_id="SRC-ARXIV", url=valid_api_url),
+                policy=policy_unverified,
+            )
+
+        adapter_api_disallowed = ArxivSourceAdapter(
+            session=FakeSession(
+                {
+                    "https://export.arxiv.org/robots.txt": FakeResponse(
+                        status_code=200,
+                        body="User-agent: *\nDisallow: /api/query\n",
+                    ),
+                }
+            ),
+            rate_limiter=self.limiter,
+        )
+        policy_api_disallowed = adapter_api_disallowed.audit_policy()
+        self.assertFalse(policy_api_disallowed.is_metadata_collection_permitted)
+        self.assertEqual(policy_api_disallowed.status, "BLOCKED")
+
 
 class PilotCoordinatorAndIdempotencyTests(unittest.TestCase):
     """Test PilotCoordinator SQLite persistence, idempotency, caps, and provenance events."""
@@ -621,7 +794,8 @@ class PilotCoordinatorAndIdempotencyTests(unittest.TestCase):
         wiki_tmp = WikipediaSourceAdapter(rate_limiter=self.limiter)
         wiki_cands = wiki_tmp.discover_candidates(limit=2)
         arxiv_tmp = ArxivSourceAdapter(rate_limiter=self.limiter)
-        arxiv_cands = arxiv_tmp.discover_candidates(limit=2)
+        arxiv_cand_1 = arxiv_tmp.discover_candidates(limit=1)[0]
+        arxiv_cand_2 = arxiv_tmp.discover_candidates(limit=2)[0]
 
         routes: dict[str, FakeResponse | list[FakeResponse] | Exception] = {
             "https://www.cs.toronto.edu/robots.txt": FakeResponse(
@@ -657,11 +831,16 @@ class PilotCoordinatorAndIdempotencyTests(unittest.TestCase):
             ),
             "https://export.arxiv.org/robots.txt": FakeResponse(
                 status_code=200,
-                body="User-agent: *\nAllow: /api/\n",
+                body="User-agent: *\nDisallow: /\nCrawl-delay: 15\n",
             ),
-            arxiv_cands[0].url: FakeResponse(
+            arxiv_cand_1.url: FakeResponse(
                 status_code=200,
                 body=SAMPLE_ARXIV_ATOM_XML,
+                headers={"Content-Type": "application/atom+xml"},
+            ),
+            arxiv_cand_2.url: FakeResponse(
+                status_code=200,
+                body=SAMPLE_ARXIV_BATCH_ATOM_XML,
                 headers={"Content-Type": "application/atom+xml"},
             ),
             "https://en.wikipedia.org/robots.txt": FakeResponse(
@@ -742,6 +921,30 @@ class PilotCoordinatorAndIdempotencyTests(unittest.TestCase):
             self.assertTrue(any(e["event_type"] == "SOURCE_POLICY_AUDIT" for e in run1_events))
             self.assertTrue(any(e["event_type"] == "ADAPTER_METADATA_COLLECTED" for e in run1_events))
             self.assertTrue(any(e["event_type"] == "RESOURCE_VERIFIED_UNCHANGED" for e in run2_events))
+
+            # Verify discovered_link_candidates were persisted as reviewable candidates without promoting into resources
+            candidates_after = store.list_discovered_link_candidates()
+            self.assertGreater(len(candidates_after), 0)
+            for cand in candidates_after:
+                # Seen in both run1 and run2 -> seen_count == 2 without duplicating candidate rows
+                self.assertEqual(cand["seen_count"], 2)
+                self.assertEqual(cand["review_status"], "PENDING_REVIEW")
+                self.assertEqual(cand["fetch_permission_granted"], 0)
+                self.assertIsNone(cand["promoted_resource_id"])
+                if cand["domain_classification"] == "EXTERNAL":
+                    self.assertEqual(cand["is_internal"], 0)
+                    self.assertEqual(cand["policy_state"], "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH")
+                else:
+                    self.assertEqual(cand["is_internal"], 1)
+
+            # Verify unsafe/non-HTTP links (javascript:, mailto:) were rejected and audited in provenance_events
+            rejected_events = [
+                e for e in run1_events if e["event_type"] == "DISCOVERED_LINK_CANDIDATE_REJECTED"
+            ]
+            self.assertEqual(len(rejected_events), 2)
+            rejected_originals = {json.loads(e["details_json"])["original_url"] for e in rejected_events}
+            self.assertIn("javascript:alert('unsafe')", rejected_originals)
+            self.assertIn("mailto:hinton@cs.toronto.edu", rejected_originals)
 
     def test_blocked_and_errored_sources_record_provenance(self) -> None:
         with KnowledgeStore(db_path=self.db_path) as store:

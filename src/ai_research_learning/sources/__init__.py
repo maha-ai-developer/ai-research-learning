@@ -7,7 +7,14 @@ Provides a unified, policy-gated connector contract across:
 - SRC-ARXIV (`ArxivSourceAdapter`)
 - SRC-WIKIPEDIA (`WikipediaSourceAdapter`)
 """
-from .arxiv_adapter import ArxivSourceAdapter, extract_arxiv_id
+from .arxiv_adapter import (
+    ARXIV_MAX_RESULTS_LIMIT,
+    ARXIV_POLICY_BASIS,
+    ARXIV_POLICY_PROFILE_ID,
+    ARXIV_POLICY_VERSION,
+    ArxivSourceAdapter,
+    extract_arxiv_id,
+)
 from .base import (
     DEFAULT_PROJECT_USER_AGENT,
     AdapterError,
@@ -53,6 +60,10 @@ from .pilot import (
 from .wikipedia_adapter import WikipediaSourceAdapter
 
 __all__ = [
+    "ARXIV_MAX_RESULTS_LIMIT",
+    "ARXIV_POLICY_BASIS",
+    "ARXIV_POLICY_PROFILE_ID",
+    "ARXIV_POLICY_VERSION",
     "DEFAULT_PROJECT_USER_AGENT",
     "MAX_PILOT_PER_SOURCE",
     "MAX_PILOT_TOTAL",
