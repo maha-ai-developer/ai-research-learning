@@ -24,6 +24,13 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import requests
 from bs4 import BeautifulSoup
 
+from knowledge_store import (
+    KnowledgeStore,
+    apply_migrations,
+    format_import_summary,
+    import_seed_manifest,
+)
+
 DEFAULT_USER_AGENT = "AIResearchLearningMetadataBot/0.1 (metadata-only; configure a contact URL before production)"
 DEFAULT_DELAY_SECONDS = 1.0
 DEFAULT_TIMEOUT_SECONDS = 15
@@ -309,110 +316,14 @@ class ConservativeCollector:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys = ON")
         self._ensure_schema()
+        self.store = KnowledgeStore(conn=self.db, auto_initialize=False)
 
     def close(self) -> None:
         self.db.close()
 
     def _ensure_schema(self) -> None:
-        self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS source_urls (
-                manifest_id TEXT PRIMARY KEY,
-                person_source TEXT NOT NULL,
-                url TEXT NOT NULL UNIQUE,
-                page_resource_name TEXT NOT NULL,
-                resource_type TEXT NOT NULL,
-                domain_scope TEXT NOT NULL,
-                verification_status TEXT NOT NULL,
-                observed_from TEXT,
-                information_to_inventory TEXT,
-                priority TEXT,
-                collection_decision TEXT,
-                robots_sitemap_status TEXT,
-                rights_status TEXT,
-                last_checked TEXT,
-                last_fetch_status TEXT,
-                last_fetch_error TEXT,
-                last_fetch_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS documents (
-                document_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                manifest_id TEXT NOT NULL,
-                canonical_url TEXT NOT NULL UNIQUE,
-                title TEXT,
-                authors TEXT,
-                published_at TEXT,
-                content_type TEXT,
-                topic_tags TEXT,
-                abstract_or_description TEXT,
-                external_identifier TEXT,
-                license_status TEXT,
-                text_storage_status TEXT NOT NULL DEFAULT 'metadata-only-not-yet-collected',
-                fetched_at TEXT,
-                content_hash TEXT,
-                metadata_hash TEXT,
-                FOREIGN KEY(manifest_id) REFERENCES source_urls(manifest_id)
-            );
-            CREATE TABLE IF NOT EXISTS crawl_runs (
-                run_id TEXT PRIMARY KEY,
-                started_at TEXT NOT NULL,
-                finished_at TEXT,
-                manifest_path TEXT,
-                selected_count INTEGER NOT NULL DEFAULT 0,
-                fetched_count INTEGER NOT NULL DEFAULT 0,
-                discovered_count INTEGER NOT NULL DEFAULT 0,
-                skipped_count INTEGER NOT NULL DEFAULT 0,
-                error_count INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL,
-                notes TEXT
-            );
-            CREATE TABLE IF NOT EXISTS discovered_links (
-                discovery_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                from_manifest_id TEXT NOT NULL,
-                link_url TEXT NOT NULL,
-                link_text TEXT,
-                rel TEXT,
-                target_scope TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                discovered_at TEXT NOT NULL,
-                UNIQUE(from_manifest_id, link_url),
-                FOREIGN KEY(from_manifest_id) REFERENCES source_urls(manifest_id)
-            );
-            CREATE TABLE IF NOT EXISTS site_policies (
-                origin TEXT PRIMARY KEY,
-                robots_url TEXT NOT NULL,
-                status TEXT NOT NULL,
-                http_status INTEGER,
-                crawl_delay_seconds REAL NOT NULL,
-                sitemap_urls TEXT,
-                evidence TEXT,
-                checked_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS fetch_events (
-                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                manifest_id TEXT NOT NULL,
-                requested_url TEXT NOT NULL,
-                final_url TEXT,
-                status TEXT NOT NULL,
-                http_status INTEGER,
-                error TEXT,
-                fetched_at TEXT NOT NULL,
-                FOREIGN KEY(run_id) REFERENCES crawl_runs(run_id),
-                FOREIGN KEY(manifest_id) REFERENCES source_urls(manifest_id)
-            );
-            """
-        )
-        doc_columns = {r[1] for r in self.db.execute("PRAGMA table_info(documents)")}
-        if "metadata_hash" not in doc_columns:
-            self.db.execute("ALTER TABLE documents ADD COLUMN metadata_hash TEXT")
-        src_columns = {r[1] for r in self.db.execute("PRAGMA table_info(source_urls)")}
-        if "last_fetch_status" not in src_columns:
-            self.db.execute("ALTER TABLE source_urls ADD COLUMN last_fetch_status TEXT")
-        if "last_fetch_error" not in src_columns:
-            self.db.execute("ALTER TABLE source_urls ADD COLUMN last_fetch_error TEXT")
-        if "last_fetch_at" not in src_columns:
-            self.db.execute("ALTER TABLE source_urls ADD COLUMN last_fetch_at TEXT")
+        apply_migrations(self.db)
+        self.db.execute("PRAGMA foreign_keys = ON")
         self.db.commit()
 
     def _wait(self, origin: str, delay: float | None = None) -> None:
@@ -572,10 +483,32 @@ class ConservativeCollector:
 
     def _save_document(self, manifest_id: str, metadata: dict[str, Any]) -> None:
         fetched_at = utc_now()
+        source_id = self.store.resolve_or_register_source(
+            person_source=None,
+            canonical_url=metadata["canonical_url"],
+            manifest_id=manifest_id,
+        )
+        res = self.store.upsert_resource(
+            source_id=source_id,
+            manifest_id=manifest_id,
+            canonical_url=metadata["canonical_url"],
+            title=metadata.get("title") or metadata["canonical_url"],
+            resource_type=metadata.get("content_type") or "web_page",
+            authors=metadata.get("authors"),
+            published_at=metadata.get("published_at"),
+            abstract_or_description=metadata.get("abstract_or_description"),
+            topic_tags=metadata.get("topic_tags"),
+            external_identifier=metadata.get("external_identifier"),
+            text_storage_status="metadata-only",
+            discovered_at=fetched_at,
+            acquisition_method="CONSERVATIVE_HTML_COLLECTOR",
+            actor=self.user_agent,
+            change_reason="html_metadata_collected",
+        )
         self.db.execute(
             "INSERT INTO documents(manifest_id,canonical_url,title,authors,published_at,content_type,topic_tags,"
-            "abstract_or_description,external_identifier,license_status,text_storage_status,fetched_at,content_hash,metadata_hash) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+            "abstract_or_description,external_identifier,license_status,text_storage_status,fetched_at,content_hash,metadata_hash,resource_id,version_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(canonical_url) DO UPDATE SET "
             "title=COALESCE(excluded.title,documents.title),authors=COALESCE(excluded.authors,documents.authors),"
             "published_at=COALESCE(excluded.published_at,documents.published_at),"
@@ -583,11 +516,13 @@ class ConservativeCollector:
             "topic_tags=COALESCE(excluded.topic_tags,documents.topic_tags),"
             "abstract_or_description=COALESCE(excluded.abstract_or_description,documents.abstract_or_description),"
             "external_identifier=COALESCE(excluded.external_identifier,documents.external_identifier),"
-            "text_storage_status='metadata-only',fetched_at=excluded.fetched_at,metadata_hash=excluded.metadata_hash",
+            "text_storage_status='metadata-only',fetched_at=excluded.fetched_at,metadata_hash=excluded.metadata_hash,"
+            "resource_id=excluded.resource_id,version_id=excluded.version_id",
             (manifest_id, metadata["canonical_url"], metadata.get("title"), metadata.get("authors"),
              metadata.get("published_at"), metadata.get("content_type"), metadata.get("topic_tags"),
              metadata.get("abstract_or_description"), metadata.get("external_identifier"),
-             "not_checked", "metadata-only", fetched_at, None, metadata.get("metadata_hash")),
+             "not_checked", "metadata-only", fetched_at, None, metadata.get("metadata_hash"),
+             res["resource_id"], res["current_version_id"]),
         )
 
     def _save_discovered_links(self, manifest_id: str, links: list[dict[str, str | None]]) -> int:
@@ -774,8 +709,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-delay", type=float, default=DEFAULT_DELAY_SECONDS, help="Minimum per-origin delay in seconds; never below 1 second")
     parser.add_argument("--fetch", action="store_true", help="Enable network collection; without this flag the command is a dry run")
     parser.add_argument("--policy-only", action="store_true", help="Check robots.txt and sitemap endpoint availability, then exit")
+    parser.add_argument("--init-db", action="store_true", help="Initialize or migrate the local SQLite database offline and exit")
+    parser.add_argument("--import-manifest", action="store_true", help="Import seed_urls.json into the local SQLite database offline and exit")
     parser.add_argument("--discoveries-csv", type=Path, default=None, help="Path for the discovered-link review CSV")
     args = parser.parse_args(argv)
+
+    if args.init_db:
+        with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
+            print(f"Initialized local knowledge store at {args.db} (schema version {store.get_schema_version()}).")
+        if not args.import_manifest and not args.fetch:
+            return 0
+
+    if args.import_manifest:
+        if not args.manifest.exists():
+            print(f"ERROR: manifest not found: {args.manifest}", file=sys.stderr)
+            return 2
+        summary = import_seed_manifest(db_path=args.db, manifest_path=args.manifest)
+        print(format_import_summary(summary))
+        if not args.fetch:
+            return 0 if summary.rejected_count == 0 else 1
 
     if not args.manifest.exists():
         print(f"ERROR: manifest not found: {args.manifest}", file=sys.stderr)

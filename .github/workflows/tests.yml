@@ -26,6 +26,6 @@ jobs:
       - name: Run offline unit tests
         run: python -m unittest discover -s tests -v
       - name: Compile Python sources
-        run: python -m compileall -q collect.py tests
+        run: python -m compileall -q collect.py knowledge_store.py tests
       - name: Run offline collector dry-run check
         run: python collect.py
