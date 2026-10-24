@@ -19,9 +19,15 @@ An AI-engineering project for building a source-grounded learning environment fr
 ai-research-learning/
 ├── collect.py                  # metadata-only collector; dry-run by default
 ├── knowledge_store.py          # local SQLite persistence store, migrations, and manifest importer
+├── src/
+│   └── ai_research_learning/
+│       └── sources/            # modular source adapters (Hinton, Bengio, 3B1B, arXiv, Wikipedia) & pilot coordinator
 ├── seed_urls.json              # 52-record source manifest
 ├── collection_plan.csv         # initial collection plan
 ├── inventory/                  # previous inventory deliverables
+├── reports/
+│   ├── repository-bootstrap-report.md
+│   └── task-012-metadata-pilot-report.md
 ├── notebooks/
 │   └── 00_inventory_exploration.ipynb
 ├── docs/
@@ -75,29 +81,37 @@ Run the offline unit tests:
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q collect.py knowledge_store.py tests
+python -m compileall -q collect.py knowledge_store.py src tests
 ```
 
 ## 3. Before enabling network collection
 
 First read `docs/DATA_AND_REUSE_POLICY.md` and `docs/JUPYTER_LAB_INTEGRATION.md`.
 
-Configure a real project contact in your user-agent and check policies from your own network:
+Configure a real project contact in your user-agent and audit policies across the five canonical source adapters (`SRC-HINTON`, `SRC-BENGIO`, `SRC-3B1B`, `SRC-ARXIV`, `SRC-WIKIPEDIA`):
+
+```bash
+python collect.py \
+  --policy-audit \
+  --user-agent "AIResearchLearningExplorer/0.1 (+https://github.com/maha-ai-developer/ai-research-learning; metadata-only-pilot)"
+```
+
+Review the recorded `robots.txt` and API policy evidence in `site_policies`, `crawl_audit`, and `provenance_events`. Any source whose policy cannot be verified or disallows target routes fails closed automatically. To run the bounded metadata-only pilot (`<= 2` items per source, `<= 10` items total):
+
+```bash
+python collect.py \
+  --metadata-pilot \
+  --pilot-max-per-source 2 \
+  --pilot-max-total 10 \
+  --user-agent "AIResearchLearningExplorer/0.1 (+https://github.com/maha-ai-developer/ai-research-learning; metadata-only-pilot)"
+```
+
+You can also run the legacy HTML-only policy check or batch:
 
 ```bash
 python collect.py \
   --fetch \
   --policy-only \
-  --user-agent "AIResearchLearningBot/0.1 (https://your-domain.example/contact)"
-```
-
-Review the recorded `robots.txt` evidence and sitemap endpoint checks. If a policy cannot be verified, the collector should fail closed. Then, only after reviewing the policy results and reuse permissions, run a small batch:
-
-```bash
-python collect.py \
-  --fetch \
-  --limit 10 \
-  --per-source-limit 5 \
   --user-agent "AIResearchLearningBot/0.1 (https://your-domain.example/contact)"
 ```
 

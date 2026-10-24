@@ -31,6 +31,19 @@ from knowledge_store import (
     import_seed_manifest,
 )
 
+_SRC_DIR = Path(__file__).resolve().parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from ai_research_learning.sources import (  # noqa: E402
+    DEFAULT_PROJECT_USER_AGENT,
+    MAX_PILOT_PER_SOURCE,
+    MAX_PILOT_TOTAL,
+    PilotCoordinator,
+    format_pilot_run_summary,
+    format_policy_audit_summary,
+)
+
 DEFAULT_USER_AGENT = "AIResearchLearningMetadataBot/0.1 (metadata-only; configure a contact URL before production)"
 DEFAULT_DELAY_SECONDS = 1.0
 DEFAULT_TIMEOUT_SECONDS = 15
@@ -711,13 +724,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--policy-only", action="store_true", help="Check robots.txt and sitemap endpoint availability, then exit")
     parser.add_argument("--init-db", action="store_true", help="Initialize or migrate the local SQLite database offline and exit")
     parser.add_argument("--import-manifest", action="store_true", help="Import seed_urls.json into the local SQLite database offline and exit")
+    parser.add_argument("--policy-audit", action="store_true", help="Audit source policies (robots.txt and API policies) across the 5 source adapters and persist results")
+    parser.add_argument("--metadata-pilot", action="store_true", help="Run the bounded, policy-gated metadata pilot (<=2 per source, <=10 total) across the 5 source adapters")
+    parser.add_argument("--pilot-max-per-source", type=int, default=MAX_PILOT_PER_SOURCE, help="Max items per source in --metadata-pilot (1..2, default: 2)")
+    parser.add_argument("--pilot-max-total", type=int, default=MAX_PILOT_TOTAL, help="Max total items in --metadata-pilot (1..10, default: 10)")
     parser.add_argument("--discoveries-csv", type=Path, default=None, help="Path for the discovered-link review CSV")
     args = parser.parse_args(argv)
 
     if args.init_db:
         with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
             print(f"Initialized local knowledge store at {args.db} (schema version {store.get_schema_version()}).")
-        if not args.import_manifest and not args.fetch:
+        if not args.import_manifest and not args.fetch and not args.policy_audit and not args.metadata_pilot:
             return 0
 
     if args.import_manifest:
@@ -726,8 +743,36 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         summary = import_seed_manifest(db_path=args.db, manifest_path=args.manifest)
         print(format_import_summary(summary))
-        if not args.fetch:
+        if not args.fetch and not args.policy_audit and not args.metadata_pilot:
             return 0 if summary.rejected_count == 0 else 1
+
+    if args.policy_audit or args.metadata_pilot:
+        effective_ua = (
+            DEFAULT_PROJECT_USER_AGENT
+            if args.user_agent == DEFAULT_USER_AGENT
+            else args.user_agent
+        )
+        with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
+            coordinator = PilotCoordinator(store, user_agent=effective_ua)
+            if args.policy_audit and not args.metadata_pilot:
+                audit_summary = coordinator.run_policy_audit(force_refresh=True)
+                print(format_policy_audit_summary(audit_summary))
+                return 0 if audit_summary.blocked_or_unverified_count == 0 else 1
+            if args.metadata_pilot:
+                try:
+                    pilot_summary = coordinator.run_metadata_pilot(
+                        manifest_path=args.manifest,
+                        max_per_source=args.pilot_max_per_source,
+                        max_total=args.pilot_max_total,
+                    )
+                except ValueError as exc:
+                    print(f"ERROR: {exc}", file=sys.stderr)
+                    return 2
+                print(format_pilot_run_summary(pilot_summary))
+                if args.discoveries_csv is not None:
+                    count = export_discoveries(args.db, args.discoveries_csv)
+                    print(f"Exported {count} discovered link rows to {args.discoveries_csv}")
+                return 0 if pilot_summary.error_count == 0 else 1
 
     if not args.manifest.exists():
         print(f"ERROR: manifest not found: {args.manifest}", file=sys.stderr)

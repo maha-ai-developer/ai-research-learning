@@ -2,8 +2,9 @@
 
 **Document ID:** `ARCH-ADAPTER-003`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-22  
-**Baseline Implementation Reference:** `collect.py` (`ConservativeCollector`)
+**Last Updated:** 2026-10-24  
+**Baseline Implementation Reference:** `collect.py` (`ConservativeCollector`), `src/ai_research_learning/sources/`  
+**Related Decisions:** [ADR-0005 (`0005-arxiv-api-access-policy.md`)](decisions/0005-arxiv-api-access-policy.md)
 
 ---
 
@@ -147,7 +148,7 @@ class SourceAdapter(Protocol):
 | **Approved Path / Route Prefix** | `/~hinton` (and `/~hinton/*`) | `/en` (and `/en/*`) | `/`, `/lessons/*`, `/topics/*` | `/api/query` | `/w/rest.php/v1/page/*`, `/w/api.php` |
 | **Seed ID Prefix** | `HI-URL-NNN` | `YB-URL-NNN` | `3B1B-URL-NNN` | `ARXIV-REC-NNN` | `WIKI-REC-NNN` |
 | **Access Protocol** | Conservative HTML GET (`collect.py`) | Conservative HTML GET (`collect.py`) | Conservative HTML GET / Public Lesson Metadata | Atom 1.0 over HTTP GET | MediaWiki REST v1 / Action API JSON |
-| **Minimum Request Interval** | `max(1.0s, robots Crawl-delay)` (`1.0s` observed) | `max(1.0s, robots Crawl-delay)` | `max(1.5s, robots Crawl-delay)` | **>= 3.0s** between requests (`1` connection max) | `<= 5 req/s` (well below Wikimedia `200 req/s` ceiling) |
+| **Minimum Request Interval** | `max(1.0s, robots Crawl-delay)` (`1.0s` observed) | `max(1.0s, robots Crawl-delay)` | `max(1.5s, robots Crawl-delay)` | **>= 3.0s** between requests; **only 1 connection at a time globally across all project machines** | `<= 5 req/s` (well below Wikimedia `200 req/s` ceiling) |
 | **Max Batch Size per Run** | `15` HTML pages | `15` HTML pages | `15` HTML pages | `50` records per query (`max_results<=50`) | `25` pages per run |
 | **Default Storage Scope** | `METADATA_ONLY` | `METADATA_ONLY` | `METADATA_ONLY` (links + lesson metadata) | `METADATA_AND_ABSTRACT` (full text only if license == CC BY / CC0) | `METADATA_AND_PERMITTED_TEXT` (CC BY-SA 4.0) |
 | **Binary / PDF Download?** | **Prohibited** in adapter (record `.pdf`/`.pptx` URLs only) | **Prohibited** in adapter | **Prohibited** (no video/graphic binary download) | Disabled by default; PDF link recorded (`https://arxiv.org/pdf/{id}`) | Diagrams linked via Wikimedia Commons metadata |
@@ -190,9 +191,16 @@ class SourceAdapter(Protocol):
 ### 4.4 `SRC-ARXIV` — arXiv Official API
 
 - **Endpoint & Query Construction:** Uses `https://export.arxiv.org/api/query?id_list=...` or bounded `search_query=au:Hinton_G+OR+au:Bengio_Y` with `start` and `max_results <= 50`.
-- **Rate Limits (Official arXiv API Terms of Use, checked 2026-10-21):**
-  - Single concurrent connection (`max_concurrency = 1`).
-  - Mandatory **minimum 3.0-second sleep** between consecutive HTTP requests.
+- **Distinction from General HTML Crawling (`robots.txt` vs. API Terms of Use):**
+  - General HTML crawling on `export.arxiv.org` and `arxiv.org` (`robots.txt` returns `User-agent: * / Disallow: /` on `export.arxiv.org`) remains **strictly blocked** under the fail-closed `robots.txt` policy (`RFC 9309`).
+  - As documented in [ADR-0005 (`0005-arxiv-api-access-policy.md`)](decisions/0005-arxiv-api-access-policy.md), the explicit API-specific policy profile (`ARXIV_OFFICIAL_API_TOU`) applies **exclusively** to `https://export.arxiv.org/api/query`. HTML pages (`/abs/*`, `/html/*`), PDFs (`/pdf/*`), e-print source tarballs (`/e-print/*`), and any other paths on `export.arxiv.org` or `arxiv.org` are rejected before any network call.
+- **Global Rate-Limit Boundary ([Official arXiv API Terms of Use](https://info.arxiv.org/help/api/tou.html)):**
+  - **Minimum Request Interval:** At least **three seconds (`>= 3.0s`)** between consecutive HTTP requests.
+  - **Single Active Connection:** Only **one connection (`max_concurrency = 1`)** making API requests at a time.
+  - **Cross-Machine Scope:** These rate and concurrency limits apply **globally across all machines controlled by the project**, not merely within a single Python object or OS process.
+- **Supported Runtime Execution Boundary:**
+  - **Current Local Implementation (`LOCAL_SINGLE_WORKER_SERIALIZED`):** All `SRC-ARXIV` API requests must execute sequentially through one controlled adapter execution path. A process-wide re-entrant mutex and shared clock schedule inside `src/ai_research_learning/sources/arxiv_adapter.py` serialize any concurrent in-process calls (across threads or multiple `ArxivSourceAdapter` instances) so that at most one HTTP connection is in flight at a time and consecutive requests remain separated by `>= 3.0s`. Parallel arXiv requests and multiple independently scheduled arXiv workers are prohibited. Deploying multiple independent adapter instances across OS processes or machines is **strictly prohibited** until coordinated cross-machine rate limiting is implemented.
+  - **Future Distributed Deployment Requirement:** Before `SRC-ARXIV` is enabled in any cloud or multi-worker environment, the deployment must enforce either: (a) **one dedicated serialized API worker** (`max_instances = 1`, `concurrency = 1`, non-overlapping scheduler triggers), or (b) a **shared global rate-limit coordinator** (single-lease distributed mutex + shared next-allowed-timestamp state) enforcing one `>= 3.0s`, single-connection schedule across all project-controlled workers.
 - **Licensing & Reuse Boundary:**
   - Bibliographic metadata (title, authors, categories, DOI, publication date, version history) and **abstracts** are provided via the arXiv API and may be indexed and embedded (`METADATA_AND_ABSTRACT`).
   - Every entry's `<link title="license" href="..."/>` or arXiv license URI (`arxiv.org/licenses/nonexclusive-distrib/1.0/`, `creativecommons.org/licenses/by/4.0/`, `creativecommons.org/publicdomain/zero/1.0/`) is inspected. Full paper text extraction is **disabled by default** and only permitted in later milestones for papers bearing an explicit Creative Commons (`CC-BY-*` or `CC0`) license URI.
@@ -244,10 +252,14 @@ flowchart LR
 
 ### 5.2 Rate Limiting & Retry / Circuit-Breaker Policy
 
-1. **Per-Origin Token Bucket:** Enforced in-process by `ingestion-worker` (which runs with `parallelism = 1` per source origin) so concurrent containers can never multiply request rates against a researcher's server.
-2. **HTTP Error Handling:**
-   - `429 Too Many Requests` or `503 Service Unavailable`: Immediately pause the source adapter, honor the `Retry-After` header (minimum 60s backoff, exponential up to 15 minutes, max 2 retries), and abort the remaining batch for that source if a second `429`/`503` occurs.
-   - `401` / `403` / `451`: Immediately mark the URL `blocked-by-policy-or-scope`, do **not** retry, and log a high-priority provenance alert.
+1. **Per-Origin Single-Connection Slot & Process-Wide arXiv Serialization:**
+   - Each adapter acquires an exclusive per-origin connection slot (`max_concurrency = 1` per origin) across the entire HTTP request and body read lifecycle.
+   - For `SRC-ARXIV`, the runtime additionally enforces a process-wide mutex and shared `>= 3.0s` inter-request schedule across all in-process `ArxivSourceAdapter` instances, and prohibits running multiple uncoordinated processes or machines against `export.arxiv.org` without a dedicated single-instance worker (`max_instances = 1`, `concurrency = 1`) or a shared global rate-limit coordinator.
+2. **HTTP Error Handling & No-Retry-Storm Circuit Breaker:**
+   - `429 Too Many Requests` or `503 Service Unavailable`:
+     - For `SRC-ARXIV`, any `429` or `503` response **immediately fails closed without automatic retry** and latches the adapter's circuit breaker (`_halted_error`) so subsequent candidate items in the run fail fast with zero additional HTTP calls, preventing retry storms against `export.arxiv.org`.
+     - For other sources where bounded retry is configured in future workers, pause the source adapter, honor `Retry-After` (minimum 60s backoff), and abort the remaining batch if a second `429`/`503` occurs. In the current local adapter implementation, all sources fail closed on `429`/`503` without retry loops.
+   - `401` / `403` / `451`: Immediately mark the URL `blocked-by-policy-or-scope`, do **not** retry, latch the circuit breaker on `SRC-ARXIV` so subsequent calls do not hit the origin, and log a high-priority provenance alert.
    - `404` / `410`: Mark existing resource `SOURCE_URL_UNAVAILABLE`, preserve historical metadata record for citation integrity, and do not delete prior provenance logs.
    - Redirects (`301`, `302`, `303`, `307`, `308`): Maximum `3` hops (`MAX_REDIRECTS = 3`). Every hop is re-validated against `is_approved_site_url()` and `robots.txt` before following. Cross-host redirects from first-party HTML crawlers are **never** followed automatically.
 

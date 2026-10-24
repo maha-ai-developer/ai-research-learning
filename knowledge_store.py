@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SEED_PATH = ROOT / "seed_urls.json"
 DEFAULT_DB_PATH = ROOT / "data" / "runtime" / "inventory.sqlite"
 
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -96,6 +96,16 @@ def compute_resource_id(source_id: str, canonical_url: str) -> str:
         raise ValueError("source_id must be a non-empty string")
     digest = sha256_hex(f"{source_id.strip()}:{canonical_url.strip()}")[:16]
     return f"res_{digest}"
+
+
+def compute_candidate_link_id(referring_resource_id: str, normalized_url: str) -> str:
+    """Compute deterministic discovered link candidate ID: `cand_<sha256_16>`."""
+    if not referring_resource_id or not isinstance(referring_resource_id, str):
+        raise ValueError("referring_resource_id must be a non-empty string")
+    if not normalized_url or not isinstance(normalized_url, str):
+        raise ValueError("normalized_url must be a non-empty string")
+    digest = sha256_hex(f"{referring_resource_id.strip()}:{normalized_url.strip()}")[:16]
+    return f"cand_{digest}"
 
 
 def compute_version_id(
@@ -801,10 +811,123 @@ def _migration_3_seed_sources_and_backfill(conn: sqlite3.Connection) -> None:
         )
 
 
+DISCOVERED_LINK_CANDIDATES_V4_SQL = """
+CREATE TABLE IF NOT EXISTS discovered_link_candidates (
+    candidate_id            TEXT PRIMARY KEY,
+    referring_resource_id   TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+    referring_source_id     TEXT NOT NULL REFERENCES sources(source_id) ON DELETE RESTRICT,
+    from_manifest_id        TEXT,
+    from_url                TEXT NOT NULL,
+    raw_href                TEXT NOT NULL,
+    original_url            TEXT NOT NULL,
+    normalized_url          TEXT NOT NULL,
+    host_domain             TEXT NOT NULL,
+    is_internal             INTEGER NOT NULL DEFAULT 0 CHECK (is_internal IN (0, 1)),
+    domain_classification   TEXT NOT NULL CHECK (domain_classification IN ('INTERNAL', 'EXTERNAL')),
+    target_scope            TEXT NOT NULL,
+    recommended_decision    TEXT NOT NULL,
+    policy_state            TEXT NOT NULL DEFAULT 'UNVERIFIED_EXTERNAL_CANDIDATE',
+    review_status           TEXT NOT NULL DEFAULT 'PENDING_REVIEW'
+                                CHECK (review_status IN ('PENDING_REVIEW', 'APPROVED_FOR_MANIFEST', 'REJECTED', 'DEFERRED')),
+    fetch_permission_granted INTEGER NOT NULL DEFAULT 0 CHECK (fetch_permission_granted IN (0, 1)),
+    promoted_resource_id    TEXT REFERENCES resources(resource_id) ON DELETE SET NULL,
+    link_text               TEXT,
+    rel                     TEXT,
+    first_seen_at           TEXT NOT NULL,
+    last_seen_at            TEXT NOT NULL,
+    seen_count              INTEGER NOT NULL DEFAULT 1 CHECK (seen_count >= 1),
+    first_run_id            TEXT,
+    last_run_id             TEXT,
+    provenance_event_id     TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL,
+    UNIQUE (referring_resource_id, normalized_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_resource
+    ON discovered_link_candidates(referring_resource_id);
+CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_source
+    ON discovered_link_candidates(referring_source_id);
+CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_url
+    ON discovered_link_candidates(normalized_url);
+CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_host
+    ON discovered_link_candidates(host_domain, domain_classification);
+CREATE INDEX IF NOT EXISTS idx_discovered_link_candidates_review
+    ON discovered_link_candidates(review_status, fetch_permission_granted);
+"""
+
+
+def _migration_4_discovered_link_candidates(conn: sqlite3.Connection) -> None:
+    """Create canonical `discovered_link_candidates` table and backfill existing `discovered_links`."""
+    conn.executescript(DISCOVERED_LINK_CANDIDATES_V4_SQL)
+    store = KnowledgeStore(conn=conn, auto_initialize=False)
+    legacy_links = conn.execute(
+        """
+        SELECT d.from_manifest_id, d.link_url, d.link_text, d.rel,
+               d.target_scope, d.decision, d.discovered_at,
+               r.resource_id, r.source_id, r.canonical_url
+          FROM discovered_links d
+          JOIN resources r ON r.manifest_id = d.from_manifest_id
+         ORDER BY d.discovery_id ASC
+        """
+    ).fetchall()
+    for lrow in legacy_links:
+        from_manifest_id = lrow[0]
+        link_url = lrow[1]
+        link_text = lrow[2]
+        rel = lrow[3]
+        target_scope = lrow[4] or "external-not-fetched"
+        decision = lrow[5] or "skip-external-host"
+        discovered_at = lrow[6] or utc_now()
+        referring_resource_id = lrow[7]
+        referring_source_id = lrow[8]
+        from_url = lrow[9]
+
+        scope_lower = str(target_scope).lower()
+        from_host = (urlsplit(from_url).hostname or "").lower()
+        target_host = (urlsplit(link_url).hostname or "").lower()
+        is_internal = scope_lower.startswith(("in-scope", "same-host", "internal")) or (
+            bool(from_host) and from_host == target_host
+        )
+        if is_internal:
+            if "binary" in scope_lower:
+                policy_state = "SAME_HOST_BINARY_CITATION_NO_FETCH"
+            elif "outside-prefix" in scope_lower:
+                policy_state = "SAME_HOST_OUTSIDE_PREFIX_NO_FETCH"
+            else:
+                policy_state = "IN_SCOPE_HTML_CANDIDATE_NO_AUTO_FETCH"
+        else:
+            policy_state = "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH"
+
+        try:
+            store.upsert_discovered_link_candidate(
+                referring_resource_id=referring_resource_id,
+                referring_source_id=referring_source_id,
+                from_manifest_id=from_manifest_id,
+                from_url=from_url,
+                raw_href=link_url,
+                original_url=link_url,
+                normalized_url=link_url,
+                link_text=link_text,
+                rel=rel,
+                is_internal=is_internal,
+                target_scope=target_scope,
+                recommended_decision=decision,
+                policy_state=policy_state,
+                review_status="PENDING_REVIEW",
+                fetch_permission_granted=False,
+                discovered_at=discovered_at,
+                acquisition_method="SQLITE_MIGRATION_V4_BACKFILL",
+                actor="migration_v4",
+                record_provenance_event=True,
+            )
+        except ValueError:
+            continue
+
+
 MIGRATIONS: tuple[tuple[int, str, str, Any], ...] = (
     (1, "0001_legacy_collector_tables", LEGACY_COLLECTOR_TABLES_SQL, _migration_1_legacy_tables),
     (2, "0002_canonical_knowledge_store_v1", CANONICAL_SCHEMA_V2_SQL, _migration_2_canonical_schema),
     (3, "0003_seed_canonical_sources_and_backfill", "SEED_CANONICAL_SOURCES_V3", _migration_3_seed_sources_and_backfill),
+    (4, "0004_discovered_link_candidates", DISCOVERED_LINK_CANDIDATES_V4_SQL, _migration_4_discovered_link_candidates),
 )
 
 
@@ -1846,6 +1969,278 @@ class KnowledgeStore:
         return [dict(r) for r in rows]
 
     # ------------------------------------------------------------------
+    # Discovered link candidate persistence (review-only, no auto-fetch)
+    # ------------------------------------------------------------------
+
+    def upsert_discovered_link_candidate(
+        self,
+        *,
+        referring_resource_id: str,
+        referring_source_id: str,
+        from_url: str,
+        original_url: str,
+        raw_href: str | None = None,
+        normalized_url: str | None = None,
+        host_domain: str | None = None,
+        is_internal: int | bool = False,
+        target_scope: str = "Out-of-scope external link (not in manifest)",
+        recommended_decision: str = "Record as reference only; do not fetch automatically",
+        policy_state: str | None = None,
+        review_status: str = "PENDING_REVIEW",
+        fetch_permission_granted: int | bool = False,
+        from_manifest_id: str | None = None,
+        link_text: str | None = None,
+        rel: str | None = None,
+        discovered_at: str | None = None,
+        run_id: str | None = None,
+        provenance_event_id: str | None = None,
+        acquisition_method: str = "CANDIDATE_LINK_DISCOVERY",
+        actor: str = "source_adapter",
+        record_provenance_event: bool = True,
+    ) -> dict[str, Any]:
+        """Idempotently persist a discovered link candidate without promoting it to `resources`.
+
+        - Rejects unsafe or non-HTTP(S) URL schemes while preserving `original_url`
+          for audit in `provenance_events` if rejected by caller or raised here.
+        - Enforces `fetch_permission_granted = 0` and `promoted_resource_id = NULL`
+          on candidate discovery.
+        - On repeated discovery of `(referring_resource_id, normalized_url)`, updates
+          `last_seen_at` and increments `seen_count` without creating duplicate rows.
+        """
+        if not referring_resource_id or not isinstance(referring_resource_id, str):
+            raise ValueError("referring_resource_id must be a non-empty string")
+        if not referring_source_id or not isinstance(referring_source_id, str):
+            raise ValueError("referring_source_id must be a non-empty string")
+        if not isinstance(original_url, str) or not original_url.strip():
+            raise ValueError("original_url must be a non-empty string")
+        if bool(fetch_permission_granted):
+            raise ValueError("Discovered link candidates cannot be persisted with fetch_permission_granted=True")
+
+        effective_raw_href = (raw_href if raw_href is not None else original_url).strip()
+        canonical_from_url = validate_and_canonicalize_url(from_url)
+        prov_run_id: str | None = None
+        if run_id is not None:
+            run_row = self.conn.execute(
+                "SELECT run_id FROM collection_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if run_row is not None:
+                prov_run_id = run_id
+
+        try:
+            canonical_target_url = validate_and_canonicalize_url(normalized_url or original_url)
+        except ValueError as exc:
+            if record_provenance_event:
+                self.record_provenance(
+                    event_type="DISCOVERED_LINK_CANDIDATE_REJECTED",
+                    acquisition_method=acquisition_method,
+                    actor=actor,
+                    status="rejected-unsafe-or-invalid-url",
+                    source_id=referring_source_id,
+                    resource_id=referring_resource_id,
+                    run_id=prov_run_id,
+                    manifest_id=from_manifest_id,
+                    source_url=canonical_from_url,
+                    final_url=original_url,
+                    details={
+                        "raw_href": effective_raw_href,
+                        "original_url": original_url,
+                        "rejection_reason": str(exc),
+                        "requested_run_id": run_id,
+                    },
+                    recorded_at=discovered_at or utc_now(),
+                )
+            raise
+        parsed_target = urlsplit(canonical_target_url)
+        resolved_host = (host_domain or parsed_target.hostname or "").lower().strip()
+        if not resolved_host:
+            raise ValueError(f"Unable to determine host_domain for {canonical_target_url!r}")
+
+        internal_flag = 1 if bool(is_internal) else 0
+        domain_classification = "INTERNAL" if internal_flag else "EXTERNAL"
+        resolved_policy_state = policy_state or (
+            "SAME_ORIGIN_CANDIDATE_NOT_AUTO_FETCHED"
+            if internal_flag
+            else "EXTERNAL_DOMAIN_RECORD_ONLY_NO_FETCH"
+        )
+        if review_status not in ("PENDING_REVIEW", "APPROVED_FOR_MANIFEST", "REJECTED", "DEFERRED"):
+            raise ValueError(f"Invalid review_status: {review_status!r}")
+
+        candidate_id = compute_candidate_link_id(referring_resource_id, canonical_target_url)
+        now = discovered_at or utc_now()
+
+        with self.transaction() as conn:
+            res_row = conn.execute(
+                "SELECT resource_id, source_id, manifest_id FROM resources WHERE resource_id = ?",
+                (referring_resource_id,),
+            ).fetchone()
+            if res_row is None:
+                raise ValueError(f"Unknown referring_resource_id: {referring_resource_id!r}")
+
+            effective_manifest_id = from_manifest_id or res_row["manifest_id"]
+
+            existing = conn.execute(
+                "SELECT * FROM discovered_link_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+
+            if existing is None:
+                eff_prov_id = provenance_event_id
+                if eff_prov_id is None and record_provenance_event:
+                    prov = self.record_provenance(
+                        event_type="DISCOVERED_LINK_RECORDED",
+                        acquisition_method=acquisition_method,
+                        actor=actor,
+                        status="candidate-recorded-not-fetched",
+                        source_id=referring_source_id,
+                        resource_id=referring_resource_id,
+                        run_id=prov_run_id,
+                        manifest_id=effective_manifest_id,
+                        source_url=canonical_from_url,
+                        final_url=canonical_target_url,
+                        details={
+                            "candidate_id": candidate_id,
+                            "raw_href": effective_raw_href,
+                            "original_url": original_url,
+                            "normalized_url": canonical_target_url,
+                            "host_domain": resolved_host,
+                            "is_internal": bool(internal_flag),
+                            "domain_classification": domain_classification,
+                            "target_scope": target_scope,
+                            "recommended_decision": recommended_decision,
+                            "policy_state": resolved_policy_state,
+                            "review_status": review_status,
+                            "fetch_permission_granted": False,
+                            "link_text": link_text,
+                            "rel": rel,
+                        },
+                        recorded_at=now,
+                    )
+                    eff_prov_id = prov["event_id"]
+
+                conn.execute(
+                    """
+                    INSERT INTO discovered_link_candidates(
+                        candidate_id, referring_resource_id, referring_source_id,
+                        from_manifest_id, from_url, raw_href, original_url,
+                        normalized_url, host_domain, is_internal, domain_classification,
+                        target_scope, recommended_decision, policy_state, review_status,
+                        fetch_permission_granted, promoted_resource_id, link_text, rel,
+                        first_seen_at, last_seen_at, seen_count,
+                        first_run_id, last_run_id, provenance_event_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        candidate_id,
+                        referring_resource_id,
+                        referring_source_id,
+                        effective_manifest_id,
+                        canonical_from_url,
+                        effective_raw_href,
+                        original_url,
+                        canonical_target_url,
+                        resolved_host,
+                        internal_flag,
+                        domain_classification,
+                        target_scope,
+                        recommended_decision,
+                        resolved_policy_state,
+                        review_status,
+                        link_text,
+                        rel,
+                        now,
+                        now,
+                        run_id,
+                        run_id,
+                        eff_prov_id,
+                    ),
+                )
+                operation = "inserted"
+            else:
+                new_seen_count = int(existing["seen_count"]) + 1
+                conn.execute(
+                    """
+                    UPDATE discovered_link_candidates
+                       SET last_seen_at = ?,
+                           seen_count = ?,
+                           last_run_id = COALESCE(?, last_run_id),
+                           link_text = COALESCE(?, link_text),
+                           rel = COALESCE(?, rel),
+                           provenance_event_id = COALESCE(?, provenance_event_id)
+                     WHERE candidate_id = ?
+                    """,
+                    (
+                        now,
+                        new_seen_count,
+                        run_id,
+                        link_text,
+                        rel,
+                        provenance_event_id,
+                        candidate_id,
+                    ),
+                )
+                operation = "updated"
+
+        stored = self.get_discovered_link_candidate(candidate_id=candidate_id)
+        assert stored is not None
+        stored["operation"] = operation
+        return stored
+
+    def get_discovered_link_candidate(
+        self,
+        *,
+        candidate_id: str | None = None,
+        referring_resource_id: str | None = None,
+        normalized_url: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Retrieve a discovered link candidate by `candidate_id` or `(referring_resource_id, normalized_url)`."""
+        if candidate_id is not None:
+            row = self.conn.execute(
+                "SELECT * FROM discovered_link_candidates WHERE candidate_id = ?",
+                (candidate_id,),
+            ).fetchone()
+        elif referring_resource_id is not None and normalized_url is not None:
+            norm = validate_and_canonicalize_url(normalized_url)
+            row = self.conn.execute(
+                "SELECT * FROM discovered_link_candidates WHERE referring_resource_id = ? AND normalized_url = ?",
+                (referring_resource_id, norm),
+            ).fetchone()
+        else:
+            raise ValueError("Specify candidate_id or both referring_resource_id and normalized_url")
+        return dict(row) if row is not None else None
+
+    def list_discovered_link_candidates(
+        self,
+        *,
+        referring_resource_id: str | None = None,
+        referring_source_id: str | None = None,
+        domain_classification: str | None = None,
+        review_status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List persisted discovered link candidates with optional filtering."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if referring_resource_id is not None:
+            clauses.append("referring_resource_id = ?")
+            params.append(referring_resource_id)
+        if referring_source_id is not None:
+            clauses.append("referring_source_id = ?")
+            params.append(referring_source_id)
+        if domain_classification is not None:
+            clauses.append("domain_classification = ?")
+            params.append(domain_classification)
+        if review_status is not None:
+            clauses.append("review_status = ?")
+            params.append(review_status)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM discovered_link_candidates {where_sql} ORDER BY first_seen_at ASC, candidate_id ASC",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
     # Explicit seed manifest import operation (offline / no network)
     # ------------------------------------------------------------------
 
@@ -2217,6 +2612,7 @@ def main(argv: list[str] | None = None) -> int:
                     "source_urls",
                     "resources",
                     "resource_versions",
+                    "discovered_link_candidates",
                     "provenance_events",
                     "collection_runs",
                     "documents",
