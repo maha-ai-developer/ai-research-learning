@@ -6,8 +6,11 @@ Date: 2026-10-20
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q collect.py tests
+python -m compileall -q collect.py knowledge_store.py tests
 python collect.py
+python knowledge_store.py init
+python knowledge_store.py import-manifest
+python knowledge_store.py status
 ```
 
 The default collector invocation is offline. The manifest contains 52 records, currently including first-party, policy/control, and external reference URLs. The initial balanced dry-run selection is limited to 10 HTML URLs (up to five per researcher).

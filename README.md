@@ -18,6 +18,7 @@ An AI-engineering project for building a source-grounded learning environment fr
 ```text
 ai-research-learning/
 ├── collect.py                  # metadata-only collector; dry-run by default
+├── knowledge_store.py          # local SQLite persistence store, migrations, and manifest importer
 ├── seed_urls.json              # 52-record source manifest
 ├── collection_plan.csv         # initial collection plan
 ├── inventory/                  # previous inventory deliverables
@@ -55,11 +56,26 @@ python collect.py
 
 This is a **dry run** and sends no web requests. It should show the selected URLs and skipped/excluded records. The collector creates its local database only when running.
 
+Initialize the local SQLite knowledge store (`data/runtime/inventory.sqlite`), import the 52-record `seed_urls.json` manifest offline, and inspect store status:
+
+```bash
+python knowledge_store.py init
+python knowledge_store.py import-manifest
+python knowledge_store.py status
+```
+
+You can also run initialization or manifest import via `collect.py`:
+
+```bash
+python collect.py --init-db
+python collect.py --import-manifest
+```
+
 Run the offline unit tests:
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q collect.py tests
+python -m compileall -q collect.py knowledge_store.py tests
 ```
 
 ## 3. Before enabling network collection
