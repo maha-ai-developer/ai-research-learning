@@ -696,7 +696,7 @@ class TranscriptIngestionRepositoryProtocol(Protocol):
     ) -> None: ...
 ```
 
-### 8.2 SQLite Migrations `6` and `7` (`0006_transcripts_and_segments` and `0007_transcript_authorization_attestations`)
+### 8.2 SQLite Migrations `6`, `7`, and `8` (`0006_transcripts_and_segments`, `0007_transcript_authorization_attestations`, and `0008_harden_transcript_authorization_triggers`)
 
 Implemented in [`../../knowledge_store.py`](../../knowledge_store.py):
 
@@ -714,11 +714,18 @@ Implemented in [`../../knowledge_store.py`](../../knowledge_store.py):
        3. `permits_ai_synthesis`: Permission to generate transformative study notes or summaries (`record_transcript_synthesis` / `transcript_syntheses`).
        4. `permits_redistribution`: Permission to export or redistribute full transcript text (`export_transcript_for_redistribution`). Defaults to `0` and is enforced independently of local storage and verbatim excerpt permissions.
      - **Verification & Lifecycle State:** `verification_status` (`VERIFIED`, `PENDING_REVIEW`, `CONTRADICTORY`, `REJECTED`, `WITHDRAWN`, `EXPIRED`, `UNKNOWN`), `reviewed_by`, `reviewed_at`, optional `expires_at`, and withdrawal audit columns (`withdrawn_at`, `withdrawn_by`, `withdrawal_reason`).
-3. **Database-Level & Policy-Gate Safety Constraints (`CHECK`, Triggers, and `evaluate_transcript_storage_policy`):**
+3. **Forward-Only Migration `8` (`0008_harden_transcript_authorization_triggers`, `version 7 -> 8`):**
+   - Hardens database-level SQLite triggers while keeping Migrations `6` and `7` untouched:
+     - Enforces live `expires_at` (`expires_at IS NULL OR datetime(expires_at) > datetime('now')`), `verification_status = 'VERIFIED'`, `withdrawn_at IS NULL`, `authorization_basis` / `license_spdx` consistency, and full scope alignment (`resource_id`, `transcript_id`, `language_bcp47`, `track_kind`) on `INSERT` and `UPDATE` across `transcripts`, `transcript_versions`, `transcript_segments`, and `transcript_syntheses`.
+     - Prevents un-withdrawing an attestation, broadening/retargeting attestation scope after creation, mutating `transcripts` identity/scope columns, or reactivating `'TOMBSTONED'` versions or `'WITHDRAWN_OR_TOMBSTONED'` transcripts via direct SQL.
+     - Enforces write-side permission checks on `transcript_syntheses` (`permits_ai_synthesis = 1` + active verified attestation) and `provenance_events` (`TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED` `status='allowed'` requires `permits_verbatim_excerpts = 1`; `TRANSCRIPT_REDISTRIBUTION_EXPORTED` `status='exported'` requires `permits_redistribution = 1`).
+     - Adds automatic `AFTER UPDATE` revocation cascade triggers (`trg_transcript_attestations_cascade_revocation_after_update` and `trg_transcripts_cascade_revocation_after_update`) so direct-SQL withdrawal, expiry, un-verification, or permission narrowing on an attestation immediately purges stored `transcript_segments` and `transcript_syntheses` and tombstones affected `transcript_versions` and `transcripts`.
+4. **Database-Level Write Triggers vs. Repository Read-Path Enforcement Boundary:**
    - **Caller-Supplied Flags Are Never Sufficient on Their Own:** Passing `permits_transcript_storage=True` or `--permits-storage` without a `VERIFIED`, non-withdrawn, non-expired attestation matching the resource (and transcript/language/track scope) is rejected (`permits_transcript_storage = False`, `ingestion_state = 'BLOCKED_BY_POLICY'` or `'NEEDS_REVIEW'`), and zero segment text rows are written.
+   - **SQLite Write Enforcement vs. Read-Path Payload Enforcement:** Because SQLite is an embedded file database without `BEFORE SELECT` triggers or row-level read ACLs on stored tables, a caller with raw SQLite read access can `SELECT` from `transcript_segments` whenever `permits_transcript_storage = 1`. Therefore, read-time payload gating for `permits_verbatim_excerpts` and `permits_redistribution` is enforced in the repository read methods (`get_verbatim_transcript_excerpt` and `export_transcript_for_redistribution`), while SQLite triggers enforce all write-side flag escalation, synthesis persistence (`transcript_syntheses`), audit-event integrity (`provenance_events`), and revocation cascades.
    - **Engineering Control vs. Legal Advice:** Attestation records provide an auditable engineering control and evidence trail for human reviewers; they do not perform automated legal interpretation.
-   - **Cascading Withdrawal:** Withdrawing an attestation via `withdraw_transcript_attestation` marks the attestation `WITHDRAWN`, revokes active scope flags, and cascades `tombstone_transcript_on_takedown` across linked transcripts to purge stored segment and synthesis text while preserving provenance history.
-4. **Deterministic ID Helpers in `knowledge_store.py`:**
+   - **Cascading Withdrawal:** Withdrawing an attestation via `withdraw_transcript_attestation` (or via direct SQL `UPDATE`) marks the attestation `WITHDRAWN`, revokes active scope flags, and cascades tombstone purging across linked transcripts while preserving provenance history.
+5. **Deterministic ID Helpers in `knowledge_store.py`:**
    - `compute_transcript_id(resource_id: str, language_bcp47: str, track_kind: str) -> str` (`tr_<sha256_16>`)
    - `compute_transcript_attestation_id(...) -> str` (`tatt_<sha256_16>`)
    - `compute_transcript_version_id(transcript_id: str, raw_content_sha256: str, version_number: int) -> str` (`tver_<sha256_16>`)

@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SEED_PATH = ROOT / "seed_urls.json"
 DEFAULT_DB_PATH = ROOT / "data" / "runtime" / "inventory.sqlite"
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 TRANSCRIPT_NORMALIZER_VERSION = "norm-v1.0"
 
 VALID_CANDIDATE_REVIEW_STATUSES: tuple[str, ...] = (
@@ -3069,6 +3069,732 @@ def _migration_7_transcript_authorization_attestations(conn: sqlite3.Connection)
     conn.executescript(TRANSCRIPT_AUTHORIZATION_ATTESTATIONS_V7_TRIGGERS_SQL)
 
 
+TRANSCRIPT_AUTHORIZATION_HARDENING_V8_SQL = """
+-- Migration 8: Harden database-level transcript authorization triggers against direct-SQL bypasses
+
+DROP TRIGGER IF EXISTS trg_transcript_attestations_verified_gate_insert;
+CREATE TRIGGER trg_transcript_attestations_verified_gate_insert
+BEFORE INSERT ON transcript_authorization_attestations
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.expires_at IS NOT NULL AND datetime(NEW.expires_at) IS NULL
+        THEN RAISE(ABORT, 'transcript_authorization_attestations.expires_at must be a valid ISO-8601 datetime')
+        WHEN NEW.permits_transcript_storage = 1 AND (
+            NEW.verification_status != 'VERIFIED'
+            OR NEW.permits_metadata_indexing = 0
+            OR NEW.license_status != 'VERIFIED_PERMISSIVE'
+            OR NEW.authorization_basis NOT IN (
+                'OPEN_LICENSE_VERIFIED',
+                'PUBLIC_DOMAIN_VERIFIED',
+                'FIRST_PARTY_OWNED',
+                'FIRST_PARTY_OWNED_MEDIA',
+                'WRITTEN_PERMISSION',
+                'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+            )
+            OR NEW.withdrawn_at IS NOT NULL
+            OR (NEW.expires_at IS NOT NULL AND datetime(NEW.expires_at) <= datetime('now'))
+        )
+        THEN RAISE(ABORT, 'Policy violation: attestation granting permits_transcript_storage=1 requires verification_status=VERIFIED, permits_metadata_indexing=1, VERIFIED_PERMISSIVE license, authorized basis, non-withdrawn status, and non-expired expires_at')
+        WHEN NEW.permits_transcript_storage = 0
+             AND (NEW.permits_verbatim_excerpts = 1 OR NEW.permits_redistribution = 1)
+        THEN RAISE(ABORT, 'Policy violation: attestation cannot grant verbatim excerpts or redistribution when permits_transcript_storage is 0')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND (
+                 NEW.withdrawn_at IS NOT NULL
+                 OR (NEW.expires_at IS NOT NULL AND datetime(NEW.expires_at) <= datetime('now'))
+             )
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation cannot be withdrawn or already expired')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND NEW.authorization_basis IN ('OPEN_LICENSE_VERIFIED', 'PUBLIC_DOMAIN_VERIFIED')
+             AND NEW.license_status IN ('ALL_RIGHTS_RESERVED', 'RESTRICTED_PROPRIETARY')
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation has contradictory authorization_basis and license_status')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND NEW.permits_transcript_storage = 1
+             AND NEW.authorization_basis = 'OPEN_LICENSE_VERIFIED'
+             AND (NEW.license_spdx IS NULL OR length(trim(NEW.license_spdx)) = 0)
+        THEN RAISE(ABORT, 'Policy violation: OPEN_LICENSE_VERIFIED attestation requires non-empty license_spdx')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND NEW.permits_transcript_storage = 1
+             AND NEW.authorization_basis IN ('WRITTEN_PERMISSION', 'WRITTEN_RIGHTS_HOLDER_PERMISSION')
+             AND (
+                 NEW.evidence_type NOT IN ('WRITTEN_PERMISSION_RECORD', 'WRITTEN_PERMISSION_REF')
+                 OR (NEW.evidence_url IS NULL AND NEW.evidence_sha256 IS NULL)
+             )
+        THEN RAISE(ABORT, 'Policy violation: WRITTEN_PERMISSION attestation requires WRITTEN_PERMISSION_RECORD/REF and evidence_sha256 or evidence_url')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_attestations_verified_gate_update;
+CREATE TRIGGER trg_transcript_attestations_verified_gate_update
+BEFORE UPDATE ON transcript_authorization_attestations
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.attestation_id != OLD.attestation_id OR NEW.resource_id != OLD.resource_id
+        THEN RAISE(ABORT, 'transcript_authorization_attestations identity and resource_id are immutable')
+        WHEN OLD.transcript_id IS NOT NULL AND (NEW.transcript_id IS NULL OR NEW.transcript_id != OLD.transcript_id)
+        THEN RAISE(ABORT, 'transcript_authorization_attestations.transcript_id scope cannot be broadened or retargeted')
+        WHEN OLD.language_bcp47 IS NOT NULL AND (NEW.language_bcp47 IS NULL OR NEW.language_bcp47 != OLD.language_bcp47)
+        THEN RAISE(ABORT, 'transcript_authorization_attestations.language_bcp47 scope cannot be broadened or retargeted')
+        WHEN OLD.track_kind IS NOT NULL AND (NEW.track_kind IS NULL OR NEW.track_kind != OLD.track_kind)
+        THEN RAISE(ABORT, 'transcript_authorization_attestations.track_kind scope cannot be broadened or retargeted')
+        WHEN (OLD.withdrawn_at IS NOT NULL OR OLD.verification_status = 'WITHDRAWN')
+             AND (NEW.withdrawn_at IS NULL OR NEW.verification_status != 'WITHDRAWN' OR NEW.permits_transcript_storage = 1)
+        THEN RAISE(ABORT, 'withdrawn transcript_authorization_attestations rows cannot be reactivated; record a new attestation instead')
+        WHEN NEW.expires_at IS NOT NULL AND datetime(NEW.expires_at) IS NULL
+        THEN RAISE(ABORT, 'transcript_authorization_attestations.expires_at must be a valid ISO-8601 datetime')
+        WHEN NEW.permits_transcript_storage = 1 AND (
+            NEW.verification_status != 'VERIFIED'
+            OR NEW.permits_metadata_indexing = 0
+            OR NEW.license_status != 'VERIFIED_PERMISSIVE'
+            OR NEW.authorization_basis NOT IN (
+                'OPEN_LICENSE_VERIFIED',
+                'PUBLIC_DOMAIN_VERIFIED',
+                'FIRST_PARTY_OWNED',
+                'FIRST_PARTY_OWNED_MEDIA',
+                'WRITTEN_PERMISSION',
+                'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+            )
+            OR NEW.withdrawn_at IS NOT NULL
+        )
+        THEN RAISE(ABORT, 'Policy violation: attestation granting permits_transcript_storage=1 requires verification_status=VERIFIED, permits_metadata_indexing=1, VERIFIED_PERMISSIVE license, authorized basis, and non-withdrawn status')
+        WHEN NEW.permits_transcript_storage = 0
+             AND (NEW.permits_verbatim_excerpts = 1 OR NEW.permits_redistribution = 1)
+        THEN RAISE(ABORT, 'Policy violation: attestation cannot grant verbatim excerpts or redistribution when permits_transcript_storage is 0')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND NEW.withdrawn_at IS NOT NULL
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation cannot have non-null withdrawn_at')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND NEW.authorization_basis IN ('OPEN_LICENSE_VERIFIED', 'PUBLIC_DOMAIN_VERIFIED')
+             AND NEW.license_status IN ('ALL_RIGHTS_RESERVED', 'RESTRICTED_PROPRIETARY')
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation has contradictory authorization_basis and license_status')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND NEW.permits_transcript_storage = 1
+             AND NEW.authorization_basis = 'OPEN_LICENSE_VERIFIED'
+             AND (NEW.license_spdx IS NULL OR length(trim(NEW.license_spdx)) = 0)
+        THEN RAISE(ABORT, 'Policy violation: OPEN_LICENSE_VERIFIED attestation requires non-empty license_spdx')
+        WHEN NEW.verification_status = 'VERIFIED'
+             AND NEW.permits_transcript_storage = 1
+             AND NEW.authorization_basis IN ('WRITTEN_PERMISSION', 'WRITTEN_RIGHTS_HOLDER_PERMISSION')
+             AND (
+                 NEW.evidence_type NOT IN ('WRITTEN_PERMISSION_RECORD', 'WRITTEN_PERMISSION_REF')
+                 OR (NEW.evidence_url IS NULL AND NEW.evidence_sha256 IS NULL)
+             )
+        THEN RAISE(ABORT, 'Policy violation: WRITTEN_PERMISSION attestation requires WRITTEN_PERMISSION_RECORD/REF and evidence_sha256 or evidence_url')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_attestations_prevent_delete;
+CREATE TRIGGER trg_transcript_attestations_prevent_delete
+BEFORE DELETE ON transcript_authorization_attestations
+FOR EACH ROW
+BEGIN
+    SELECT RAISE(ABORT, 'transcript_authorization_attestations rows are auditable records and cannot be deleted; withdraw the attestation instead');
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_attestations_cascade_revocation_after_update;
+CREATE TRIGGER trg_transcript_attestations_cascade_revocation_after_update
+AFTER UPDATE ON transcript_authorization_attestations
+FOR EACH ROW
+BEGIN
+    -- Full storage revocation, withdrawal, rejection, contradiction, or expiry cascades takedown
+    DELETE FROM transcript_segments
+     WHERE (
+         NEW.withdrawn_at IS NOT NULL
+         OR NEW.verification_status != 'VERIFIED'
+         OR NEW.permits_transcript_storage = 0
+         OR (NEW.expires_at IS NOT NULL AND (datetime(NEW.expires_at) IS NULL OR datetime(NEW.expires_at) <= datetime('now')))
+     )
+       AND transcript_id IN (
+           SELECT transcript_id FROM transcripts WHERE authorization_attestation_id = NEW.attestation_id
+       );
+
+    DELETE FROM transcript_syntheses
+     WHERE (
+         NEW.withdrawn_at IS NOT NULL
+         OR NEW.verification_status != 'VERIFIED'
+         OR NEW.permits_transcript_storage = 0
+         OR NEW.permits_ai_synthesis = 0
+         OR (NEW.expires_at IS NOT NULL AND (datetime(NEW.expires_at) IS NULL OR datetime(NEW.expires_at) <= datetime('now')))
+     )
+       AND transcript_id IN (
+           SELECT transcript_id FROM transcripts WHERE authorization_attestation_id = NEW.attestation_id
+       );
+
+    UPDATE transcript_versions
+       SET status = 'TOMBSTONED'
+     WHERE (
+         NEW.withdrawn_at IS NOT NULL
+         OR NEW.verification_status != 'VERIFIED'
+         OR NEW.permits_transcript_storage = 0
+         OR (NEW.expires_at IS NOT NULL AND (datetime(NEW.expires_at) IS NULL OR datetime(NEW.expires_at) <= datetime('now')))
+     )
+       AND transcript_id IN (
+           SELECT transcript_id FROM transcripts WHERE authorization_attestation_id = NEW.attestation_id
+       )
+       AND status != 'TOMBSTONED';
+
+    UPDATE transcripts
+       SET permits_transcript_storage = 0,
+           permits_verbatim_excerpts = 0,
+           permits_ai_synthesis = 0,
+           permits_redistribution = 0,
+           ingestion_state = 'WITHDRAWN_OR_TOMBSTONED',
+           transcript_storage_status = 'TOMBSTONED_ON_TAKEDOWN',
+           latest_transcript_version_id = NULL,
+           segment_count = 0,
+           block_or_review_reason = COALESCE(
+               NEW.withdrawal_reason,
+               block_or_review_reason,
+               'Authorization attestation revoked, withdrawn, or expired'
+           )
+     WHERE (
+         NEW.withdrawn_at IS NOT NULL
+         OR NEW.verification_status != 'VERIFIED'
+         OR NEW.permits_transcript_storage = 0
+         OR (NEW.expires_at IS NOT NULL AND (datetime(NEW.expires_at) IS NULL OR datetime(NEW.expires_at) <= datetime('now')))
+     )
+       AND authorization_attestation_id = NEW.attestation_id
+       AND (
+           permits_transcript_storage = 1
+           OR ingestion_state != 'WITHDRAWN_OR_TOMBSTONED'
+           OR transcript_storage_status != 'TOMBSTONED_ON_TAKEDOWN'
+       );
+
+    -- Partial permission narrowing (verbatim excerpts, AI synthesis, redistribution) cascades to linked transcripts
+    UPDATE transcripts
+       SET permits_verbatim_excerpts = CASE WHEN NEW.permits_verbatim_excerpts = 0 THEN 0 ELSE permits_verbatim_excerpts END,
+           permits_ai_synthesis = CASE WHEN NEW.permits_ai_synthesis = 0 THEN 0 ELSE permits_ai_synthesis END,
+           permits_redistribution = CASE WHEN NEW.permits_redistribution = 0 THEN 0 ELSE permits_redistribution END
+     WHERE authorization_attestation_id = NEW.attestation_id
+       AND (
+           (NEW.permits_verbatim_excerpts = 0 AND permits_verbatim_excerpts = 1)
+           OR (NEW.permits_ai_synthesis = 0 AND permits_ai_synthesis = 1)
+           OR (NEW.permits_redistribution = 0 AND permits_redistribution = 1)
+       );
+END;
+
+DROP TRIGGER IF EXISTS trg_transcripts_require_attestation_insert;
+CREATE TRIGGER trg_transcripts_require_attestation_insert
+BEFORE INSERT ON transcripts
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.permits_transcript_storage = 0 AND (
+            NEW.permits_verbatim_excerpts = 1
+            OR NEW.permits_redistribution = 1
+            OR NEW.ingestion_state = 'INGESTED'
+            OR NEW.transcript_storage_status IN ('STORED_TIMED_SEGMENTS', 'STORED_PLAIN_TEXT')
+            OR NEW.segment_count > 0
+            OR NEW.latest_transcript_version_id IS NOT NULL
+        )
+        THEN RAISE(ABORT, 'transcripts with permits_transcript_storage = 0 cannot enable verbatim excerpts, redistribution, INGESTED state, or stored segment metadata')
+        WHEN NEW.authorization_attestation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1
+              FROM transcript_authorization_attestations a
+             WHERE a.attestation_id = NEW.authorization_attestation_id
+               AND a.resource_id = NEW.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = NEW.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = NEW.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = NEW.track_kind)
+        )
+        THEN RAISE(ABORT, 'transcripts.authorization_attestation_id must reference an existing attestation matching resource_id, transcript_id, language_bcp47, and track_kind')
+        WHEN NEW.authorization_attestation_id IS NOT NULL
+             AND NEW.permits_ai_synthesis = 1
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM transcript_authorization_attestations a
+                  WHERE a.attestation_id = NEW.authorization_attestation_id
+                    AND a.verification_status = 'VERIFIED'
+                    AND a.withdrawn_at IS NULL
+                    AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+                    AND a.permits_ai_synthesis = 1
+             )
+        THEN RAISE(ABORT, 'transcripts.permits_ai_synthesis = 1 requires linked attestation to be VERIFIED, non-withdrawn, non-expired, and permit AI synthesis')
+        WHEN NEW.permits_transcript_storage = 1 AND NEW.authorization_attestation_id IS NULL
+        THEN RAISE(ABORT, 'transcripts.permits_transcript_storage = 1 requires a non-null authorization_attestation_id')
+        WHEN NEW.permits_transcript_storage = 1 AND NOT EXISTS (
+            SELECT 1
+              FROM transcript_authorization_attestations a
+             WHERE a.attestation_id = NEW.authorization_attestation_id
+               AND a.resource_id = NEW.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = NEW.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = NEW.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = NEW.track_kind)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+               AND a.permits_transcript_storage = 1
+               AND a.license_status = 'VERIFIED_PERMISSIVE'
+               AND a.authorization_basis IN (
+                   'OPEN_LICENSE_VERIFIED',
+                   'PUBLIC_DOMAIN_VERIFIED',
+                   'FIRST_PARTY_OWNED',
+                   'FIRST_PARTY_OWNED_MEDIA',
+                   'WRITTEN_PERMISSION',
+                   'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+               )
+               AND (
+                   a.authorization_basis = NEW.authorization_basis
+                   OR (a.authorization_basis = 'PUBLIC_DOMAIN_VERIFIED' AND NEW.authorization_basis = 'OPEN_LICENSE_VERIFIED')
+               )
+               AND (a.license_spdx IS NULL OR NEW.license_spdx = a.license_spdx)
+               AND (NEW.permits_verbatim_excerpts = 0 OR a.permits_verbatim_excerpts = 1)
+               AND (NEW.permits_ai_synthesis = 0 OR a.permits_ai_synthesis = 1)
+               AND (NEW.permits_redistribution = 0 OR a.permits_redistribution = 1)
+        )
+        THEN RAISE(ABORT, 'transcripts.permits_transcript_storage = 1 requires a VERIFIED, non-withdrawn, non-expired attestation matching resource_id, language_bcp47, track_kind, and requested permission scope')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcripts_require_attestation_update;
+CREATE TRIGGER trg_transcripts_require_attestation_update
+BEFORE UPDATE ON transcripts
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.transcript_id != OLD.transcript_id
+             OR NEW.resource_id != OLD.resource_id
+             OR NEW.language_bcp47 != OLD.language_bcp47
+             OR NEW.track_kind != OLD.track_kind
+        THEN RAISE(ABORT, 'transcripts identity and scope columns (transcript_id, resource_id, language_bcp47, track_kind) are immutable')
+        WHEN OLD.ingestion_state = 'WITHDRAWN_OR_TOMBSTONED' AND NEW.ingestion_state != 'WITHDRAWN_OR_TOMBSTONED'
+        THEN RAISE(ABORT, 'transcripts in WITHDRAWN_OR_TOMBSTONED state cannot be reactivated')
+        WHEN NEW.permits_transcript_storage = 0 AND (
+            NEW.permits_verbatim_excerpts = 1
+            OR NEW.permits_redistribution = 1
+            OR NEW.ingestion_state = 'INGESTED'
+            OR NEW.transcript_storage_status IN ('STORED_TIMED_SEGMENTS', 'STORED_PLAIN_TEXT')
+            OR NEW.segment_count > 0
+            OR NEW.latest_transcript_version_id IS NOT NULL
+        )
+        THEN RAISE(ABORT, 'transcripts with permits_transcript_storage = 0 cannot enable verbatim excerpts, redistribution, INGESTED state, or stored segment metadata')
+        WHEN NEW.authorization_attestation_id IS NOT NULL AND NOT EXISTS (
+            SELECT 1
+              FROM transcript_authorization_attestations a
+             WHERE a.attestation_id = NEW.authorization_attestation_id
+               AND a.resource_id = NEW.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = NEW.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = NEW.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = NEW.track_kind)
+        )
+        THEN RAISE(ABORT, 'transcripts.authorization_attestation_id must reference an existing attestation matching resource_id, transcript_id, language_bcp47, and track_kind')
+        WHEN NEW.authorization_attestation_id IS NOT NULL
+             AND NEW.permits_ai_synthesis = 1
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM transcript_authorization_attestations a
+                  WHERE a.attestation_id = NEW.authorization_attestation_id
+                    AND a.verification_status = 'VERIFIED'
+                    AND a.withdrawn_at IS NULL
+                    AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+                    AND a.permits_ai_synthesis = 1
+             )
+        THEN RAISE(ABORT, 'transcripts.permits_ai_synthesis = 1 requires linked attestation to be VERIFIED, non-withdrawn, non-expired, and permit AI synthesis')
+        WHEN NEW.permits_transcript_storage = 1 AND NEW.authorization_attestation_id IS NULL
+        THEN RAISE(ABORT, 'transcripts.permits_transcript_storage = 1 requires a non-null authorization_attestation_id')
+        WHEN NEW.permits_transcript_storage = 1 AND NOT EXISTS (
+            SELECT 1
+              FROM transcript_authorization_attestations a
+             WHERE a.attestation_id = NEW.authorization_attestation_id
+               AND a.resource_id = NEW.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = NEW.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = NEW.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = NEW.track_kind)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+               AND a.permits_transcript_storage = 1
+               AND a.license_status = 'VERIFIED_PERMISSIVE'
+               AND a.authorization_basis IN (
+                   'OPEN_LICENSE_VERIFIED',
+                   'PUBLIC_DOMAIN_VERIFIED',
+                   'FIRST_PARTY_OWNED',
+                   'FIRST_PARTY_OWNED_MEDIA',
+                   'WRITTEN_PERMISSION',
+                   'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+               )
+               AND (
+                   a.authorization_basis = NEW.authorization_basis
+                   OR (a.authorization_basis = 'PUBLIC_DOMAIN_VERIFIED' AND NEW.authorization_basis = 'OPEN_LICENSE_VERIFIED')
+               )
+               AND (a.license_spdx IS NULL OR NEW.license_spdx = a.license_spdx)
+               AND (NEW.permits_verbatim_excerpts = 0 OR a.permits_verbatim_excerpts = 1)
+               AND (NEW.permits_ai_synthesis = 0 OR a.permits_ai_synthesis = 1)
+               AND (NEW.permits_redistribution = 0 OR a.permits_redistribution = 1)
+        )
+        THEN RAISE(ABORT, 'transcripts.permits_transcript_storage = 1 requires a VERIFIED, non-withdrawn, non-expired attestation matching resource_id, language_bcp47, track_kind, and requested permission scope')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcripts_cascade_revocation_after_update;
+CREATE TRIGGER trg_transcripts_cascade_revocation_after_update
+AFTER UPDATE ON transcripts
+FOR EACH ROW
+BEGIN
+    DELETE FROM transcript_segments
+     WHERE transcript_id = NEW.transcript_id
+       AND (
+           NEW.permits_transcript_storage = 0
+           OR NEW.ingestion_state IN ('BLOCKED_BY_POLICY', 'METADATA_ONLY_LINKED', 'WITHDRAWN_OR_TOMBSTONED', 'RIGHTS_PENDING', 'DISCOVERED')
+       );
+
+    UPDATE transcript_versions
+       SET status = 'TOMBSTONED'
+     WHERE transcript_id = NEW.transcript_id
+       AND status != 'TOMBSTONED'
+       AND (
+           NEW.permits_transcript_storage = 0
+           OR NEW.ingestion_state IN ('BLOCKED_BY_POLICY', 'METADATA_ONLY_LINKED', 'WITHDRAWN_OR_TOMBSTONED', 'RIGHTS_PENDING', 'DISCOVERED')
+       );
+
+    DELETE FROM transcript_syntheses
+     WHERE transcript_id = NEW.transcript_id
+       AND (
+           NEW.permits_ai_synthesis = 0
+           OR NEW.ingestion_state IN ('BLOCKED_BY_POLICY', 'WITHDRAWN_OR_TOMBSTONED', 'RIGHTS_PENDING', 'DISCOVERED')
+       );
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_versions_require_authorized_parent;
+DROP TRIGGER IF EXISTS trg_transcript_versions_require_verified_attestation_insert;
+CREATE TRIGGER trg_transcript_versions_require_verified_attestation_insert
+BEFORE INSERT ON transcript_versions
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+              JOIN transcript_authorization_attestations a
+                ON a.attestation_id = t.authorization_attestation_id
+             WHERE t.transcript_id = NEW.transcript_id
+               AND t.permits_transcript_storage = 1
+               AND t.license_status = 'VERIFIED_PERMISSIVE'
+               AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW')
+               AND a.resource_id = t.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+               AND a.permits_transcript_storage = 1
+               AND a.license_status = 'VERIFIED_PERMISSIVE'
+               AND a.authorization_basis IN (
+                   'OPEN_LICENSE_VERIFIED',
+                   'PUBLIC_DOMAIN_VERIFIED',
+                   'FIRST_PARTY_OWNED',
+                   'FIRST_PARTY_OWNED_MEDIA',
+                   'WRITTEN_PERMISSION',
+                   'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+               )
+        )
+        THEN RAISE(ABORT, 'transcript_versions insert blocked: parent transcript lacks a VERIFIED, non-withdrawn, non-expired authorization attestation matching resource_id, language_bcp47, and track_kind')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_versions_immutable_update;
+CREATE TRIGGER trg_transcript_versions_immutable_update
+BEFORE UPDATE ON transcript_versions
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.transcript_version_id != OLD.transcript_version_id
+          OR NEW.transcript_id != OLD.transcript_id
+          OR NEW.version_number != OLD.version_number
+          OR NEW.raw_content_sha256 != OLD.raw_content_sha256
+          OR NEW.normalized_text_sha256 != OLD.normalized_text_sha256
+          OR NEW.normalizer_version != OLD.normalizer_version
+          OR NEW.segment_count != OLD.segment_count
+          OR NEW.word_count != OLD.word_count
+          OR NEW.char_count != OLD.char_count
+          OR NEW.created_at != OLD.created_at
+        THEN RAISE(ABORT, 'transcript_versions content and hash metadata are immutable once recorded')
+        WHEN OLD.status = 'TOMBSTONED' AND NEW.status != 'TOMBSTONED'
+        THEN RAISE(ABORT, 'tombstoned transcript_versions rows cannot be reactivated')
+        WHEN NEW.status = 'ACTIVE' AND NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+              JOIN transcript_authorization_attestations a
+                ON a.attestation_id = t.authorization_attestation_id
+             WHERE t.transcript_id = NEW.transcript_id
+               AND t.permits_transcript_storage = 1
+               AND t.license_status = 'VERIFIED_PERMISSIVE'
+               AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW')
+               AND a.resource_id = t.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+               AND a.permits_transcript_storage = 1
+               AND a.license_status = 'VERIFIED_PERMISSIVE'
+               AND a.authorization_basis IN (
+                   'OPEN_LICENSE_VERIFIED',
+                   'PUBLIC_DOMAIN_VERIFIED',
+                   'FIRST_PARTY_OWNED',
+                   'FIRST_PARTY_OWNED_MEDIA',
+                   'WRITTEN_PERMISSION',
+                   'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+               )
+        )
+        THEN RAISE(ABORT, 'transcript_versions cannot remain ACTIVE without a VERIFIED, non-withdrawn, non-expired authorization attestation')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_segments_require_authorized_parent;
+DROP TRIGGER IF EXISTS trg_transcript_segments_require_verified_attestation_insert;
+CREATE TRIGGER trg_transcript_segments_require_verified_attestation_insert
+BEFORE INSERT ON transcript_segments
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+              JOIN transcript_versions v
+                ON v.transcript_version_id = NEW.transcript_version_id
+               AND v.transcript_id = t.transcript_id
+              JOIN transcript_authorization_attestations a
+                ON a.attestation_id = t.authorization_attestation_id
+             WHERE t.transcript_id = NEW.transcript_id
+               AND v.status = 'ACTIVE'
+               AND t.permits_transcript_storage = 1
+               AND t.license_status = 'VERIFIED_PERMISSIVE'
+               AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW')
+               AND a.resource_id = t.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+               AND a.permits_transcript_storage = 1
+               AND a.license_status = 'VERIFIED_PERMISSIVE'
+               AND a.authorization_basis IN (
+                   'OPEN_LICENSE_VERIFIED',
+                   'PUBLIC_DOMAIN_VERIFIED',
+                   'FIRST_PARTY_OWNED',
+                   'FIRST_PARTY_OWNED_MEDIA',
+                   'WRITTEN_PERMISSION',
+                   'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+               )
+        )
+        THEN RAISE(ABORT, 'transcript_segments insert blocked: parent transcript/version lacks an ACTIVE version and a VERIFIED, non-withdrawn, non-expired authorization attestation matching resource_id, language_bcp47, and track_kind')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_segments_require_verified_attestation_update;
+CREATE TRIGGER trg_transcript_segments_require_verified_attestation_update
+BEFORE UPDATE ON transcript_segments
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.segment_id != OLD.segment_id
+          OR NEW.transcript_id != OLD.transcript_id
+          OR NEW.transcript_version_id != OLD.transcript_version_id
+          OR NEW.sequence_index != OLD.sequence_index
+        THEN RAISE(ABORT, 'transcript_segments identity and parent linkage are immutable')
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+              JOIN transcript_versions v
+                ON v.transcript_version_id = NEW.transcript_version_id
+               AND v.transcript_id = t.transcript_id
+              JOIN transcript_authorization_attestations a
+                ON a.attestation_id = t.authorization_attestation_id
+             WHERE t.transcript_id = NEW.transcript_id
+               AND v.status = 'ACTIVE'
+               AND t.permits_transcript_storage = 1
+               AND t.license_status = 'VERIFIED_PERMISSIVE'
+               AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW')
+               AND a.resource_id = t.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+               AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+               AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+               AND a.permits_transcript_storage = 1
+               AND a.license_status = 'VERIFIED_PERMISSIVE'
+               AND a.authorization_basis IN (
+                   'OPEN_LICENSE_VERIFIED',
+                   'PUBLIC_DOMAIN_VERIFIED',
+                   'FIRST_PARTY_OWNED',
+                   'FIRST_PARTY_OWNED_MEDIA',
+                   'WRITTEN_PERMISSION',
+                   'WRITTEN_RIGHTS_HOLDER_PERMISSION'
+               )
+        )
+        THEN RAISE(ABORT, 'transcript_segments update blocked: parent transcript/version lacks an ACTIVE version and a VERIFIED, non-withdrawn, non-expired authorization attestation')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_syntheses_require_permission_insert;
+CREATE TRIGGER trg_transcript_syntheses_require_permission_insert
+BEFORE INSERT ON transcript_syntheses
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+             WHERE t.transcript_id = NEW.transcript_id
+               AND t.permits_ai_synthesis = 1
+               AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW', 'METADATA_ONLY_LINKED')
+               AND (
+                   NEW.transcript_version_id IS NULL
+                   OR EXISTS (
+                       SELECT 1
+                         FROM transcript_versions v
+                        WHERE v.transcript_version_id = NEW.transcript_version_id
+                          AND v.transcript_id = NEW.transcript_id
+                          AND v.status != 'TOMBSTONED'
+                   )
+               )
+               AND (
+                   (t.permits_transcript_storage = 0 AND t.authorization_attestation_id IS NULL AND t.ingestion_state = 'METADATA_ONLY_LINKED')
+                   OR EXISTS (
+                       SELECT 1
+                         FROM transcript_authorization_attestations a
+                        WHERE a.attestation_id = t.authorization_attestation_id
+                          AND a.resource_id = t.resource_id
+                          AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+                          AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+                          AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+                          AND a.verification_status = 'VERIFIED'
+                          AND a.withdrawn_at IS NULL
+                          AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+                          AND a.permits_ai_synthesis = 1
+                   )
+               )
+        )
+        THEN RAISE(ABORT, 'transcript_syntheses insert blocked: parent transcript or linked authorization attestation does not permit AI synthesis or is withdrawn/expired')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_transcript_syntheses_require_permission_update;
+CREATE TRIGGER trg_transcript_syntheses_require_permission_update
+BEFORE UPDATE ON transcript_syntheses
+FOR EACH ROW
+BEGIN
+    SELECT CASE
+        WHEN NEW.synthesis_id != OLD.synthesis_id OR NEW.transcript_id != OLD.transcript_id
+        THEN RAISE(ABORT, 'transcript_syntheses identity and transcript_id are immutable')
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+             WHERE t.transcript_id = NEW.transcript_id
+               AND t.permits_ai_synthesis = 1
+               AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW', 'METADATA_ONLY_LINKED')
+               AND (
+                   (t.permits_transcript_storage = 0 AND t.authorization_attestation_id IS NULL AND t.ingestion_state = 'METADATA_ONLY_LINKED')
+                   OR EXISTS (
+                       SELECT 1
+                         FROM transcript_authorization_attestations a
+                        WHERE a.attestation_id = t.authorization_attestation_id
+                          AND a.resource_id = t.resource_id
+                          AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+                          AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+                          AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+                          AND a.verification_status = 'VERIFIED'
+                          AND a.withdrawn_at IS NULL
+                          AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+                          AND a.permits_ai_synthesis = 1
+                   )
+               )
+        )
+        THEN RAISE(ABORT, 'transcript_syntheses update blocked: parent transcript or linked authorization attestation does not permit AI synthesis or is withdrawn/expired')
+    END;
+END;
+
+DROP TRIGGER IF EXISTS trg_provenance_events_require_transcript_permission_insert;
+CREATE TRIGGER trg_provenance_events_require_transcript_permission_insert
+BEFORE INSERT ON provenance_events
+FOR EACH ROW
+WHEN NEW.event_type IN ('TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED', 'TRANSCRIPT_REDISTRIBUTION_EXPORTED')
+BEGIN
+    SELECT CASE
+        WHEN NEW.event_type = 'TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED'
+             AND NEW.status = 'allowed'
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM transcripts t
+                   JOIN transcript_authorization_attestations a
+                     ON a.attestation_id = t.authorization_attestation_id
+                  WHERE t.transcript_id = json_extract(NEW.details_json, '$.transcript_id')
+                    AND a.attestation_id = json_extract(NEW.details_json, '$.authorization_attestation_id')
+                    AND t.resource_id = NEW.resource_id
+                    AND t.permits_transcript_storage = 1
+                    AND t.permits_verbatim_excerpts = 1
+                    AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW')
+                    AND a.resource_id = t.resource_id
+                    AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+                    AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+                    AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+                    AND a.verification_status = 'VERIFIED'
+                    AND a.withdrawn_at IS NULL
+                    AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+                    AND a.permits_transcript_storage = 1
+                    AND a.permits_verbatim_excerpts = 1
+             )
+        THEN RAISE(ABORT, 'TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED audit record blocked: transcript and attestation do not permit verbatim excerpts')
+        WHEN NEW.event_type = 'TRANSCRIPT_REDISTRIBUTION_EXPORTED'
+             AND NEW.status = 'exported'
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM transcripts t
+                   JOIN transcript_authorization_attestations a
+                     ON a.attestation_id = t.authorization_attestation_id
+                  WHERE t.transcript_id = json_extract(NEW.details_json, '$.transcript_id')
+                    AND a.attestation_id = json_extract(NEW.details_json, '$.authorization_attestation_id')
+                    AND t.resource_id = NEW.resource_id
+                    AND t.permits_transcript_storage = 1
+                    AND t.permits_redistribution = 1
+                    AND t.ingestion_state IN ('READY_FOR_INGESTION', 'INGESTED', 'NEEDS_REVIEW')
+                    AND a.resource_id = t.resource_id
+                    AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+                    AND (a.language_bcp47 IS NULL OR a.language_bcp47 = t.language_bcp47)
+                    AND (a.track_kind IS NULL OR a.track_kind = t.track_kind)
+                    AND a.verification_status = 'VERIFIED'
+                    AND a.withdrawn_at IS NULL
+                    AND (a.expires_at IS NULL OR (datetime(a.expires_at) IS NOT NULL AND datetime(a.expires_at) > datetime('now')))
+                    AND a.permits_transcript_storage = 1
+                    AND a.permits_redistribution = 1
+             )
+        THEN RAISE(ABORT, 'TRANSCRIPT_REDISTRIBUTION_EXPORTED audit record blocked: transcript and attestation do not permit redistribution')
+    END;
+END;
+"""
+
+
+def _migration_8_harden_transcript_authorization_triggers(conn: sqlite3.Connection) -> None:
+    """Apply Migration 8: harden SQLite triggers across attestations, transcripts, versions, segments, syntheses, and provenance."""
+    # Clear any legacy scope-mismatched attestation references on non-stored transcripts prior to trigger installation
+    conn.execute(
+        """
+        UPDATE transcripts
+           SET authorization_attestation_id = NULL,
+               permits_ai_synthesis = 0
+         WHERE authorization_attestation_id IS NOT NULL
+           AND permits_transcript_storage = 0
+           AND NOT EXISTS (
+               SELECT 1
+                 FROM transcript_authorization_attestations a
+                WHERE a.attestation_id = transcripts.authorization_attestation_id
+                  AND a.resource_id = transcripts.resource_id
+                  AND (a.transcript_id IS NULL OR a.transcript_id = transcripts.transcript_id)
+                  AND (a.language_bcp47 IS NULL OR a.language_bcp47 = transcripts.language_bcp47)
+                  AND (a.track_kind IS NULL OR a.track_kind = transcripts.track_kind)
+           )
+        """
+    )
+    conn.executescript(TRANSCRIPT_AUTHORIZATION_HARDENING_V8_SQL)
+
+
 MIGRATIONS: tuple[tuple[int, str, str, Any], ...] = (
     (1, "0001_legacy_collector_tables", LEGACY_COLLECTOR_TABLES_SQL, _migration_1_legacy_tables),
     (2, "0002_canonical_knowledge_store_v1", CANONICAL_SCHEMA_V2_SQL, _migration_2_canonical_schema),
@@ -3077,6 +3803,7 @@ MIGRATIONS: tuple[tuple[int, str, str, Any], ...] = (
     (5, "0005_discovered_link_curation_reviews", DISCOVERED_LINK_CURATION_V5_SQL, _migration_5_discovered_link_curation_reviews),
     (6, "0006_transcripts_and_segments", TRANSCRIPTS_AND_SEGMENTS_V6_SQL, _migration_6_transcripts_and_segments),
     (7, "0007_transcript_authorization_attestations", TRANSCRIPT_AUTHORIZATION_ATTESTATIONS_V7_SQL, _migration_7_transcript_authorization_attestations),
+    (8, "0008_harden_transcript_authorization_triggers", TRANSCRIPT_AUTHORIZATION_HARDENING_V8_SQL, _migration_8_harden_transcript_authorization_triggers),
 )
 
 
@@ -6166,8 +6893,18 @@ class KnowledgeStore:
             else effective_spdx
         )
         fk_attestation_id: str | None = None
-        if policy.authorization_attestation_id and self.get_transcript_attestation(policy.authorization_attestation_id) is not None:
-            fk_attestation_id = policy.authorization_attestation_id
+        if policy.authorization_attestation_id and resolved_attestation is not None:
+            att_res_id = str(resolved_attestation.get("resource_id") or "")
+            att_tr_id = str(resolved_attestation.get("transcript_id") or "")
+            att_lang = str(resolved_attestation.get("language_bcp47") or "").strip().lower()
+            att_kind = str(resolved_attestation.get("track_kind") or "").strip().upper()
+            if (
+                att_res_id == resource_id
+                and (not att_tr_id or att_tr_id == transcript_id)
+                and (not att_lang or validate_bcp47_language_tag(att_lang) == lang)
+                and (not att_kind or att_kind == kind)
+            ):
+                fk_attestation_id = policy.authorization_attestation_id
 
         existing = self.get_transcript(transcript_id)
         if existing is not None and existing["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED":
@@ -6828,7 +7565,15 @@ class KnowledgeStore:
         end_ms: int | None = None,
         actor: str = "excerpt_reader",
     ) -> dict[str, Any] | list[dict[str, Any]]:
-        """Return verbatim transcript segment excerpt(s) only when authorized by both `transcripts` and its attestation."""
+        """Return verbatim transcript segment excerpt(s) only when authorized by both `transcripts` and its attestation.
+
+        Enforcement boundary:
+        - SQLite triggers (`Migration 8`) enforce write-time authorization on `transcripts.permits_verbatim_excerpts`,
+          `transcript_segments` storage, and `TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED` provenance audit records.
+        - Because SQLite does not support `BEFORE SELECT` triggers or row-level read ACLs on stored tables,
+          read-time payload gating for verbatim excerpt retrieval is enforced here in the repository method
+          before returning segment text.
+        """
         seg_row: sqlite3.Row | None = None
         if target_id.startswith(("seg_", "tseg_")):
             seg_row = self.conn.execute(
@@ -6844,7 +7589,10 @@ class KnowledgeStore:
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
-        if tr["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED" or not int(tr["permits_transcript_storage"]):
+        if (
+            tr["ingestion_state"] not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW")
+            or not int(tr["permits_transcript_storage"])
+        ):
             raise TranscriptPolicyViolationError(
                 f"Transcript {transcript_id} does not permit storage or verbatim excerpt retrieval (state={tr['ingestion_state']!r})."
             )
@@ -6866,7 +7614,12 @@ class KnowledgeStore:
             att.get("withdrawn_at")
             or str(att.get("verification_status")) != "VERIFIED"
             or _is_iso_timestamp_expired(att.get("expires_at"))
+            or not int(att.get("permits_transcript_storage", 0))
             or not int(att.get("permits_verbatim_excerpts", 0))
+            or str(att.get("resource_id")) != str(tr["resource_id"])
+            or (att.get("transcript_id") and str(att.get("transcript_id")) != transcript_id)
+            or (att.get("language_bcp47") and str(att.get("language_bcp47")) != str(tr["language_bcp47"]))
+            or (att.get("track_kind") and str(att.get("track_kind")) != str(tr["track_kind"]))
         ):
             raise TranscriptPolicyViolationError(
                 f"Attestation {att_id!r} does not permit verbatim quoting (status={att.get('verification_status')!r}, "
@@ -6927,11 +7680,21 @@ class KnowledgeStore:
         *,
         actor: str = "redistribution_exporter",
     ) -> dict[str, Any]:
-        """Export full transcript metadata and segments for external redistribution ONLY when authorized by attestation scope."""
+        """Export full transcript metadata and segments for external redistribution ONLY when authorized by attestation scope.
+
+        Enforcement boundary:
+        - SQLite triggers (`Migration 8`) enforce write-time authorization on `transcripts.permits_redistribution`,
+          `transcript_segments` storage, and `TRANSCRIPT_REDISTRIBUTION_EXPORTED` provenance audit records.
+        - Because SQLite does not support `BEFORE SELECT` triggers, read-time redistribution export gating is
+          enforced in this repository method before returning transcript segments.
+        """
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
-        if tr["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED" or not int(tr["permits_transcript_storage"]):
+        if (
+            tr["ingestion_state"] not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW")
+            or not int(tr["permits_transcript_storage"])
+        ):
             raise TranscriptPolicyViolationError(
                 f"Transcript {transcript_id} is not stored or has been withdrawn; redistribution is blocked."
             )
@@ -6953,7 +7716,12 @@ class KnowledgeStore:
             att.get("withdrawn_at")
             or str(att.get("verification_status")) != "VERIFIED"
             or _is_iso_timestamp_expired(att.get("expires_at"))
+            or not int(att.get("permits_transcript_storage", 0))
             or not int(att.get("permits_redistribution", 0))
+            or str(att.get("resource_id")) != str(tr["resource_id"])
+            or (att.get("transcript_id") and str(att.get("transcript_id")) != transcript_id)
+            or (att.get("language_bcp47") and str(att.get("language_bcp47")) != str(tr["language_bcp47"]))
+            or (att.get("track_kind") and str(att.get("track_kind")) != str(tr["track_kind"]))
         ):
             raise TranscriptPolicyViolationError(
                 f"Attestation {att_id!r} does not permit redistribution (status={att.get('verification_status')!r}, "
@@ -6998,19 +7766,31 @@ class KnowledgeStore:
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise ValueError(f"Unknown transcript_id: {transcript_id!r}")
-        if not int(tr["permits_ai_synthesis"]) or tr["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED":
+        if (
+            not int(tr["permits_ai_synthesis"])
+            or tr["ingestion_state"] not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW", "METADATA_ONLY_LINKED")
+        ):
             raise TranscriptPolicyViolationError(f"Transcript {transcript_id} does not permit synthesis storage")
         att_id = tr.get("authorization_attestation_id")
+        if int(tr["permits_transcript_storage"]) and not att_id:
+            raise TranscriptPolicyViolationError(
+                f"Transcript {transcript_id} is missing a required authorization_attestation_id for synthesis storage."
+            )
         if att_id:
             att = self.get_transcript_attestation(str(att_id))
-            if att is not None and (
-                att.get("withdrawn_at")
-                or str(att.get("verification_status")) in ("WITHDRAWN", "EXPIRED", "REJECTED", "CONTRADICTORY")
+            if (
+                att is None
+                or att.get("withdrawn_at")
+                or str(att.get("verification_status")) != "VERIFIED"
                 or _is_iso_timestamp_expired(att.get("expires_at"))
                 or not int(att.get("permits_ai_synthesis", 0))
+                or str(att.get("resource_id")) != str(tr["resource_id"])
+                or (att.get("transcript_id") and str(att.get("transcript_id")) != transcript_id)
+                or (att.get("language_bcp47") and str(att.get("language_bcp47")) != str(tr["language_bcp47"]))
+                or (att.get("track_kind") and str(att.get("track_kind")) != str(tr["track_kind"]))
             ):
                 raise TranscriptPolicyViolationError(
-                    f"Linked attestation {att_id!r} for transcript {transcript_id} is withdrawn, expired, or disallows AI synthesis."
+                    f"Linked attestation {att_id!r} for transcript {transcript_id} is missing, withdrawn, expired, scope-mismatched, or disallows AI synthesis."
                 )
         if synthesis_type not in VALID_TRANSCRIPT_SYNTHESIS_TYPES:
             raise ValueError(f"Invalid synthesis_type: {synthesis_type!r}")

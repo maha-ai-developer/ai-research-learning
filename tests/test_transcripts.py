@@ -158,9 +158,9 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
 
             with KnowledgeStore(db_path=db_v5_path, auto_initialize=False) as store:
                 newly_applied = store.initialize()
-                self.assertEqual(newly_applied, [6, 7])
-                self.assertEqual(store.get_schema_version(), 7)
-                self.assertEqual(LATEST_SCHEMA_VERSION, 7)
+                self.assertEqual(newly_applied, [6, 7, 8])
+                self.assertEqual(store.get_schema_version(), 8)
+                self.assertEqual(LATEST_SCHEMA_VERSION, 8)
 
                 sources = store.list_sources(only_complete=True)
                 self.assertEqual(len(sources), 5)
@@ -243,8 +243,8 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
 
             with KnowledgeStore(db_path=db_v6_path, auto_initialize=False) as store6:
                 newly_applied_6 = store6.initialize()
-                self.assertEqual(newly_applied_6, [7])
-                self.assertEqual(store6.get_schema_version(), 7)
+                self.assertEqual(newly_applied_6, [7, 8])
+                self.assertEqual(store6.get_schema_version(), 8)
                 migrated_tr = store6.get_transcript(tr_id)
                 self.assertIsNotNone(migrated_tr["authorization_attestation_id"])
                 backfilled_att = store6.get_transcript_attestation(
@@ -1065,7 +1065,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
             with contextlib.redirect_stdout(status_buf):
                 rc_status = knowledge_store.main(["status", "--db", str(db_path)])
             self.assertEqual(rc_status, 0)
-            self.assertIn("Schema version: 7", status_buf.getvalue())
+            self.assertIn("Schema version: 8", status_buf.getvalue())
             self.assertIn("transcripts", status_buf.getvalue())
             self.assertIn("transcript_authorization_attestations", status_buf.getvalue())
 
@@ -1328,6 +1328,390 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     details["transcript_storage_status"], "STORED_TIMED_SEGMENTS"
                 )
                 self.assertNotIn("backpropagation", imported_events[0]["details_json"])
+
+    def test_13_direct_sql_authorization_bypass_hardening_and_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "direct_sql_hardening.sqlite"
+            with init_db(db_path) as store:
+                res_a = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/sql-hardening-a",
+                    title="SQL Hardening Resource A",
+                )
+                res_b = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/sql-hardening-b",
+                    title="SQL Hardening Resource B",
+                )
+
+                # Create a valid attestation for Resource A (en, PRIMARY, storage=1, verbatim=0, synthesis=1, redist=0)
+                att_a = store.record_transcript_attestation(
+                    resource_id=res_a,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    authorization_basis="WRITTEN_PERMISSION",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx=None,
+                    evidence_type="WRITTEN_PERMISSION_RECORD",
+                    evidence_reference="Signed Permission #SQL-01",
+                    evidence_sha256=sha256_hex("signed-permission-sql-01"),
+                    attribution_text="Resource A Written Permission",
+                    permits_metadata_indexing=True,
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=False,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=False,
+                    reviewed_by="security_auditor",
+                    verification_status="VERIFIED",
+                )
+
+                # Create an expired attestation for Resource A (de, TRANSLATION)
+                att_expired = self._create_open_license_attestation(
+                    store,
+                    res_a,
+                    language_bcp47="de",
+                    track_kind="TRANSLATION",
+                    expires_at="2020-01-01T00:00:00+00:00",
+                )
+
+                # ------------------------------------------------------------------
+                # Question 1: Can direct SQL set permits_transcript_storage = 1
+                # without a valid, matching attestation?
+                # ------------------------------------------------------------------
+                tr_b_id = compute_transcript_id(res_b, "en", "PRIMARY")
+                # 1a. No attestation (NULL)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO transcripts (
+                            transcript_id, resource_id, source_id, media_canonical_url,
+                            language_bcp47, track_kind, origin_type, acquisition_method,
+                            caption_format, speaker_attribution_quality, license_status,
+                            license_spdx, authorization_basis, authorization_attestation_id,
+                            permits_transcript_storage, permits_verbatim_excerpts, permits_ai_synthesis,
+                            permits_redistribution, attribution_text, ingestion_state,
+                            transcript_storage_status, segment_count, created_at, updated_at
+                        ) VALUES (
+                            ?, ?, 'SRC-3B1B', 'https://www.3blue1brown.com/lessons/sql-hardening-b',
+                            'en', 'PRIMARY', 'AUTHOR_PROVIDED', 'OPEN_LICENSED_DIRECT_CAPTION',
+                            'WEBVTT', 'VERIFIED_SINGLE_SPEAKER', 'VERIFIED_PERMISSIVE',
+                            'CC-BY-4.0', 'OPEN_LICENSE_VERIFIED', NULL,
+                            1, 0, 1, 0, 'Bypass attempt', 'INGESTED', 'STORED_TIMED_SEGMENTS',
+                            0, '2026-10-25T00:00:00+00:00', '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (tr_b_id, res_b),
+                    )
+
+                # 1b. Cross-resource attestation (att_a belongs to res_a, used on res_b)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO transcripts (
+                            transcript_id, resource_id, source_id, media_canonical_url,
+                            language_bcp47, track_kind, origin_type, acquisition_method,
+                            caption_format, speaker_attribution_quality, license_status,
+                            license_spdx, authorization_basis, authorization_attestation_id,
+                            permits_transcript_storage, permits_verbatim_excerpts, permits_ai_synthesis,
+                            permits_redistribution, attribution_text, ingestion_state,
+                            transcript_storage_status, segment_count, created_at, updated_at
+                        ) VALUES (
+                            ?, ?, 'SRC-3B1B', 'https://www.3blue1brown.com/lessons/sql-hardening-b',
+                            'en', 'PRIMARY', 'AUTHOR_PROVIDED', 'FIRST_PARTY_CURATED_IMPORT',
+                            'WEBVTT', 'VERIFIED_SINGLE_SPEAKER', 'VERIFIED_PERMISSIVE',
+                            NULL, 'WRITTEN_PERMISSION', ?,
+                            1, 0, 1, 0, 'Cross-resource SQL bypass', 'INGESTED', 'STORED_TIMED_SEGMENTS',
+                            0, '2026-10-25T00:00:00+00:00', '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (tr_b_id, res_b, att_a["attestation_id"]),
+                    )
+
+                # 1c. Language mismatch via direct SQL (att_a is scoped to 'en', used for 'fr' on res_a)
+                tr_a_fr_id = compute_transcript_id(res_a, "fr", "PRIMARY")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO transcripts (
+                            transcript_id, resource_id, source_id, media_canonical_url,
+                            language_bcp47, track_kind, origin_type, acquisition_method,
+                            caption_format, speaker_attribution_quality, license_status,
+                            license_spdx, authorization_basis, authorization_attestation_id,
+                            permits_transcript_storage, permits_verbatim_excerpts, permits_ai_synthesis,
+                            permits_redistribution, attribution_text, ingestion_state,
+                            transcript_storage_status, segment_count, created_at, updated_at
+                        ) VALUES (
+                            ?, ?, 'SRC-3B1B', 'https://www.3blue1brown.com/lessons/sql-hardening-a',
+                            'fr', 'PRIMARY', 'AUTHOR_PROVIDED', 'FIRST_PARTY_CURATED_IMPORT',
+                            'WEBVTT', 'VERIFIED_SINGLE_SPEAKER', 'VERIFIED_PERMISSIVE',
+                            NULL, 'WRITTEN_PERMISSION', ?,
+                            1, 0, 1, 0, 'Lang mismatch SQL bypass', 'INGESTED', 'STORED_TIMED_SEGMENTS',
+                            0, '2026-10-25T00:00:00+00:00', '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (tr_a_fr_id, res_a, att_a["attestation_id"]),
+                    )
+
+                # 1d. Expired attestation via direct SQL (att_expired is expired, used on res_a 'de' 'TRANSLATION')
+                tr_a_de_id = compute_transcript_id(res_a, "de", "TRANSLATION")
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO transcripts (
+                            transcript_id, resource_id, source_id, media_canonical_url,
+                            language_bcp47, track_kind, origin_type, acquisition_method,
+                            caption_format, speaker_attribution_quality, license_status,
+                            license_spdx, authorization_basis, authorization_attestation_id,
+                            permits_transcript_storage, permits_verbatim_excerpts, permits_ai_synthesis,
+                            permits_redistribution, attribution_text, ingestion_state,
+                            transcript_storage_status, segment_count, created_at, updated_at
+                        ) VALUES (
+                            ?, ?, 'SRC-3B1B', 'https://www.3blue1brown.com/lessons/sql-hardening-a',
+                            'de', 'TRANSLATION', 'AUTHOR_PROVIDED', 'OPEN_LICENSED_DIRECT_CAPTION',
+                            'WEBVTT', 'VERIFIED_SINGLE_SPEAKER', 'VERIFIED_PERMISSIVE',
+                            'CC-BY-4.0', 'OPEN_LICENSE_VERIFIED', ?,
+                            1, 0, 1, 0, 'Expired attestation SQL bypass', 'INGESTED', 'STORED_TIMED_SEGMENTS',
+                            0, '2026-10-25T00:00:00+00:00', '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (tr_a_de_id, res_a, att_expired["attestation_id"]),
+                    )
+
+                # 1e. Malformed non-ISO expires_at on attestation via direct SQL is rejected
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcript_authorization_attestations SET expires_at = 'not-a-valid-date' WHERE attestation_id = ?",
+                        (att_a["attestation_id"],),
+                    )
+
+                # 1f. Broadening or retargeting attestation scope via direct SQL UPDATE is rejected
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcript_authorization_attestations SET resource_id = ? WHERE attestation_id = ?",
+                        (res_b, att_a["attestation_id"]),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcript_authorization_attestations SET language_bcp47 = NULL WHERE attestation_id = ?",
+                        (att_a["attestation_id"],),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcript_authorization_attestations SET track_kind = 'TRANSLATION' WHERE attestation_id = ?",
+                        (att_a["attestation_id"],),
+                    )
+
+                # ------------------------------------------------------------------
+                # Question 2 & 3: Direct SQL bypass attempts on versions, segments,
+                # verbatim excerpts, redistribution, and syntheses
+                # ------------------------------------------------------------------
+                # Import valid transcript for Resource A under att_a (storage=1, verbatim=0, synthesis=1, redist=0)
+                imported_a = store.import_local_transcript_file(
+                    resource_id=res_a,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    authorization_basis="WRITTEN_PERMISSION",
+                    attribution_text="Resource A Written Permission",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=False,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=False,
+                    attestation_id=att_a["attestation_id"],
+                )
+                self.assertEqual(imported_a.status, "imported")
+
+                # 3a. Direct SQL cannot escalate permits_verbatim_excerpts = 1 or permits_redistribution = 1
+                # when the attestation has permits_verbatim_excerpts = 0 and permits_redistribution = 0
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcripts SET permits_verbatim_excerpts = 1 WHERE transcript_id = ?",
+                        (imported_a.transcript_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcripts SET permits_redistribution = 1 WHERE transcript_id = ?",
+                        (imported_a.transcript_id,),
+                    )
+
+                # 3b. Direct SQL cannot insert TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED or TRANSCRIPT_REDISTRIBUTION_EXPORTED
+                # audit records into provenance_events when permission is not granted
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO provenance_events (
+                            event_id, resource_id, source_id, event_type, acquisition_method,
+                            actor, status, details_json, recorded_at
+                        ) VALUES (
+                            'evt_forged_verbatim_01', ?, 'SRC-3B1B', 'TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED',
+                            'FIRST_PARTY_CURATED_IMPORT', 'attacker', 'allowed', ?, '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (
+                            res_a,
+                            json.dumps(
+                                {
+                                    "transcript_id": imported_a.transcript_id,
+                                    "authorization_attestation_id": att_a["attestation_id"],
+                                }
+                            ),
+                        ),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO provenance_events (
+                            event_id, resource_id, source_id, event_type, acquisition_method,
+                            actor, status, details_json, recorded_at
+                        ) VALUES (
+                            'evt_forged_redist_01', ?, 'SRC-3B1B', 'TRANSCRIPT_REDISTRIBUTION_EXPORTED',
+                            'FIRST_PARTY_CURATED_IMPORT', 'attacker', 'exported', ?, '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (
+                            res_a,
+                            json.dumps(
+                                {
+                                    "transcript_id": imported_a.transcript_id,
+                                    "authorization_attestation_id": att_a["attestation_id"],
+                                }
+                            ),
+                        ),
+                    )
+
+                # 3c. Narrowing permits_ai_synthesis = 0 via direct SQL on the attestation cascades to transcripts
+                # and blocks inserting transcript_syntheses via direct SQL or application methods
+                syn_before = store.record_transcript_synthesis(
+                    transcript_id=imported_a.transcript_id,
+                    synthesis_type="STRUCTURED_SUMMARY",
+                    generator_type="HUMAN_CURATED",
+                    content_markdown="## Summary\nValid transformative summary while permits_ai_synthesis=1.",
+                )
+                self.assertEqual(len(store.get_transcript_syntheses(imported_a.transcript_id)), 1)
+
+                store.conn.execute(
+                    "UPDATE transcript_authorization_attestations SET permits_ai_synthesis = 0 WHERE attestation_id = ?",
+                    (att_a["attestation_id"],),
+                )
+                # Verify cascade purged existing synthesis and set transcripts.permits_ai_synthesis = 0
+                self.assertEqual(len(store.get_transcript_syntheses(imported_a.transcript_id)), 0)
+                self.assertEqual(store.get_transcript(imported_a.transcript_id)["permits_ai_synthesis"], 0)
+
+                # Direct SQL cannot re-enable transcripts.permits_ai_synthesis = 1 or insert transcript_syntheses
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcripts SET permits_ai_synthesis = 1 WHERE transcript_id = ?",
+                        (imported_a.transcript_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO transcript_syntheses (
+                            synthesis_id, transcript_id, transcript_version_id, synthesis_type,
+                            generator_type, content_markdown, is_original_transformative,
+                            contains_verbatim_transcript, review_status, created_at
+                        ) VALUES (
+                            'tsyn_bypass_01', ?, ?, 'STRUCTURED_SUMMARY',
+                            'HUMAN_CURATED', 'Bypass synthesis attempt', 1, 0, 'PENDING_REVIEW',
+                            '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (imported_a.transcript_id, imported_a.transcript_version_id),
+                    )
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.record_transcript_synthesis(
+                        transcript_id=imported_a.transcript_id,
+                        synthesis_type="STRUCTURED_SUMMARY",
+                        generator_type="HUMAN_CURATED",
+                        content_markdown="## Blocked\nSynthesis disallowed.",
+                    )
+
+                # ------------------------------------------------------------------
+                # Question 4: Direct SQL expiry/withdrawal cascades takedown and
+                # prevents any continued import or segment/version insertion
+                # ------------------------------------------------------------------
+                # 4a. Deleting an attestation row via direct SQL is prohibited
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "DELETE FROM transcript_authorization_attestations WHERE attestation_id = ?",
+                        (att_a["attestation_id"],),
+                    )
+
+                # 4b. Expiring att_a via direct SQL UPDATE cascades takedown to transcripts, versions, and segments
+                store.conn.execute(
+                    "UPDATE transcript_authorization_attestations SET expires_at = '2020-01-01T00:00:00+00:00' WHERE attestation_id = ?",
+                    (att_a["attestation_id"],),
+                )
+                tr_after_expiry = store.get_transcript(imported_a.transcript_id)
+                self.assertEqual(tr_after_expiry["ingestion_state"], "WITHDRAWN_OR_TOMBSTONED")
+                self.assertEqual(tr_after_expiry["transcript_storage_status"], "TOMBSTONED_ON_TAKEDOWN")
+                self.assertEqual(tr_after_expiry["permits_transcript_storage"], 0)
+                self.assertEqual(len(store.get_transcript_segments(imported_a.transcript_id)), 0)
+                self.assertEqual(
+                    store.get_transcript_versions(imported_a.transcript_id)[0]["status"],
+                    "TOMBSTONED",
+                )
+
+                # 4c. Direct SQL cannot reactivate a tombstoned version or tombstoned transcript,
+                # nor insert versions or segments after expiry/tombstone
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcript_versions SET status = 'ACTIVE' WHERE transcript_version_id = ?",
+                        (imported_a.transcript_version_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        "UPDATE transcripts SET ingestion_state = 'INGESTED' WHERE transcript_id = ?",
+                        (imported_a.transcript_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO transcript_versions (
+                            transcript_version_id, transcript_id, version_number,
+                            raw_content_sha256, normalized_text_sha256, normalizer_version,
+                            segment_count, word_count, char_count, status, created_at
+                        ) VALUES (
+                            'tver_after_expiry_v2', ?, 2, 'h1', 'h2', 'norm-v1.0',
+                            1, 1, 1, 'ACTIVE', '2026-10-25T00:00:00+00:00'
+                        )
+                        """,
+                        (imported_a.transcript_id,),
+                    )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        INSERT INTO transcript_segments (
+                            segment_id, transcript_id, transcript_version_id, sequence_index,
+                            start_ms, end_ms, original_segment_text, normalized_segment_text,
+                            deep_link_url, segment_sha256
+                        ) VALUES (
+                            'tseg_after_expiry_0', ?, ?, 0, 0, 1000, 'Bypass text', 'Bypass text',
+                            'https://www.3blue1brown.com/lessons/sql-hardening-a#t=0s', 'sha'
+                        )
+                        """,
+                        (imported_a.transcript_id, imported_a.transcript_version_id),
+                    )
+
+                # 4d. Withdrawn attestation cannot be reactivated via direct SQL UPDATE
+                att_b = self._create_open_license_attestation(store, res_b)
+                store.withdraw_transcript_attestation(
+                    att_b["attestation_id"],
+                    reason="Revoked for test",
+                    actor="security_auditor",
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.conn.execute(
+                        """
+                        UPDATE transcript_authorization_attestations
+                           SET verification_status = 'VERIFIED',
+                               withdrawn_at = NULL,
+                               permits_transcript_storage = 1
+                         WHERE attestation_id = ?
+                        """,
+                        (att_b["attestation_id"],),
+                    )
 
 
 if __name__ == "__main__":

@@ -157,11 +157,11 @@ python3 knowledge_store.py withdraw-transcript <tr_id> --db data/runtime/invento
 
 | Capability | Status | Notes |
 | --- | --- | --- |
-| Forward-only SQLite migrations v6 & v7 (`0006_transcripts_and_segments`, `0007_transcript_authorization_attestations`) | **Implemented** | Preserves all v1–v6 tables, resources, versions, candidates, and provenance |
+| Forward-only SQLite migrations v6, v7 & v8 (`0006_transcripts_and_segments`, `0007_transcript_authorization_attestations`, `0008_harden_transcript_authorization_triggers`) | **Implemented** | Preserves all v1–v7 tables, resources, versions, candidates, and provenance |
 | Deterministic IDs (`tr_*`, `tatt_*`, `tver_*`, `tseg_*`, `tsyn_*`, `tslnk_*`) | **Implemented** | Content-addressed and sequence-addressed SHA-256 identifiers |
-| Auditable authorization attestations & scope enforcement (storage, quoting, AI synthesis, redistribution) | **Implemented** | Blocks caller-supplied permission flags unless backed by a `VERIFIED`, non-expired, non-withdrawn attestation |
+| Auditable authorization attestations & scope enforcement (storage, quoting, AI synthesis, redistribution) | **Implemented** | Blocks caller-supplied permission flags unless backed by a `VERIFIED`, non-expired, non-withdrawn attestation matching resource/transcript/language/track scope |
 | Offline parser & normalizer (`WEBVTT`, `SRT`, `PLAIN_TEXT`) + validation (`TV-01`..`TV-08`) | **Implemented** | Strips markup, extracts speaker labels, flags low-confidence cues, validates intervals |
-| Fail-closed policy gate & SQLite triggers blocking unauthorized text storage | **Implemented** | Missing/pending/withdrawn/expired attestation or `ALL_RIGHTS_RESERVED` stores 0 segments |
+| Fail-closed policy gate & hardened SQLite triggers blocking direct-SQL bypasses | **Implemented** | SQLite write triggers enforce verified non-expired attestation scope on `transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, and `provenance_events`, plus automatic revocation cascades |
 | Idempotent re-imports, version superseding (`ACTIVE` -> `SUPERSEDED`), and takedown/attestation withdrawal cascading | **Implemented** | Purges segments/syntheses on takedown or attestation withdrawal while retaining `TOMBSTONED` audit history |
 | Live remote caption downloading (`OFFICIAL_PLATFORM_API`, YouTube/Vimeo HTTP fetching) | **Deferred** | Requires future task & explicit platform API credentials/terms review |
 | Automated Speech Recognition (`LOCAL_ASR_WHISPER` audio download & model execution) | **Deferred** | Schema fields exist, but no audio downloading or ASR execution is implemented |
