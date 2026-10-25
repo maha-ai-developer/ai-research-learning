@@ -2,8 +2,9 @@
 
 **Document ID:** `ARCH-DATA-002`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-22  
-**Related ADR:** `docs/architecture/decisions/0002-knowledge-data-model.md`
+**Last Updated:** 2026-10-25  
+**Related ADRs:** [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md)  
+**Companion Docs:** [`transcript-ingestion.md`](./transcript-ingestion.md)
 
 ---
 
@@ -175,7 +176,7 @@ Unifies papers, articles, 3Blue1Brown educational lessons, videos, lectures, int
 
 ### 4.3 Transcripts and Timestamped Segments (`transcripts/{transcript_id}` & `segments/{segment_id}`)
 
-Stores transcript text **only** when the acquisition method and license/permission are explicitly verified (e.g., CC-licensed captions or explicit written rights-holder permission). When full transcript reuse is not licensed, the record stores timestamped concept index points and AI-generated segment summaries with `permits_verbatim_excerpts: false` and `verbatim_excerpt: null`.
+Stores transcript text **only** when the acquisition method (`METHOD_A_OFFICIAL_SOURCE_PAGE`, `METHOD_B_PERMITTED_URL_OR_API`, `METHOD_C_AUTHORIZED_USER_SUPPLIED_ASR`, or `METHOD_D_UNAVAILABLE`) and license/permission are explicitly verified (e.g., CC-licensed captions, openly licensed first-party transcript pages, or documented written rights-holder permission). When full transcript reuse is not licensed (`METHOD_D_UNAVAILABLE`), the record stores `UNAVAILABLE` provenance or timestamped concept index points and AI-generated segment summaries with `permits_verbatim_excerpts: false` and `original_segment_text: null`. For the complete transcript data model, 3-layer separation (`original_segment_text`, `normalized_segment_text`, `transcript_syntheses`), state machine, and planned local SQLite Migration `6` (`_migration_6_transcripts_and_segments`), see [`transcript-ingestion.md`](./transcript-ingestion.md) (`ARCH-TRANSCRIPT-007`) and [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md).
 
 ```json
 {
@@ -183,7 +184,8 @@ Stores transcript text **only** when the acquisition method and license/permissi
   "resource_id": "res_3b1b_backprop_0001",
   "source_id": "SRC-3B1B",
   "language": "en",
-  "acquisition_method": "TIMESTAMP_CONCEPT_INDEX_ONLY",
+  "acquisition_method": "METHOD_D_UNAVAILABLE",
+  "transcript_state": "UNAVAILABLE",
   "authorization_basis": "3Blue1Brown lesson narratives and videos are copyright 3Blue1Brown LLC (All Rights Reserved); only timestamp locators, concept tags, and AI-generated summaries are stored unless explicit reuse permission is verified.",
   "permits_verbatim_excerpts": false,
   "max_permitted_excerpt_chars": 0,
@@ -207,6 +209,8 @@ Representative segment document (`transcripts/tr_res_3b1b_backprop_en_v1/segment
   "deep_link_url": "https://www.3blue1brown.com/lessons/backpropagation#t=184",
   "speaker": "Grant Sanderson",
   "segment_summary": "Explains how the chain rule decomposes the sensitivity of the cost function with respect to weights in earlier layers.",
+  "original_segment_text": null,
+  "normalized_segment_text": null,
   "verbatim_excerpt": null,
   "concept_ids": ["cpt_chain_rule", "cpt_backpropagation", "cpt_gradient_descent"],
   "chunk_id": "chk_ver_20261021_3b1b0012_0012"

@@ -3,10 +3,10 @@
 | Metadata | Value |
 | :--- | :--- |
 | **Document ID** | `ARCH-ROADMAP-006` |
-| **Version** | `1.1.0` |
-| **Last Updated** | `2026-10-22` |
+| **Version** | `1.2.0` |
+| **Last Updated** | `2026-10-25` |
 | **Status** | `Proposed (For Architectural Review)` |
-| **Companion Docs** | [`system-overview.md`](./system-overview.md), [`cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md), [`0001-cloud-architecture.md`](./decisions/0001-cloud-architecture.md), [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0004-notebook-isolation.md`](./decisions/0004-notebook-isolation.md) |
+| **Companion Docs** | [`system-overview.md`](./system-overview.md), [`transcript-ingestion.md`](./transcript-ingestion.md), [`cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md), [`0001-cloud-architecture.md`](./decisions/0001-cloud-architecture.md), [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0004-notebook-isolation.md`](./decisions/0004-notebook-isolation.md), [`0005-arxiv-api-access-policy.md`](./decisions/0005-arxiv-api-access-policy.md), [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md) |
 
 ---
 
@@ -102,17 +102,18 @@ flowchart TD
 ---
 
 ### Stage 4 — Transcript Ingestion
-- **Dependencies**: Stage 3.
+- **Dependencies**: Stage 3 (and architecture specification [`transcript-ingestion.md`](./transcript-ingestion.md) / [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md)).
 - **Scope**:
-  - Implement authorized transcript acquisition workflows (`official_caption_api`, `first_party_webpage`, `curated_upload`) and schema normalization into `Transcript` (`tr_...`) and `TranscriptSegment` (`seg_...`) records with `start_ms` and `end_ms` locators.
-  - Link transcript segments to `knowledge_chunks` and `concept_ids` while enforcing `redistribution_allowed` policies (e.g., snippet-only indexing + deep timestamp linking for `SRC-3B1B`).
+  - Implement forward-only SQLite Migration `6` (`_migration_6_transcripts_and_segments`) and authorized transcript acquisition workflows (`METHOD_A_OFFICIAL_SOURCE_PAGE`, `METHOD_B_PERMITTED_URL_OR_API`, `METHOD_C_AUTHORIZED_USER_SUPPLIED_ASR`, `METHOD_D_UNAVAILABLE`) normalizing into `transcripts`, `transcript_versions`, `transcript_segments` (`start_ms`, `end_ms`), `transcript_syntheses`, and `transcript_segment_links`.
+  - Enforce the transcript state machine (`DISCOVERED`, `POLICY_REVIEW_REQUIRED`, `TRANSCRIPT_AVAILABLE`, `READY_FOR_INGESTION`, `INGESTED`, `UNAVAILABLE`, `BLOCKED_BY_POLICY`, `FAILED_RETRYABLE`, `WITHDRAWN_OR_TOMBSTONED`) and strict separation of original transcript text, normalized segment text, and AI-generated summaries/notes.
+  - Link transcript segments to `knowledge_chunks`, `concepts`, and `resources` while enforcing `permits_full_text_storage` and `permits_verbatim_excerpts` policies (e.g., `METHOD_D_UNAVAILABLE` / timestamp-locator-only fallback for `SRC-3B1B`, `SRC-HINTON`, and `SRC-BENGIO` unless explicit open license or permission is verified).
 - **Acceptance Criteria**:
-  - Transcript segments accurately resolve to timestamped deep links (`start_ms`, `end_ms`).
-  - Unauthorized audio/video downloading or covert scraping is blocked by policy gates (`G-03`).
+  - Transcript segments accurately resolve to timestamped deep links (`start_ms`, `end_ms`) and pass validation rules `TV-01` through `TV-08`.
+  - Unauthorized audio/video downloading, third-party caption scraping (`youtube-transcript-api`, `yt-dlp`), or unverified redistribution is blocked by policy gates (`G-03`).
 - **Key Risks & Mitigations**:
-  - *Risk*: Storing or redistributing full copyrighted transcripts without authorization. *Mitigation*: Policy gate verifies `acquisition_method` and `redistribution_allowed` before storage.
+  - *Risk*: Storing or redistributing full copyrighted transcripts without authorization. *Mitigation*: Pre-acquisition policy gate verifies `acquisition_method`, `permits_full_text_storage`, and `authorization_basis` before any fetch or storage, and retries from `FAILED_RETRYABLE` always re-enter the policy gate.
 - **Measurable Completion Checks**:
-  - `100%` of ingested `TranscriptSegment` records satisfy `0 <= start_ms < end_ms` and resolve to valid `ResourceVersion` and `ProvenanceRecord` IDs.
+  - `100%` of ingested `TranscriptSegment` records satisfy `0 <= start_ms < end_ms`, maintain monotonic segment ordering (`TV-02`), and resolve to valid `ResourceVersion` and `ProvenanceEvent` IDs (`TV-08`).
 
 ---
 
