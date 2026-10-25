@@ -77,12 +77,72 @@ python collect.py --init-db
 python collect.py --import-manifest
 ```
 
-Run the offline unit tests:
+Run the offline unit tests and syntax verification:
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q collect.py knowledge_store.py src tests
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q collect.py curation.py knowledge_store.py src tests
 ```
+
+## 2.1 Offline Transcript Data Model and Local Import Workflow (Schema v6)
+
+Schema migration `0006_transcripts_and_segments` (`LATEST_SCHEMA_VERSION = 6`) extends the local SQLite store with five transcript persistence tables defined in `docs/architecture/transcript-ingestion.md` (`ARCH-TRANSCRIPT-007`) and `docs/architecture/decisions/0006-transcript-acquisition-and-storage.md` (`ADR-0006`):
+
+- `transcripts` — canonical transcript registry, license/rights status, authorization basis, and 8-state ingestion machine (`DISCOVERED`, `RIGHTS_PENDING`, `READY_FOR_INGESTION`, `INGESTED`, `NEEDS_REVIEW`, `BLOCKED_BY_POLICY`, `METADATA_ONLY_LINKED`, `WITHDRAWN_OR_TOMBSTONED`).
+- `transcript_versions` — immutable version ledger (`tver_*`) tracking SHA-256 digests (`raw_content_sha256`, `normalized_text_sha256`), normalizer version (`norm-v1.0`), segment/word/character counts, and confidence statistics.
+- `transcript_segments` — normalized, timestamped segment cues (`tseg_*`) with monotonic `start_ms` / `end_ms`, preserved `original_segment_text`, `normalized_segment_text`, speaker attribution, quality flags, and timestamped deep links (`#t=<seconds>s` or `?t=<seconds>`).
+- `transcript_syntheses` — transformative study notes/summaries (`tsyn_*`) enforced to exclude verbatim transcript dumps.
+- `transcript_segment_links` — cross-modal links (`tslnk_*`) connecting transcript segments to concepts, paper resources, modules, equations, or chunks.
+
+### Offline Transcript CLI Usage
+
+All transcript commands in `knowledge_store.py` are strictly offline and make zero network requests. Storing transcript text requires passing the 4-part conjunctive policy gate (active source, non-restricted license, explicit `authorization_basis != 'NONE'`, and `--permits-storage`).
+
+```bash
+# Import a local WebVTT (.vtt), SubRip (.srt), or plain-text (.txt) transcript under explicit permission:
+python3 knowledge_store.py import-transcript \
+  --db data/runtime/inventory.sqlite \
+  --resource-id <res_id> \
+  --file path/to/transcript.vtt \
+  --language en \
+  --track-kind PRIMARY \
+  --origin-type MANUAL_CURATED_IMPORT \
+  --acquisition-method FIRST_PARTY_CURATED_IMPORT \
+  --license-status CC_BY_4_0 \
+  --license-spdx CC-BY-4.0 \
+  --authorization-basis CREATIVE_COMMONS_LICENSE \
+  --attribution "Author Name — Lecture Title (CC BY 4.0)" \
+  --permits-storage \
+  --permits-excerpts
+
+# Record a metadata-only or policy-blocked transcript entry (stores 0 rows in transcript_versions/transcript_segments):
+python3 knowledge_store.py import-transcript \
+  --db data/runtime/inventory.sqlite \
+  --resource-id <res_id> \
+  --language en \
+  --acquisition-method METADATA_AND_LINK_ONLY \
+  --license-status ALL_RIGHTS_RESERVED \
+  --authorization-basis NONE \
+  --attribution "External Lecture (All Rights Reserved — Metadata & Deep-Link Only)"
+
+# List transcripts, inspect a transcript with versions/segments, or withdraw/tombstone on takedown:
+python3 knowledge_store.py list-transcripts --db data/runtime/inventory.sqlite
+python3 knowledge_store.py show-transcript <tr_id> --db data/runtime/inventory.sqlite --show-segments
+python3 knowledge_store.py withdraw-transcript <tr_id> --db data/runtime/inventory.sqlite --reason "Rights withdrawal request"
+```
+
+### Transcript Subsystem Status: Implemented vs. Deferred
+
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Forward-only SQLite migration v6 (`0006_transcripts_and_segments`) | **Implemented** | Preserves all v1–v5 tables, resources, versions, candidates, and provenance |
+| Deterministic IDs (`tr_*`, `tver_*`, `tseg_*`, `tsyn_*`, `tslnk_*`) | **Implemented** | Content-addressed and sequence-addressed SHA-256 identifiers |
+| Offline parser & normalizer (`WEBVTT`, `SRT`, `PLAIN_TEXT`) + validation (`TV-01`..`TV-08`) | **Implemented** | Strips markup, extracts speaker labels, flags low-confidence cues, validates intervals |
+| Fail-closed 4-part policy gate & SQLite triggers blocking unauthorized text storage | **Implemented** | `UNKNOWN`, `ALL_RIGHTS_RESERVED`, `RESTRICTED_PROPRIETARY`, or `NONE` basis stores 0 segments |
+| Idempotent re-imports, version superseding (`ACTIVE` -> `SUPERSEDED`), and takedown tombstoning | **Implemented** | Purges segments/syntheses on takedown while retaining `TOMBSTONED` audit history |
+| Live remote caption downloading (`OFFICIAL_PLATFORM_API`, YouTube/Vimeo HTTP fetching) | **Deferred** | Requires future task & explicit platform API credentials/terms review |
+| Automated Speech Recognition (`LOCAL_ASR_WHISPER` audio download & model execution) | **Deferred** | Schema fields exist, but no audio downloading or ASR execution is implemented |
+| Vector embeddings, semantic transcript search, learning UI, and cloud synchronization | **Deferred** | Local SQLite only; no Firebase/GCP provisioning or vector indexing |
 
 ## 3. Before enabling network collection
 
