@@ -696,21 +696,33 @@ class TranscriptIngestionRepositoryProtocol(Protocol):
     ) -> None: ...
 ```
 
-### 8.2 Future SQLite Migration `6` (`_migration_6_transcripts_and_segments`) Implications
+### 8.2 SQLite Migrations `6` and `7` (`0006_transcripts_and_segments` and `0007_transcript_authorization_attestations`)
 
-When a future task implements transcript storage in [`../../knowledge_store.py`](../../knowledge_store.py):
+Implemented in [`../../knowledge_store.py`](../../knowledge_store.py):
 
-1. **Forward-Only Migration (`version 5 -> 6`):**
-   - Add `_migration_6_transcripts_and_segments(conn)` creating `transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, and `transcript_segment_links` with `PRAGMA foreign_keys = ON`.
-   - Preserve all existing tables (`sources`, `resources`, `resource_versions`, `provenance_events`, `discovered_link_candidates`, `discovered_link_reviews`, and legacy collector tables) with zero data loss.
-2. **Database-Level Safety Constraints (`CHECK` & Triggers):**
-   - `transcripts`: `CHECK (permits_transcript_storage IN (0, 1))` and `CHECK (NOT (ingestion_state IN ('UNAVAILABLE', 'BLOCKED_BY_POLICY', 'WITHDRAWN_OR_TOMBSTONED') AND permits_transcript_storage = 1))`.
-   - `transcript_segments`: `CHECK (start_ms >= 0 AND end_ms >= start_ms)` and `CHECK (sequence_index >= 0)`.
-   - Repository transaction guard: `ingest_permitted_transcript_version` must verify inside the SQLite transaction that `policy_result.next_state == 'READY_FOR_INGESTION'` and `policy_result.permits_transcript_storage is True` before inserting any row into `transcript_segments`.
-3. **Deterministic ID Helpers to Add in `knowledge_store.py`:**
+1. **Forward-Only Migration `6` (`0006_transcripts_and_segments`, `version 5 -> 6`):**
+   - Adds `transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, and `transcript_segment_links` with `PRAGMA foreign_keys = ON`.
+   - Preserves all existing tables (`sources`, `resources`, `resource_versions`, `provenance_events`, `discovered_link_candidates`, `discovered_link_reviews`, and legacy collector tables) with zero data loss.
+2. **Forward-Only Migration `7` (`0007_transcript_authorization_attestations`, `version 6 -> 7`):**
+   - Adds `transcript_authorization_attestations` (`attestation_id` `tatt_<sha256_16>`) and extends `transcripts` with `permits_redistribution` while preserving Migration `6` untouched for forward-only checksum stability.
+   - Captures structured, human-verifiable authorization records for transcript rights:
+     - **Target linkage:** `resource_id`, optional `transcript_id`, `language_bcp47`, and `track_kind`.
+     - **Authorization basis & evidence:** `authorization_basis` (`OPEN_LICENSE_VERIFIED`, `PUBLIC_DOMAIN_VERIFIED`, `FIRST_PARTY_OWNED`, `FIRST_PARTY_OWNED_MEDIA`, `WRITTEN_PERMISSION`, `WRITTEN_RIGHTS_HOLDER_PERMISSION`, `NONE`), `license_status`, `license_spdx`, `evidence_type` (`LICENSE_URL`, `SPDX_HEADER_OR_PAGE_FOOTER`, `FIRST_PARTY_STATEMENT`, `WRITTEN_PERMISSION_RECORD`, `PUBLIC_DOMAIN_DEDICATION`, `SOURCE_REGISTRY_POLICY`, `OTHER_DOCUMENTED_EVIDENCE`), `evidence_reference`, optional `evidence_url`, and optional `evidence_sha256`.
+     - **Four-Part Granular Scope Distinction:**
+       1. `permits_transcript_storage`: Permission to persist `transcript_versions` and `transcript_segments` in the local SQLite store.
+       2. `permits_verbatim_excerpts`: Permission to quote verbatim segment spans (`get_verbatim_transcript_excerpt`). May be `0` even when storage is `1` (e.g., internal study index where verbatim display is restricted).
+       3. `permits_ai_synthesis`: Permission to generate transformative study notes or summaries (`record_transcript_synthesis` / `transcript_syntheses`).
+       4. `permits_redistribution`: Permission to export or redistribute full transcript text (`export_transcript_for_redistribution`). Defaults to `0` and is enforced independently of local storage and verbatim excerpt permissions.
+     - **Verification & Lifecycle State:** `verification_status` (`VERIFIED`, `PENDING_REVIEW`, `CONTRADICTORY`, `REJECTED`, `WITHDRAWN`, `EXPIRED`, `UNKNOWN`), `reviewed_by`, `reviewed_at`, optional `expires_at`, and withdrawal audit columns (`withdrawn_at`, `withdrawn_by`, `withdrawal_reason`).
+3. **Database-Level & Policy-Gate Safety Constraints (`CHECK`, Triggers, and `evaluate_transcript_storage_policy`):**
+   - **Caller-Supplied Flags Are Never Sufficient on Their Own:** Passing `permits_transcript_storage=True` or `--permits-storage` without a `VERIFIED`, non-withdrawn, non-expired attestation matching the resource (and transcript/language/track scope) is rejected (`permits_transcript_storage = False`, `ingestion_state = 'BLOCKED_BY_POLICY'` or `'NEEDS_REVIEW'`), and zero segment text rows are written.
+   - **Engineering Control vs. Legal Advice:** Attestation records provide an auditable engineering control and evidence trail for human reviewers; they do not perform automated legal interpretation.
+   - **Cascading Withdrawal:** Withdrawing an attestation via `withdraw_transcript_attestation` marks the attestation `WITHDRAWN`, revokes active scope flags, and cascades `tombstone_transcript_on_takedown` across linked transcripts to purge stored segment and synthesis text while preserving provenance history.
+4. **Deterministic ID Helpers in `knowledge_store.py`:**
    - `compute_transcript_id(resource_id: str, language_bcp47: str, track_kind: str) -> str` (`tr_<sha256_16>`)
-   - `compute_transcript_version_id(transcript_id: str, raw_content_sha256: str, version_number: int, created_at: str) -> str` (`tver_<yyyymmdd>_<hash8>_v<n>`)
-   - `compute_transcript_segment_id(transcript_id: str, sequence_index: int) -> str` (`seg_<transcript_id>_<sequence_index:05d>`)
+   - `compute_transcript_attestation_id(...) -> str` (`tatt_<sha256_16>`)
+   - `compute_transcript_version_id(transcript_id: str, raw_content_sha256: str, version_number: int) -> str` (`tver_<sha256_16>`)
+   - `compute_transcript_segment_id(transcript_version_id: str, sequence_index: int) -> str` (`tseg_<sha256_16>`)
 
 ---
 

@@ -13,9 +13,11 @@ from knowledge_store import (
     LATEST_SCHEMA_VERSION,
     MIGRATIONS,
     KnowledgeStore,
+    TranscriptPolicyViolationError,
     TranscriptSegmentCue,
     compute_resource_id,
     compute_segment_deep_link_url,
+    compute_transcript_attestation_id,
     compute_transcript_id,
     compute_transcript_segment_id,
     compute_transcript_segment_link_id,
@@ -55,12 +57,18 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
         self._create_conn_patcher.stop()
         self._socket_patcher.stop()
 
-    def _seed_sample_resource(self, store: KnowledgeStore) -> str:
+    def _seed_sample_resource(
+        self,
+        store: KnowledgeStore,
+        *,
+        canonical_url: str = "https://www.3blue1brown.com/lessons/synthetic-test-lecture",
+        title: str = "Synthetic Lecture on Backpropagation (Test Fixture)",
+    ) -> str:
         upserted = store.upsert_resource(
             source_id="SRC-3B1B",
             manifest_id=None,
-            canonical_url="https://www.3blue1brown.com/lessons/synthetic-test-lecture",
-            title="Synthetic Lecture on Backpropagation (Test Fixture)",
+            canonical_url=canonical_url,
+            title=title,
             authors="Synthetic Test Author",
             published_at="2026-01-15",
             resource_type="Educational video lesson",
@@ -79,10 +87,52 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
         )
         return str(upserted["resource_id"])
 
-    def test_01_forward_only_migration_from_v5_to_v6_preserves_existing_records(self):
+    def _create_open_license_attestation(
+        self,
+        store: KnowledgeStore,
+        resource_id: str,
+        *,
+        license_spdx: str = "CC-BY-4.0",
+        authorization_basis: str = "OPEN_LICENSE_VERIFIED",
+        permits_transcript_storage: bool = True,
+        permits_verbatim_excerpts: bool = True,
+        permits_ai_synthesis: bool = True,
+        permits_redistribution: bool = False,
+        language_bcp47: str | None = None,
+        track_kind: str | None = None,
+        transcript_id: str | None = None,
+        verification_status: str = "VERIFIED",
+        expires_at: str | None = None,
+    ) -> dict:
+        return store.record_transcript_attestation(
+            resource_id=resource_id,
+            transcript_id=transcript_id,
+            language_bcp47=language_bcp47,
+            track_kind=track_kind,
+            authorization_basis=authorization_basis,
+            license_status="VERIFIED_PERMISSIVE",
+            license_spdx=license_spdx,
+            evidence_type="CREATOR_LICENSE_PAGE",
+            evidence_reference=f"Verified {license_spdx} caption license page for {resource_id}",
+            source_evidence_url="https://www.3blue1brown.com/lessons/synthetic-test-lecture",
+            evidence_sha256=sha256_hex(f"evidence:{resource_id}:{license_spdx}"),
+            attribution_text=f"Synthetic Test Fixture ({license_spdx})",
+            permits_metadata_indexing=True,
+            permits_transcript_storage=permits_transcript_storage,
+            permits_verbatim_excerpts=permits_verbatim_excerpts,
+            permits_ai_synthesis=permits_ai_synthesis,
+            permits_redistribution=permits_redistribution,
+            reviewed_by="unit_test_curator",
+            review_notes="Verified open license in unit test fixture",
+            verification_status=verification_status,
+            expires_at=expires_at,
+        )
+
+    def test_01_forward_only_migration_from_v5_and_v6_to_v7_preserves_existing_records(self):
         with tempfile.TemporaryDirectory() as tmp:
-            db_path = Path(tmp) / "v5_to_v6.sqlite"
-            conn = sqlite3.connect(str(db_path))
+            # Part A: Migrate from v5 -> v7
+            db_v5_path = Path(tmp) / "v5_to_v7.sqlite"
+            conn = sqlite3.connect(str(db_v5_path))
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute(
@@ -95,7 +145,6 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 )
                 """
             )
-            # Apply only migrations 1..5 to simulate an existing schema v5 database
             for version, name, sql_marker, migration_fn in MIGRATIONS[:5]:
                 checksum = sha256_hex(f"{version}:{name}:{sql_marker}")
                 with conn:
@@ -107,23 +156,15 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     conn.execute(f"PRAGMA user_version = {version}")
             conn.close()
 
-            # Verify v5 state before upgrading
-            conn_check = sqlite3.connect(str(db_path))
-            self.assertEqual(conn_check.execute("PRAGMA user_version").fetchone()[0], 5)
-            conn_check.close()
-
-            # Open with KnowledgeStore to trigger forward-only migration 5 -> 6
-            with KnowledgeStore(db_path=db_path, auto_initialize=False) as store:
+            with KnowledgeStore(db_path=db_v5_path, auto_initialize=False) as store:
                 newly_applied = store.initialize()
-                self.assertEqual(newly_applied, [6])
-                self.assertEqual(store.get_schema_version(), 6)
-                self.assertEqual(LATEST_SCHEMA_VERSION, 6)
+                self.assertEqual(newly_applied, [6, 7])
+                self.assertEqual(store.get_schema_version(), 7)
+                self.assertEqual(LATEST_SCHEMA_VERSION, 7)
 
-                # Confirm existing canonical sources survived intact
                 sources = store.list_sources(only_complete=True)
                 self.assertEqual(len(sources), 5)
 
-                # Confirm all 5 new transcript tables exist
                 tables = {
                     r[0]
                     for r in store.conn.execute(
@@ -136,13 +177,84 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     "transcript_segments",
                     "transcript_syntheses",
                     "transcript_segment_links",
+                    "transcript_authorization_attestations",
                 ):
                     self.assertIn(expected_table, tables)
 
-                # Confirm repeated initialization is idempotent
                 self.assertEqual(store.initialize(), [])
 
-    def test_02_deterministic_transcript_version_and_segment_ids(self):
+            # Part B: Migrate from v6 (containing a pre-existing authorized transcript) -> v7
+            db_v6_path = Path(tmp) / "v6_to_v7.sqlite"
+            conn6 = sqlite3.connect(str(db_v6_path))
+            conn6.row_factory = sqlite3.Row
+            conn6.execute("PRAGMA foreign_keys = ON")
+            conn6.execute(
+                """
+                CREATE TABLE schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    checksum TEXT NOT NULL,
+                    applied_at TEXT NOT NULL
+                )
+                """
+            )
+            for version, name, sql_marker, migration_fn in MIGRATIONS[:6]:
+                checksum = sha256_hex(f"{version}:{name}:{sql_marker}")
+                with conn6:
+                    migration_fn(conn6)
+                    conn6.execute(
+                        "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+                        (version, name, checksum, "2026-01-01T00:00:00+00:00"),
+                    )
+                    conn6.execute(f"PRAGMA user_version = {version}")
+
+            # Insert a resource and a v6 authorized transcript prior to applying migration 7
+            store_v6 = KnowledgeStore(conn=conn6, auto_initialize=False)
+            res_id = self._seed_sample_resource(
+                store_v6,
+                canonical_url="https://www.3blue1brown.com/lessons/v6-legacy",
+                title="Legacy v6 Resource",
+            )
+            tr_id = compute_transcript_id(res_id, "en", "PRIMARY")
+            with conn6:
+                conn6.execute(
+                    """
+                    INSERT INTO transcripts (
+                        transcript_id, resource_id, source_id, media_canonical_url,
+                        language_bcp47, track_kind, origin_type, acquisition_method,
+                        caption_format, speaker_attribution_quality, license_status,
+                        license_spdx, authorization_basis,
+                        permits_transcript_storage, permits_verbatim_excerpts, permits_ai_synthesis,
+                        attribution_text, ingestion_state, transcript_storage_status,
+                        segment_count, created_at, updated_at
+                    ) VALUES (
+                        ?, ?, 'SRC-3B1B', 'https://www.3blue1brown.com/lessons/v6-legacy',
+                        'en', 'PRIMARY', 'AUTHOR_PROVIDED', 'OPEN_LICENSED_DIRECT_CAPTION',
+                        'WEBVTT', 'VERIFIED_SINGLE_SPEAKER', 'VERIFIED_PERMISSIVE',
+                        'CC-BY-4.0', 'OPEN_LICENSE_VERIFIED',
+                        1, 1, 1,
+                        'Legacy v6 Attribution', 'INGESTED', 'STORED_TIMED_SEGMENTS',
+                        0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                    )
+                    """,
+                    (tr_id, res_id),
+                )
+            conn6.close()
+
+            with KnowledgeStore(db_path=db_v6_path, auto_initialize=False) as store6:
+                newly_applied_6 = store6.initialize()
+                self.assertEqual(newly_applied_6, [7])
+                self.assertEqual(store6.get_schema_version(), 7)
+                migrated_tr = store6.get_transcript(tr_id)
+                self.assertIsNotNone(migrated_tr["authorization_attestation_id"])
+                backfilled_att = store6.get_transcript_attestation(
+                    migrated_tr["authorization_attestation_id"]
+                )
+                self.assertIsNotNone(backfilled_att)
+                self.assertEqual(backfilled_att["verification_status"], "VERIFIED")
+                self.assertEqual(backfilled_att["permits_transcript_storage"], 1)
+
+    def test_02_deterministic_transcript_attestation_version_and_segment_ids(self):
         resource_id = compute_resource_id(
             "SRC-3B1B", "https://www.3blue1brown.com/lessons/synthetic-test-lecture"
         )
@@ -151,6 +263,26 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
         self.assertEqual(t_id_1, t_id_2)
         self.assertTrue(t_id_1.startswith("tr_"))
         self.assertEqual(len(t_id_1), 19)
+
+        att_id_1 = compute_transcript_attestation_id(
+            resource_id,
+            "OPEN_LICENSE_VERIFIED",
+            "CREATOR_LICENSE_PAGE",
+            "https://www.3blue1brown.com/lessons/synthetic-test-lecture",
+            language_bcp47="en",
+            track_kind="PRIMARY",
+        )
+        att_id_2 = compute_transcript_attestation_id(
+            resource_id,
+            "open_license_verified",
+            "creator_license_page",
+            "https://www.3blue1brown.com/lessons/synthetic-test-lecture",
+            language_bcp47="EN",
+            track_kind="primary",
+        )
+        self.assertEqual(att_id_1, att_id_2)
+        self.assertTrue(att_id_1.startswith("tatt_"))
+        self.assertEqual(len(att_id_1), 21)
 
         t_id_fr = compute_transcript_id(resource_id, "fr", "TRANSLATION")
         self.assertNotEqual(t_id_1, t_id_fr)
@@ -178,11 +310,19 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
             deep_link, "https://www.3blue1brown.com/lessons/synthetic-test-lecture#t=9s"
         )
 
-    def test_03_valid_import_of_webvtt_srt_and_plain_text_under_explicit_permission(self):
+    def test_03_valid_import_of_webvtt_srt_and_plain_text_under_verified_attestation(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "store.sqlite"
             with init_db(db_path) as store:
                 res_id = self._seed_sample_resource(store)
+                att_cc_by = self._create_open_license_attestation(
+                    store,
+                    res_id,
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                )
 
                 # 1. WebVTT import (PRIMARY, en)
                 vtt_res = store.import_local_transcript_file(
@@ -199,6 +339,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     attribution_text="Synthetic Test Fixture (CC-BY-4.0)",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
+                    attestation_id=att_cc_by["attestation_id"],
                     duration_ms=20000,
                 )
                 self.assertEqual(vtt_res.status, "imported")
@@ -206,6 +347,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(vtt_res.transcript_storage_status, "STORED_TIMED_SEGMENTS")
                 self.assertTrue(vtt_res.permits_transcript_storage)
                 self.assertTrue(vtt_res.permits_verbatim_excerpts)
+                self.assertEqual(vtt_res.authorization_attestation_id, att_cc_by["attestation_id"])
                 self.assertEqual(vtt_res.stored_segments, 3)
 
                 segments = store.get_transcript_segments(vtt_res.transcript_id)
@@ -237,6 +379,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     attribution_text="Synthetic French Translation Fixture (CC-BY-4.0)",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
+                    attestation_id=att_cc_by["attestation_id"],
                 )
                 self.assertEqual(srt_res.status, "imported")
                 self.assertEqual(srt_res.ingestion_state, "INGESTED")
@@ -247,7 +390,18 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(fr_segments[1]["start_ms"], 3800)
                 self.assertEqual(fr_segments[1]["end_ms"], 8400)
 
-                # 3. Plain text import (DESCRIPTIVE_AUDIO_TEXT, en)
+                # 3. Plain text import (DESCRIPTIVE_AUDIO_TEXT, en) under PUBLIC_DOMAIN_VERIFIED / CC0-1.0
+                att_pd = self._create_open_license_attestation(
+                    store,
+                    res_id,
+                    license_spdx="CC0-1.0",
+                    authorization_basis="PUBLIC_DOMAIN_VERIFIED",
+                    language_bcp47="en",
+                    track_kind="DESCRIPTIVE_AUDIO_TEXT",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_redistribution=True,
+                )
                 txt_res = store.import_local_transcript_file(
                     resource_id=res_id,
                     transcript_path=TXT_FIXTURE,
@@ -258,14 +412,17 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     speaker_attribution_quality="VERIFIED_SINGLE_SPEAKER",
                     license_status="VERIFIED_PERMISSIVE",
                     license_spdx="CC0-1.0",
-                    authorization_basis="FIRST_PARTY_OWNED",
+                    authorization_basis="PUBLIC_DOMAIN_VERIFIED",
                     attribution_text="Synthetic Plain Text Notes (CC0-1.0)",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
+                    permits_redistribution=True,
+                    attestation_id=att_pd["attestation_id"],
                 )
                 self.assertEqual(txt_res.status, "imported")
                 self.assertEqual(txt_res.ingestion_state, "INGESTED")
                 self.assertEqual(txt_res.transcript_storage_status, "STORED_PLAIN_TEXT")
+                self.assertTrue(txt_res.permits_redistribution)
                 self.assertEqual(txt_res.stored_segments, 2)
 
                 # Verify synthesis and segment link persistence
@@ -293,52 +450,116 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     len(store.get_transcript_segment_links(segments[1]["segment_id"])), 1
                 )
 
-    def test_04_policy_gate_blocks_unauthorized_or_unknown_license_and_stores_zero_text(self):
+    def test_04_policy_gate_blocks_caller_flags_without_attestation_and_invalid_attestations(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "policy_gate.sqlite"
             with init_db(db_path) as store:
                 res_id = self._seed_sample_resource(store)
 
-                # Case A: license_status is UNKNOWN (even though caller passes permits_transcript_storage=True)
-                blocked_unknown = store.import_local_transcript_file(
+                # Scenario 1: Caller passes permits_transcript_storage=True + VERIFIED_PERMISSIVE + CC-BY-4.0
+                # WITHOUT an attestation -> MUST fail closed and store 0 segments
+                blocked_no_att = store.import_local_transcript_file(
                     resource_id=res_id,
                     transcript_path=VTT_FIXTURE,
                     language_bcp47="en",
                     track_kind="PRIMARY",
-                    license_status="UNKNOWN",
+                    license_status="VERIFIED_PERMISSIVE",
                     authorization_basis="OPEN_LICENSE_VERIFIED",
                     license_spdx="CC-BY-4.0",
-                    attribution_text="Unverified License Transcript",
+                    attribution_text="Caller-Claimed License Without Attestation",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
                 )
-                self.assertEqual(blocked_unknown.status, "blocked")
-                self.assertEqual(blocked_unknown.ingestion_state, "BLOCKED_BY_POLICY")
+                self.assertEqual(blocked_no_att.status, "blocked")
+                self.assertEqual(blocked_no_att.ingestion_state, "BLOCKED_BY_POLICY")
                 self.assertEqual(
-                    blocked_unknown.transcript_storage_status, "BLOCKED_NO_AUTHORIZATION"
+                    blocked_no_att.transcript_storage_status, "BLOCKED_NO_AUTHORIZATION"
                 )
-                self.assertFalse(blocked_unknown.permits_transcript_storage)
-                self.assertFalse(blocked_unknown.permits_verbatim_excerpts)
-                self.assertIsNone(blocked_unknown.transcript_version_id)
-                self.assertEqual(blocked_unknown.stored_segments, 0)
+                self.assertFalse(blocked_no_att.permits_transcript_storage)
+                self.assertFalse(blocked_no_att.permits_verbatim_excerpts)
+                self.assertIsNone(blocked_no_att.authorization_attestation_id)
+                self.assertIsNone(blocked_no_att.transcript_version_id)
+                self.assertEqual(blocked_no_att.stored_segments, 0)
+                self.assertIn("Missing auditable authorization attestation", blocked_no_att.reason)
 
-                # Case B: ALL_RIGHTS_RESERVED
-                blocked_arr = store.import_local_transcript_file(
+                # Scenario 2a: Non-existent attestation_id fails closed
+                blocked_missing_id = store.import_local_transcript_file(
+                    resource_id=res_id,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    license_spdx="CC-BY-4.0",
+                    attribution_text="Missing Attestation ID",
+                    permits_transcript_storage=True,
+                    attestation_id="tatt_0000000000000000",
+                )
+                self.assertEqual(blocked_missing_id.status, "blocked")
+                self.assertEqual(blocked_missing_id.stored_segments, 0)
+
+                # Scenario 2b: UNKNOWN, PENDING_REVIEW, REJECTED, and CONTRADICTORY attestations all fail closed
+                for status_label in ("UNKNOWN", "PENDING_REVIEW", "REJECTED"):
+                    att_non_verified = store.record_transcript_attestation(
+                        resource_id=res_id,
+                        language_bcp47="fr",
+                        track_kind="TRANSLATION",
+                        authorization_basis="OPEN_LICENSE_VERIFIED",
+                        license_status="VERIFIED_PERMISSIVE",
+                        license_spdx="CC-BY-4.0",
+                        evidence_type="CREATOR_LICENSE_PAGE",
+                        evidence_reference=f"Non-verified test ({status_label})",
+                        source_evidence_url="https://www.3blue1brown.com/lessons/synthetic-test-lecture",
+                        permits_transcript_storage=True,
+                        verification_status=status_label,
+                    )
+                    res_blocked = store.import_local_transcript_file(
+                        resource_id=res_id,
+                        transcript_path=SRT_FIXTURE,
+                        language_bcp47="fr",
+                        track_kind="TRANSLATION",
+                        license_status="VERIFIED_PERMISSIVE",
+                        license_spdx="CC-BY-4.0",
+                        authorization_basis="OPEN_LICENSE_VERIFIED",
+                        attribution_text="Non-verified attestation import",
+                        permits_transcript_storage=True,
+                        attestation_id=att_non_verified["attestation_id"],
+                    )
+                    self.assertEqual(res_blocked.status, "blocked")
+                    self.assertEqual(res_blocked.stored_segments, 0)
+
+                # Contradictory attestation (e.g., OPEN_LICENSE_VERIFIED with non-permissive SPDX or ALL_RIGHTS_RESERVED with permits_transcript_storage=True)
+                att_contradictory = store.record_transcript_attestation(
+                    resource_id=res_id,
+                    language_bcp47="es",
+                    track_kind="TRANSLATION",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    license_status="ALL_RIGHTS_RESERVED",
+                    license_spdx="CC-BY-NC-ND-4.0",
+                    evidence_type="CREATOR_LICENSE_PAGE",
+                    evidence_reference="Contradictory license claim",
+                    source_evidence_url="https://www.3blue1brown.com/lessons/synthetic-test-lecture",
+                    permits_transcript_storage=True,
+                    verification_status="VERIFIED",
+                )
+                self.assertEqual(att_contradictory["verification_status"], "CONTRADICTORY")
+                self.assertEqual(att_contradictory["permits_transcript_storage"], 0)
+                blocked_contradictory = store.import_local_transcript_file(
                     resource_id=res_id,
                     transcript_path=SRT_FIXTURE,
-                    language_bcp47="fr",
+                    language_bcp47="es",
                     track_kind="TRANSLATION",
-                    license_status="ALL_RIGHTS_RESERVED",
-                    authorization_basis="NONE",
-                    attribution_text="Proprietary Lecture Transcript",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Contradictory attestation import",
                     permits_transcript_storage=True,
-                    permits_verbatim_excerpts=True,
+                    attestation_id=att_contradictory["attestation_id"],
                 )
-                self.assertEqual(blocked_arr.status, "blocked")
-                self.assertEqual(blocked_arr.ingestion_state, "BLOCKED_BY_POLICY")
-                self.assertEqual(blocked_arr.stored_segments, 0)
+                self.assertEqual(blocked_contradictory.status, "blocked")
+                self.assertEqual(blocked_contradictory.stored_segments, 0)
 
-                # Case C: METADATA_AND_LINK_ONLY
+                # Scenario 2c: METADATA_AND_LINK_ONLY
                 meta_only = store.import_local_transcript_file(
                     resource_id=res_id,
                     transcript_path=TXT_FIXTURE,
@@ -384,7 +605,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                             segment_count, word_count, char_count, status, created_at
                         ) VALUES ('tver_20261025_deadbeef_v1', ?, 1, 'a', 'b', 'norm-v1.0', 1, 1, 1, 'ACTIVE', '2026-10-25T00:00:00+00:00')
                         """,
-                        (blocked_unknown.transcript_id,),
+                        (blocked_no_att.transcript_id,),
                     )
 
     def test_05_validation_failures_for_corrupt_cues_and_missing_parent_resource(self):
@@ -392,6 +613,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
             db_path = Path(tmp) / "validation.sqlite"
             with init_db(db_path) as store:
                 res_id = self._seed_sample_resource(store)
+                att = self._create_open_license_attestation(store, res_id)
 
                 # Missing parent resource
                 with self.assertRaisesRegex(ValueError, "Parent resource_id does not exist"):
@@ -403,6 +625,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         license_spdx="CC-BY-4.0",
                         authorization_basis="OPEN_LICENSE_VERIFIED",
                         permits_transcript_storage=True,
+                        attestation_id=att["attestation_id"],
                     )
 
                 # Empty transcript content (TV-01)
@@ -416,6 +639,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         license_spdx="CC-BY-4.0",
                         authorization_basis="OPEN_LICENSE_VERIFIED",
                         permits_transcript_storage=True,
+                        attestation_id=att["attestation_id"],
                     )
 
                 # end_ms < start_ms (TV-02)
@@ -432,6 +656,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         license_spdx="CC-BY-4.0",
                         authorization_basis="OPEN_LICENSE_VERIFIED",
                         permits_transcript_storage=True,
+                        attestation_id=att["attestation_id"],
                     )
 
                 # Non-monotonic start_ms across segments (TV-02)
@@ -450,6 +675,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         license_spdx="CC-BY-4.0",
                         authorization_basis="OPEN_LICENSE_VERIFIED",
                         permits_transcript_storage=True,
+                        attestation_id=att["attestation_id"],
                     )
 
                 # Negative timestamp / empty segment text via validate_transcript_cues (TV-02, TV-04)
@@ -496,6 +722,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         license_spdx="CC-BY-4.0",
                         authorization_basis="OPEN_LICENSE_VERIFIED",
                         permits_transcript_storage=True,
+                        attestation_id=att["attestation_id"],
                     )
 
     def test_06_idempotent_reimport_and_version_superseding_on_content_change(self):
@@ -503,6 +730,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
             db_path = Path(tmp) / "versioning.sqlite"
             with init_db(db_path) as store:
                 res_id = self._seed_sample_resource(store)
+                att = self._create_open_license_attestation(store, res_id)
 
                 first = store.import_local_transcript_file(
                     resource_id=res_id,
@@ -515,6 +743,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     attribution_text="Synthetic Lecture Attribution",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
+                    attestation_id=att["attestation_id"],
                 )
                 self.assertEqual(first.status, "imported")
                 self.assertEqual(first.version_number, 1)
@@ -531,6 +760,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     attribution_text="Synthetic Lecture Attribution",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
+                    attestation_id=att["attestation_id"],
                 )
                 self.assertEqual(second.status, "skipped_unchanged")
                 self.assertEqual(second.transcript_id, first.transcript_id)
@@ -555,6 +785,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     attribution_text="Synthetic Lecture Attribution",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
+                    attestation_id=att["attestation_id"],
                 )
                 self.assertEqual(third.status, "updated")
                 self.assertEqual(third.version_number, 2)
@@ -575,11 +806,12 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         (first.transcript_version_id,),
                     )
 
-    def test_07_takedown_withdrawal_purges_segments_and_syntheses_and_retains_tombstone(self):
+    def test_07_attestation_withdrawal_and_expiry_block_storage_and_cascade_takedown(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "takedown.sqlite"
             with init_db(db_path) as store:
                 res_id = self._seed_sample_resource(store)
+                att = self._create_open_license_attestation(store, res_id)
                 imported = store.import_local_transcript_file(
                     resource_id=res_id,
                     transcript_path=VTT_FIXTURE,
@@ -589,6 +821,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     attribution_text="Synthetic Lecture Attribution",
                     permits_transcript_storage=True,
                     permits_verbatim_excerpts=True,
+                    attestation_id=att["attestation_id"],
                 )
                 store.record_transcript_synthesis(
                     transcript_id=imported.transcript_id,
@@ -599,11 +832,18 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(store.get_transcript_segments(imported.transcript_id)), 3)
                 self.assertEqual(len(store.get_transcript_syntheses(imported.transcript_id)), 1)
 
-                tombstoned = store.tombstone_transcript_on_takedown(
-                    imported.transcript_id,
-                    reason="Rights holder requested removal of caption track",
+                # Withdrawing the authorization attestation cascades takedown to linked transcripts
+                withdrawn_att = store.withdraw_transcript_attestation(
+                    att["attestation_id"],
+                    reason="Rights holder revoked caption storage authorization",
                     actor="rights_governance_officer",
                 )
+                self.assertEqual(withdrawn_att["verification_status"], "WITHDRAWN")
+                self.assertEqual(withdrawn_att["permits_transcript_storage"], 0)
+                self.assertEqual(withdrawn_att["permits_verbatim_excerpts"], 0)
+                self.assertEqual(withdrawn_att["permits_redistribution"], 0)
+
+                tombstoned = store.get_transcript(imported.transcript_id)
                 self.assertEqual(tombstoned["ingestion_state"], "WITHDRAWN_OR_TOMBSTONED")
                 self.assertEqual(
                     tombstoned["transcript_storage_status"], "TOMBSTONED_ON_TAKEDOWN"
@@ -611,6 +851,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(tombstoned["permits_transcript_storage"], 0)
                 self.assertEqual(tombstoned["permits_verbatim_excerpts"], 0)
                 self.assertEqual(tombstoned["permits_ai_synthesis"], 0)
+                self.assertEqual(tombstoned["permits_redistribution"], 0)
                 self.assertEqual(tombstoned["segment_count"], 0)
                 self.assertIsNone(tombstoned["latest_transcript_version_id"])
 
@@ -626,16 +867,55 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(seg_left, 0)
                 self.assertEqual(syn_left, 0)
 
-                # Confirm version row is marked TOMBSTONED and provenance event was recorded
+                # Confirm version row is marked TOMBSTONED and provenance events were recorded
                 versions = store.get_transcript_versions(imported.transcript_id)
                 self.assertEqual(versions[0]["status"], "TOMBSTONED")
                 prov = store.conn.execute(
-                    "SELECT * FROM provenance_events WHERE event_type = 'TRANSCRIPT_TOMBSTONED_ON_TAKEDOWN'"
+                    "SELECT * FROM provenance_events WHERE event_type = 'TRANSCRIPT_ATTESTATION_WITHDRAWN'"
                 ).fetchone()
                 self.assertIsNotNone(prov)
 
+                # Confirm a withdrawn attestation blocks any new transcript storage attempt
+                blocked_after_withdrawal = store.import_local_transcript_file(
+                    resource_id=res_id,
+                    transcript_path=SRT_FIXTURE,
+                    language_bcp47="fr",
+                    track_kind="TRANSLATION",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Attempt with withdrawn attestation",
+                    permits_transcript_storage=True,
+                    attestation_id=att["attestation_id"],
+                )
+                self.assertEqual(blocked_after_withdrawal.status, "blocked")
+                self.assertEqual(blocked_after_withdrawal.stored_segments, 0)
+
+                # Confirm an expired attestation blocks transcript storage
+                expired_att = self._create_open_license_attestation(
+                    store,
+                    res_id,
+                    language_bcp47="de",
+                    track_kind="TRANSLATION",
+                    expires_at="2020-01-01T00:00:00+00:00",
+                )
+                blocked_expired = store.import_local_transcript_file(
+                    resource_id=res_id,
+                    transcript_path=SRT_FIXTURE,
+                    language_bcp47="de",
+                    track_kind="TRANSLATION",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Attempt with expired attestation",
+                    permits_transcript_storage=True,
+                    attestation_id=expired_att["attestation_id"],
+                )
+                self.assertEqual(blocked_expired.status, "blocked")
+                self.assertEqual(blocked_expired.stored_segments, 0)
+                self.assertIn("expired", blocked_expired.reason.lower())
+
     def test_08_state_machine_and_cli_commands_work_offline(self):
-        # Verify state machine rejects invalid transitions
         validate_transcript_state_transition("DISCOVERED", "RIGHTS_PENDING")
         validate_transcript_state_transition("RIGHTS_PENDING", "READY_FOR_INGESTION")
         with self.assertRaises(ValueError):
@@ -643,12 +923,71 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_transcript_state_transition("WITHDRAWN_OR_TOMBSTONED", "INGESTED")
 
-        # Verify CLI commands: import-transcript, list-transcripts, show-transcript, withdraw-transcript, status
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "cli.sqlite"
             with init_db(db_path) as store:
                 res_id = self._seed_sample_resource(store)
 
+            # 1. Create attestation via CLI
+            att_buf = io.StringIO()
+            with contextlib.redirect_stdout(att_buf):
+                rc_att = knowledge_store.main(
+                    [
+                        "attest-transcript",
+                        "--db",
+                        str(db_path),
+                        "--resource-id",
+                        res_id,
+                        "--language",
+                        "en",
+                        "--track-kind",
+                        "PRIMARY",
+                        "--authorization-basis",
+                        "OPEN_LICENSE_VERIFIED",
+                        "--license-status",
+                        "VERIFIED_PERMISSIVE",
+                        "--license-spdx",
+                        "CC-BY-4.0",
+                        "--evidence-type",
+                        "CREATOR_LICENSE_PAGE",
+                        "--evidence-reference",
+                        "Verified 3B1B lesson page CC-BY-4.0 notice",
+                        "--evidence-url",
+                        "https://www.3blue1brown.com/lessons/synthetic-test-lecture",
+                        "--attribution",
+                        "CLI Test Attribution (CC-BY-4.0)",
+                        "--permit-storage",
+                        "--permit-verbatim-excerpts",
+                        "--permit-ai-synthesis",
+                        "--reviewed-by",
+                        "cli_test_curator",
+                        "--verification-status",
+                        "VERIFIED",
+                    ]
+                )
+            self.assertEqual(rc_att, 0)
+            att_out = att_buf.getvalue()
+            self.assertIn("Verification status:       VERIFIED", att_out)
+
+            att_id = compute_transcript_attestation_id(
+                res_id,
+                "OPEN_LICENSE_VERIFIED",
+                "CREATOR_LICENSE_PAGE",
+                "Verified 3B1B lesson page CC-BY-4.0 notice",
+                language_bcp47="en",
+                track_kind="PRIMARY",
+            )
+
+            # 2. List attestations via CLI
+            list_att_buf = io.StringIO()
+            with contextlib.redirect_stdout(list_att_buf):
+                rc_list_att = knowledge_store.main(
+                    ["list-transcript-attestations", "--db", str(db_path)]
+                )
+            self.assertEqual(rc_list_att, 0)
+            self.assertIn(att_id, list_att_buf.getvalue())
+
+            # 3. Import transcript via CLI referencing attestation
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 rc = knowledge_store.main(
@@ -676,6 +1015,8 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         "OPEN_LICENSE_VERIFIED",
                         "--attribution",
                         "CLI Test Attribution (CC-BY-4.0)",
+                        "--attestation-id",
+                        att_id,
                         "--permit-storage",
                         "--permit-verbatim-excerpts",
                     ]
@@ -683,8 +1024,8 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             output = buf.getvalue()
             self.assertIn("Status:                    imported", output)
+            self.assertIn(f"Attestation ID:            {att_id}", output)
             self.assertIn("Stored segments:           3", output)
-            # Ensure CLI output never dumps full transcript text
             self.assertNotIn("backpropagation", output)
 
             t_id = compute_transcript_id(res_id, "en", "PRIMARY")
@@ -702,35 +1043,38 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 )
             self.assertEqual(rc_show, 0)
             self.assertIn("Stored Segments:      3", show_buf.getvalue())
+            self.assertIn(att_id, show_buf.getvalue())
 
             withdraw_buf = io.StringIO()
             with contextlib.redirect_stdout(withdraw_buf):
                 rc_withdraw = knowledge_store.main(
                     [
-                        "withdraw-transcript",
+                        "withdraw-transcript-attestation",
                         "--db",
                         str(db_path),
-                        "--transcript-id",
-                        t_id,
+                        "--attestation-id",
+                        att_id,
                         "--reason",
-                        "CLI takedown test",
+                        "CLI attestation withdrawal test",
                     ]
                 )
             self.assertEqual(rc_withdraw, 0)
-            self.assertIn("state=WITHDRAWN_OR_TOMBSTONED", withdraw_buf.getvalue())
+            self.assertIn("status=WITHDRAWN", withdraw_buf.getvalue())
 
             status_buf = io.StringIO()
             with contextlib.redirect_stdout(status_buf):
                 rc_status = knowledge_store.main(["status", "--db", str(db_path)])
             self.assertEqual(rc_status, 0)
-            self.assertIn("Schema version: 6", status_buf.getvalue())
+            self.assertIn("Schema version: 7", status_buf.getvalue())
             self.assertIn("transcripts", status_buf.getvalue())
+            self.assertIn("transcript_authorization_attestations", status_buf.getvalue())
 
     def test_09_low_confidence_inaudible_markers_route_to_needs_review(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "needs_review.sqlite"
             with init_db(db_path) as store:
                 res_id = self._seed_sample_resource(store)
+                att = self._create_open_license_attestation(store, res_id)
                 vtt_with_inaudible = (
                     "WEBVTT\n\n"
                     "00:00:00.000 --> 00:00:05.000\n"
@@ -749,6 +1093,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     authorization_basis="OPEN_LICENSE_VERIFIED",
                     attribution_text="Inaudible Marker Test",
                     permits_transcript_storage=True,
+                    attestation_id=att["attestation_id"],
                 )
                 self.assertEqual(result.status, "imported")
                 self.assertEqual(result.ingestion_state, "NEEDS_REVIEW")
@@ -787,6 +1132,202 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 )
                 self.assertEqual(blocked["ingestion_state"], "BLOCKED_BY_POLICY")
                 self.assertEqual(blocked["transcript_storage_status"], "BLOCKED_NO_AUTHORIZATION")
+
+    def test_11_written_permission_attestation_and_granular_scope_enforcement(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "written_permission.sqlite"
+            with init_db(db_path) as store:
+                res_id = self._seed_sample_resource(store)
+
+                # Create a WRITTEN_PERMISSION attestation that grants storage + AI synthesis
+                # but forbids verbatim excerpts and redistribution, without needing a public license URL.
+                written_att = store.record_transcript_attestation(
+                    resource_id=res_id,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    authorization_basis="WRITTEN_PERMISSION",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx=None,
+                    evidence_type="WRITTEN_PERMISSION_RECORD",
+                    evidence_reference="2026-10-15 Signed Lecturer Email Permission #LP-2026-09",
+                    source_evidence_url=None,
+                    evidence_sha256=sha256_hex("signed-permission-email-digest"),
+                    attribution_text="Used by written permission of the lecturer (internal study only)",
+                    permits_metadata_indexing=True,
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=False,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=False,
+                    reviewed_by="rights_reviewer",
+                    review_notes="Internal storage & synthesis permitted; verbatim quoting and redistribution prohibited.",
+                    verification_status="VERIFIED",
+                )
+                self.assertEqual(written_att["verification_status"], "VERIFIED")
+                self.assertIsNone(written_att["source_evidence_url"])
+                self.assertEqual(written_att["permits_transcript_storage"], 1)
+                self.assertEqual(written_att["permits_verbatim_excerpts"], 0)
+                self.assertEqual(written_att["permits_redistribution"], 0)
+
+                # Attempting to import with permits_verbatim_excerpts=True or permits_redistribution=True
+                # beyond the attestation scope MUST fail closed.
+                exceeded_verbatim = store.import_local_transcript_file(
+                    resource_id=res_id,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    authorization_basis="WRITTEN_PERMISSION",
+                    attribution_text="Used by written permission",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    attestation_id=written_att["attestation_id"],
+                )
+                self.assertEqual(exceeded_verbatim.status, "blocked")
+                self.assertEqual(exceeded_verbatim.stored_segments, 0)
+                self.assertIn("permits_verbatim_excerpts", exceeded_verbatim.reason)
+
+                exceeded_redist = store.import_local_transcript_file(
+                    resource_id=res_id,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    authorization_basis="WRITTEN_PERMISSION",
+                    attribution_text="Used by written permission",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=False,
+                    permits_redistribution=True,
+                    attestation_id=written_att["attestation_id"],
+                )
+                self.assertEqual(exceeded_redist.status, "blocked")
+                self.assertEqual(exceeded_redist.stored_segments, 0)
+                self.assertIn("permits_redistribution", exceeded_redist.reason)
+
+                # Importing within the exact attested scope succeeds and preserves scope flags
+                valid_written = store.import_local_transcript_file(
+                    resource_id=res_id,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    authorization_basis="WRITTEN_PERMISSION",
+                    attribution_text="Used by written permission of the lecturer (internal study only)",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=False,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=False,
+                    attestation_id=written_att["attestation_id"],
+                )
+                self.assertEqual(valid_written.status, "imported")
+                self.assertTrue(valid_written.permits_transcript_storage)
+                self.assertFalse(valid_written.permits_verbatim_excerpts)
+                self.assertFalse(valid_written.permits_redistribution)
+                self.assertEqual(valid_written.stored_segments, 3)
+
+                # Attempting downstream verbatim excerpt quoting or redistribution fails closed
+                segments = store.get_transcript_segments(valid_written.transcript_id)
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(segments[0]["segment_id"])
+
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.export_transcript_for_redistribution(valid_written.transcript_id)
+
+                # Transformative AI synthesis IS permitted by the attestation
+                syn = store.record_transcript_synthesis(
+                    transcript_id=valid_written.transcript_id,
+                    synthesis_type="STRUCTURED_SUMMARY",
+                    generator_type="LLM_ASSISTED_CURATED",
+                    content_markdown="## Concept Notes\nOwn-words explanation of gradient clipping.",
+                )
+                self.assertTrue(syn["synthesis_id"].startswith("tsyn_"))
+
+    def test_12_cross_resource_and_track_mismatch_and_provenance_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "cross_resource.sqlite"
+            with init_db(db_path) as store:
+                res_a = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/resource-a",
+                    title="Resource A",
+                )
+                res_b = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/resource-b",
+                    title="Resource B",
+                )
+
+                att_a = self._create_open_license_attestation(
+                    store,
+                    res_a,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                )
+
+                # 1. Attestation for Resource A cannot authorize transcript storage for Resource B
+                mismatch_res = store.import_local_transcript_file(
+                    resource_id=res_b,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Cross-resource attempt",
+                    permits_transcript_storage=True,
+                    attestation_id=att_a["attestation_id"],
+                )
+                self.assertEqual(mismatch_res.status, "blocked")
+                self.assertEqual(mismatch_res.stored_segments, 0)
+                self.assertIn("resource_id mismatch", mismatch_res.reason)
+
+                # 2. Attestation scoped to language 'en' cannot authorize language 'fr'
+                mismatch_lang = store.import_local_transcript_file(
+                    resource_id=res_a,
+                    transcript_path=SRT_FIXTURE,
+                    language_bcp47="fr",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Language mismatch attempt",
+                    permits_transcript_storage=True,
+                    attestation_id=att_a["attestation_id"],
+                )
+                self.assertEqual(mismatch_lang.status, "blocked")
+                self.assertEqual(mismatch_lang.stored_segments, 0)
+                self.assertIn("language_bcp47 mismatch", mismatch_lang.reason)
+
+                # 3. Valid import on Resource A records authorization_attestation_id and policy outcome
+                # in provenance_events without storing full transcript text.
+                valid_a = store.import_local_transcript_file(
+                    resource_id=res_a,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Valid Resource A Import",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    attestation_id=att_a["attestation_id"],
+                )
+                self.assertEqual(valid_a.status, "imported")
+
+                events = store.list_provenance_events(resource_id=res_a)
+                imported_events = [
+                    e for e in events if e["event_type"] == "TRANSCRIPT_IMPORTED"
+                ]
+                self.assertEqual(len(imported_events), 1)
+                details = json.loads(imported_events[0]["details_json"])
+                self.assertEqual(
+                    details["authorization_attestation_id"], att_a["attestation_id"]
+                )
+                self.assertEqual(details["ingestion_state"], "INGESTED")
+                self.assertEqual(
+                    details["transcript_storage_status"], "STORED_TIMED_SEGMENTS"
+                )
+                self.assertNotIn("backpropagation", imported_events[0]["details_json"])
 
 
 if __name__ == "__main__":

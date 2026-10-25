@@ -30,7 +30,7 @@ class KnowledgeStoreTests(unittest.TestCase):
             with init_db(db_path) as store:
                 self.assertEqual(store.get_schema_version(), LATEST_SCHEMA_VERSION)
                 migrations = store.list_migrations()
-                self.assertEqual([m["version"] for m in migrations], [1, 2, 3, 4, 5, 6])
+                self.assertEqual([m["version"] for m in migrations], [1, 2, 3, 4, 5, 6, 7])
                 user_ver = store.conn.execute("PRAGMA user_version").fetchone()[0]
                 self.assertEqual(user_ver, LATEST_SCHEMA_VERSION)
                 fk_enabled = store.conn.execute("PRAGMA foreign_keys").fetchone()[0]

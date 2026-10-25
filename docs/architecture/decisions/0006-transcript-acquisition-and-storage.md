@@ -70,24 +70,31 @@ Every media or lecture resource evaluated for transcript ingestion must be class
    - Default fail-closed classification whenever captions do not exist, require third-party video-owner OAuth (`PLATFORM_API_OWNER_ONLY_RESTRICTION`), or are governed by restrictive/unresolved copyright (`ALL_RIGHTS_RESERVED` or `UNVERIFIED_REQUIRES_HUMAN_REVIEW`).
    - Records availability status, reason code, and provenance in `transcripts` (`permits_transcript_storage = 0`, `segment_count = 0`) while preserving parent `resources` metadata and outbound deep links (`canonical_url`).
 
-### 3.2 Mandatory Policy Gate State Machine
+### 3.2 Mandatory Policy Gate State Machine and Auditable Authorization Attestations
 
-Transcript ingestion is governed by a state machine (`DISCOVERED`, `TRANSCRIPT_AVAILABLE`, `POLICY_REVIEW_REQUIRED`, `READY_FOR_INGESTION`, `INGESTED`, `UNAVAILABLE`, `BLOCKED_BY_POLICY`, `FAILED_RETRYABLE`, `WITHDRAWN_OR_TOMBSTONED`) enforcing two non-bypassable invariants:
+Transcript ingestion is governed by a state machine (`DISCOVERED`, `TRANSCRIPT_AVAILABLE` / `RIGHTS_PENDING`, `POLICY_REVIEW_REQUIRED` / `NEEDS_REVIEW`, `READY_FOR_INGESTION`, `INGESTED`, `UNAVAILABLE` / `METADATA_ONLY_LINKED`, `BLOCKED_BY_POLICY`, `FAILED_RETRYABLE`, `WITHDRAWN_OR_TOMBSTONED`) enforcing three non-bypassable invariants:
 
 1. **Discovery Never Grants Acquisition Permission:** Discovering a media URL or reviewing a candidate in `discovered_link_candidates` (`fetch_permission_granted = 0`) never transitions directly to `READY_FOR_INGESTION` or triggers network caption fetching.
-2. **Retries Never Bypass the Policy Gate:** Any retry from `FAILED_RETRYABLE` transitions back to `TRANSCRIPT_AVAILABLE` and must re-execute the full policy gate (`validate_and_canonicalize_url`, `robots.txt` check, source circuit breaker, and license verification) before re-entering `READY_FOR_INGESTION`.
+2. **Caller-Supplied Permission Flags Require an Auditable Authorization Attestation:** The policy gate (`evaluate_transcript_storage_policy`) and local importers (`import_local_transcript`, `import_local_transcript_file`) never trust caller-supplied `permits_transcript_storage=True` or `--permits-storage` flags in isolation. Storing transcript text requires a `VERIFIED`, non-withdrawn, non-expired record in `transcript_authorization_attestations` (`tatt_*`, introduced in forward-only SQLite Migration `7`) matching the target `resource_id` (and `transcript_id`, `language_bcp47`, and `track_kind` when scoped) with concrete evidence (`evidence_type`, `evidence_reference`, `reviewed_by`, `reviewed_at`).
+3. **Granular Scope Separation (Storage vs. Verbatim Quoting vs. AI Synthesis vs. Redistribution):** Each authorization attestation and transcript record tracks four distinct operational permissions:
+   - `permits_transcript_storage`: Permission to persist `transcript_versions` and `transcript_segments` locally.
+   - `permits_verbatim_excerpts`: Permission to return verbatim quotes (`get_verbatim_transcript_excerpt`).
+   - `permits_ai_synthesis`: Permission to store transformative AI study notes (`record_transcript_synthesis`).
+   - `permits_redistribution`: Permission to export/redistribute full transcript text (`export_transcript_for_redistribution`).
+   Withdrawing an attestation (`withdraw_transcript_attestation`) immediately revokes active permissions and cascades `tombstone_transcript_on_takedown` to purge stored segments and syntheses while retaining provenance history.
+4. **Retries Never Bypass the Policy Gate:** Any retry from `FAILED_RETRYABLE` transitions back to `TRANSCRIPT_AVAILABLE` and must re-execute the full policy gate (`validate_and_canonicalize_url`, `robots.txt` check, source circuit breaker, and attestation verification) before re-entering `READY_FOR_INGESTION`.
 
 ### 3.3 Three-Layer Separation of Source, Normalized, and AI-Generated Text
 
 To prevent fabricated quotes and preserve primary-source integrity:
 
-1. **Original Transcript Material (`transcript_segments.original_segment_text`)**: Immutable verbatim cue text as published by the source (`VERBATIM_SOURCE_QUOTE`) or emitted by authorized ASR (`ASR_TRANSCRIBED_SOURCE`). Null whenever `permits_transcript_storage = 0`.
+1. **Original Transcript Material (`transcript_segments.original_segment_text`)**: Immutable verbatim cue text as published by the source (`VERBATIM_SOURCE_QUOTE`) or emitted by authorized ASR (`ASR_TRANSCRIBED_SOURCE`). Null/unpersisted whenever `permits_transcript_storage = 0`.
 2. **Normalized Transcript Text (`transcript_segments.normalized_segment_text`)**: Deterministic, non-LLM rule-normalized text (`normalizer_version = 'norm-v1.0'`) for search indexing, stored in a separate column with its own `normalized_text_sha256`.
-3. **AI-Generated Summaries & Explanations (`transcript_syntheses`)**: Stored in a dedicated table with `epistemic_status = 'GENERATED_INTERPRETATION'`, `agent_run_id`, `model_id`, `prompt_version`, `cited_segment_ids_json`, and deterministic grounding checks (`TV-07`, `TV-08`).
+3. **AI-Generated Summaries & Explanations (`transcript_syntheses`)**: Stored in a dedicated table with `epistemic_status = 'GENERATED_INTERPRETATION'`, `agent_run_id`, `model_id`, `prompt_version`, `cited_segment_ids_json`, and deterministic grounding checks (`TV-07`, `TV-08`), gated by `permits_ai_synthesis = 1`.
 
 ### 3.4 Local SQLite First, Cloud Storage & Cloud Run Deferred
 
-- **Initial Local Runtime:** All structured transcript tables (`transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, `transcript_segment_links`, planned as forward-only SQLite Migration `6` in a future implementation task) operate locally in `data/research_inventory.sqlite` on the Raspberry Pi with zero Firebase or Google Cloud dependency.
+- **Initial Local Runtime:** All structured transcript tables (`transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, `transcript_segment_links` in Migration `6`, plus `transcript_authorization_attestations` in Migration `7`) operate locally in SQLite on the Raspberry Pi with zero Firebase or Google Cloud dependency.
 - **Future Cloud Partition:** Raw caption files (`.vtt`, `.srt`, `.ttml`) and full ASR JSON payloads where `permits_transcript_storage = 1` will later reside in Google Cloud Storage (`gs://<unprovisioned-artifacts-bucket>/transcripts/...`) and be processed by the `ingestion-worker` Cloud Run Job only after a cloud provisioning plan is separately approved.
 
 ---

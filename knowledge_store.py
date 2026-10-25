@@ -42,7 +42,7 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_SEED_PATH = ROOT / "seed_urls.json"
 DEFAULT_DB_PATH = ROOT / "data" / "runtime" / "inventory.sqlite"
 
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 TRANSCRIPT_NORMALIZER_VERSION = "norm-v1.0"
 
 VALID_CANDIDATE_REVIEW_STATUSES: tuple[str, ...] = (
@@ -99,6 +99,7 @@ VALID_TRANSCRIPT_LICENSE_STATUSES: tuple[str, ...] = (
 )
 VALID_AUTHORIZATION_BASES: tuple[str, ...] = (
     "OPEN_LICENSE_VERIFIED",
+    "PUBLIC_DOMAIN_VERIFIED",
     "FIRST_PARTY_OWNED",
     "FIRST_PARTY_OWNED_MEDIA",
     "WRITTEN_PERMISSION",
@@ -108,10 +109,47 @@ VALID_AUTHORIZATION_BASES: tuple[str, ...] = (
 AUTHORIZED_STORAGE_BASES: frozenset[str] = frozenset(
     {
         "OPEN_LICENSE_VERIFIED",
+        "PUBLIC_DOMAIN_VERIFIED",
         "FIRST_PARTY_OWNED",
         "FIRST_PARTY_OWNED_MEDIA",
         "WRITTEN_PERMISSION",
         "WRITTEN_RIGHTS_HOLDER_PERMISSION",
+    }
+)
+VALID_ATTESTATION_EVIDENCE_TYPES: tuple[str, ...] = (
+    "SPDX_LICENSE_URL",
+    "OFFICIAL_RIGHTS_STATEMENT",
+    "WRITTEN_PERMISSION_REF",
+    "FIRST_PARTY_POLICY_REF",
+    "PUBLIC_DOMAIN_DEDICATION",
+    "OTHER_VERIFIABLE_EVIDENCE",
+    "CREATOR_LICENSE_PAGE",
+    "WRITTEN_PERMISSION_RECORD",
+    "PUBLIC_DOMAIN_DECLARATION",
+    "FIRST_PARTY_OWNERSHIP_RECORD",
+)
+VALID_ATTESTATION_VERIFICATION_STATUSES: tuple[str, ...] = (
+    "VERIFIED",
+    "PENDING_REVIEW",
+    "CONTRADICTORY",
+    "REJECTED",
+    "WITHDRAWN",
+    "EXPIRED",
+    "UNKNOWN",
+)
+PERMISSIVE_SPDX_IDENTIFIERS: frozenset[str] = frozenset(
+    {
+        "CC0-1.0",
+        "CC-BY-4.0",
+        "CC-BY-3.0",
+        "CC-BY-2.0",
+        "CC-BY-SA-4.0",
+        "CC-BY-SA-3.0",
+        "MIT",
+        "Apache-2.0",
+        "BSD-2-Clause",
+        "BSD-3-Clause",
+        "PUBLIC-DOMAIN",
     }
 )
 VALID_TRANSCRIPT_INGESTION_STATES: tuple[str, ...] = (
@@ -463,6 +501,42 @@ def compute_transcript_segment_link_id(
     return f"tslnk_{digest}"
 
 
+class TranscriptPolicyViolationError(PermissionError, ValueError):
+    """Raised when an operation attempts to store, quote, synthesize, or redistribute transcript content beyond attested authorization scope."""
+
+
+def compute_transcript_attestation_id(
+    resource_id: str,
+    authorization_basis: str,
+    evidence_type: str,
+    evidence_reference: str,
+    reviewed_by: str | None = None,
+    *,
+    transcript_id: str | None = None,
+    language_bcp47: str | None = None,
+    track_kind: str | None = None,
+) -> str:
+    """Compute deterministic transcript authorization attestation ID: `tatt_<sha256_16>`."""
+    if not resource_id or not isinstance(resource_id, str) or not resource_id.strip():
+        raise ValueError("resource_id must be a non-empty string")
+    lang_norm = validate_bcp47_language_tag(language_bcp47) if language_bcp47 else ""
+    kind_norm = (track_kind or "").strip().upper()
+    digest = sha256_hex(
+        "|".join(
+            [
+                resource_id.strip(),
+                (transcript_id or "").strip(),
+                lang_norm,
+                kind_norm,
+                (authorization_basis or "").strip().upper(),
+                (evidence_type or "").strip().upper(),
+                (evidence_reference or "").strip(),
+            ]
+        )
+    )[:16]
+    return f"tatt_{digest}"
+
+
 def compute_segment_deep_link_url(media_canonical_url: str, start_ms: int) -> str:
     """Compute deterministic timestamp deep link (`#t=<seconds>s`) for a media URL."""
     canonical = validate_and_canonicalize_url(media_canonical_url)
@@ -484,6 +558,70 @@ def validate_transcript_state_transition(previous_state: str, new_state: str) ->
             f"Invalid transcript ingestion_state transition: {previous_state!r} -> {new_state!r} "
             f"(allowed targets from {previous_state!r}: {sorted(allowed)})"
         )
+
+
+@dataclass
+class TranscriptAuthorizationAttestation:
+    """Structured, auditable authorization attestation for transcript rights and scope."""
+
+    attestation_id: str
+    resource_id: str
+    authorization_basis: str
+    license_status: str
+    evidence_type: str
+    evidence_reference: str
+    reviewed_by: str
+    reviewed_at: str
+    verification_status: str = "VERIFIED"
+    transcript_id: str | None = None
+    language_bcp47: str | None = None
+    track_kind: str | None = None
+    license_spdx: str | None = None
+    evidence_url: str | None = None
+    evidence_sha256: str | None = None
+    permits_metadata_indexing: bool = True
+    permits_transcript_storage: bool = False
+    permits_verbatim_excerpts: bool = False
+    permits_ai_synthesis: bool = True
+    permits_redistribution: bool = False
+    review_notes: str | None = None
+    expires_at: str | None = None
+    withdrawn_at: str | None = None
+    withdrawn_by: str | None = None
+    withdrawal_reason: str | None = None
+    revision_number: int = 1
+    provenance_event_id: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attestation_id": self.attestation_id,
+            "resource_id": self.resource_id,
+            "transcript_id": self.transcript_id,
+            "language_bcp47": self.language_bcp47,
+            "track_kind": self.track_kind,
+            "authorization_basis": self.authorization_basis,
+            "license_status": self.license_status,
+            "license_spdx": self.license_spdx,
+            "evidence_type": self.evidence_type,
+            "evidence_reference": self.evidence_reference,
+            "evidence_url": self.evidence_url,
+            "evidence_sha256": self.evidence_sha256,
+            "permits_metadata_indexing": int(bool(self.permits_metadata_indexing)),
+            "permits_transcript_storage": int(bool(self.permits_transcript_storage)),
+            "permits_verbatim_excerpts": int(bool(self.permits_verbatim_excerpts)),
+            "permits_ai_synthesis": int(bool(self.permits_ai_synthesis)),
+            "permits_redistribution": int(bool(self.permits_redistribution)),
+            "reviewed_by": self.reviewed_by,
+            "reviewed_at": self.reviewed_at,
+            "verification_status": self.verification_status,
+            "review_notes": self.review_notes,
+            "expires_at": self.expires_at,
+            "withdrawn_at": self.withdrawn_at,
+            "withdrawn_by": self.withdrawn_by,
+            "withdrawal_reason": self.withdrawal_reason,
+            "revision_number": self.revision_number,
+            "provenance_event_id": self.provenance_event_id,
+        }
 
 
 @dataclass
@@ -513,6 +651,9 @@ class TranscriptPolicyDecision:
     ingestion_state: str
     transcript_storage_status: str
     block_or_review_reason: str | None = None
+    permits_redistribution: bool = False
+    permits_metadata_indexing: bool = True
+    authorization_attestation_id: str | None = None
 
 
 @dataclass
@@ -534,21 +675,110 @@ class TranscriptImportResult:
     stored_segments: int = 0
     reason: str | None = None
     provenance_event_id: str | None = None
+    authorization_attestation_id: str | None = None
+    permits_redistribution: bool = False
+
+
+def _is_iso_timestamp_expired(expires_at: str | None, now_iso: str | None = None) -> bool:
+    """Return True if `expires_at` is non-empty and earlier than or equal to `now_iso`."""
+    if not expires_at or not str(expires_at).strip():
+        return False
+    ref_str = (now_iso or utc_now()).strip()
+    exp_str = str(expires_at).strip()
+    try:
+        exp_dt = datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
+        ref_dt = datetime.fromisoformat(ref_str.replace("Z", "+00:00"))
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if ref_dt.tzinfo is None:
+            ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+        return exp_dt <= ref_dt
+    except ValueError:
+        return exp_str <= ref_str
+
+
+def _detect_attestation_contradictions(
+    *,
+    authorization_basis: str,
+    license_status: str,
+    license_spdx: str | None,
+    evidence_type: str,
+    evidence_reference: str,
+    permits_metadata_indexing: bool,
+    permits_transcript_storage: bool,
+    permits_verbatim_excerpts: bool,
+    permits_redistribution: bool,
+) -> list[str]:
+    """Return a list of contradiction or missing-evidence reasons for an attestation record."""
+    issues: list[str] = []
+    if not evidence_reference or not str(evidence_reference).strip():
+        issues.append("Attestation evidence_reference is empty.")
+    if permits_transcript_storage:
+        if not permits_metadata_indexing:
+            issues.append(
+                "Contradictory attestation scope: permits_transcript_storage=1 requires permits_metadata_indexing=1."
+            )
+        if license_status != "VERIFIED_PERMISSIVE":
+            issues.append(
+                f"Contradictory attestation: permits_transcript_storage=1 conflicts with license_status={license_status!r}."
+            )
+        if authorization_basis not in AUTHORIZED_STORAGE_BASES:
+            issues.append(
+                f"Contradictory attestation: permits_transcript_storage=1 conflicts with authorization_basis={authorization_basis!r}."
+            )
+        if authorization_basis == "OPEN_LICENSE_VERIFIED" and not (
+            license_spdx and str(license_spdx).strip()
+        ):
+            issues.append(
+                "Contradictory attestation: authorization_basis='OPEN_LICENSE_VERIFIED' requires a non-empty license_spdx."
+            )
+    else:
+        if permits_verbatim_excerpts:
+            issues.append(
+                "Contradictory attestation scope: permits_verbatim_excerpts=1 cannot be granted when permits_transcript_storage=0."
+            )
+        if permits_redistribution:
+            issues.append(
+                "Contradictory attestation scope: permits_redistribution=1 cannot be granted when permits_transcript_storage=0."
+            )
+    if (
+        authorization_basis in ("OPEN_LICENSE_VERIFIED", "PUBLIC_DOMAIN_VERIFIED")
+        and license_status in ("ALL_RIGHTS_RESERVED", "RESTRICTED_PROPRIETARY")
+    ):
+        issues.append(
+            f"Contradictory attestation: authorization_basis={authorization_basis!r} conflicts with license_status={license_status!r}."
+        )
+    if (
+        license_spdx
+        and str(license_spdx).strip().upper() in {s.upper() for s in PERMISSIVE_SPDX_IDENTIFIERS}
+        and license_status in ("ALL_RIGHTS_RESERVED", "RESTRICTED_PROPRIETARY")
+    ):
+        issues.append(
+            f"Contradictory attestation: permissive license_spdx={license_spdx!r} conflicts with license_status={license_status!r}."
+        )
+    return issues
 
 
 def evaluate_transcript_storage_policy(
     *,
     resource_row: dict[str, Any],
     acquisition_method: str,
-    license_status: str,
-    license_spdx: str | None,
-    authorization_basis: str,
+    license_status: str = "UNKNOWN",
+    license_spdx: str | None = None,
+    authorization_basis: str = "NONE",
     attribution_text: str,
     requested_transcript_storage: bool,
     requested_verbatim_excerpts: bool,
     requested_ai_synthesis: bool = True,
+    requested_redistribution: bool = False,
+    attestation: dict[str, Any] | TranscriptAuthorizationAttestation | None = None,
+    requested_attestation_id: str | None = None,
+    expected_transcript_id: str | None = None,
+    expected_language_bcp47: str | None = None,
+    expected_track_kind: str | None = None,
+    now_iso: str | None = None,
 ) -> TranscriptPolicyDecision:
-    """Evaluate the mandatory 4-part conjunctive transcript policy gate (ARCH-TRANSCRIPT-007 §2)."""
+    """Evaluate the mandatory conjunctive transcript policy gate with auditable authorization attestation (ARCH-TRANSCRIPT-007 §2)."""
     if acquisition_method not in VALID_TRANSCRIPT_ACQUISITION_METHODS:
         raise ValueError(f"Invalid acquisition_method: {acquisition_method!r}")
     if license_status not in VALID_TRANSCRIPT_LICENSE_STATUSES:
@@ -558,40 +788,228 @@ def evaluate_transcript_storage_policy(
     if not isinstance(attribution_text, str) or not attribution_text.strip():
         raise ValueError("attribution_text must be a non-empty string")
 
+    att_dict: dict[str, Any] | None = None
+    if isinstance(attestation, TranscriptAuthorizationAttestation):
+        att_dict = attestation.to_dict()
+    elif isinstance(attestation, dict):
+        att_dict = dict(attestation)
+
     if resource_row.get("collection_decision") == "REJECTED":
         return TranscriptPolicyDecision(
             permits_transcript_storage=False,
             permits_verbatim_excerpts=False,
             permits_ai_synthesis=False,
+            permits_redistribution=False,
+            permits_metadata_indexing=False,
             ingestion_state="BLOCKED_BY_POLICY",
             transcript_storage_status="BLOCKED_NO_AUTHORIZATION",
             block_or_review_reason="Parent resource collection_decision is REJECTED.",
+            authorization_attestation_id=att_dict.get("attestation_id") if att_dict else requested_attestation_id,
         )
 
+    target_resource_id = str(resource_row.get("resource_id") or "")
+
+    # If an attestation is supplied, validate resource/transcript/language/track binding and lifecycle first
+    att_errors: list[str] = []
+    att_id: str | None = requested_attestation_id
+    if att_dict is not None:
+        att_id = str(att_dict.get("attestation_id") or "") or requested_attestation_id
+        att_resource_id = str(att_dict.get("resource_id") or "")
+        if att_resource_id != target_resource_id:
+            att_errors.append(
+                f"Attestation {att_id!r} belongs to resource {att_resource_id!r} and cannot authorize resource {target_resource_id!r} (resource_id mismatch)."
+            )
+        att_tr_id = att_dict.get("transcript_id")
+        if att_tr_id and expected_transcript_id and str(att_tr_id) != str(expected_transcript_id):
+            att_errors.append(
+                f"Attestation {att_id!r} is scoped to transcript_id {att_tr_id!r}, not {expected_transcript_id!r} (transcript_id mismatch)."
+            )
+        att_lang = att_dict.get("language_bcp47")
+        if att_lang and expected_language_bcp47:
+            if validate_bcp47_language_tag(str(att_lang)) != validate_bcp47_language_tag(str(expected_language_bcp47)):
+                att_errors.append(
+                    f"Attestation {att_id!r} is scoped to language {att_lang!r}, not {expected_language_bcp47!r} (language_bcp47 mismatch)."
+                )
+        att_kind = att_dict.get("track_kind")
+        if att_kind and expected_track_kind:
+            if str(att_kind).strip().upper() != str(expected_track_kind).strip().upper():
+                att_errors.append(
+                    f"Attestation {att_id!r} is scoped to track_kind {att_kind!r}, not {expected_track_kind!r} (track_kind mismatch)."
+                )
+        ver_status = str(att_dict.get("verification_status") or "UNKNOWN").upper()
+        if att_dict.get("withdrawn_at") or ver_status == "WITHDRAWN":
+            att_errors.append(
+                f"Attestation {att_id!r} has been WITHDRAWN ({att_dict.get('withdrawal_reason') or 'revoked'})."
+            )
+        if ver_status == "EXPIRED" or _is_iso_timestamp_expired(att_dict.get("expires_at"), now_iso=now_iso):
+            att_errors.append(
+                f"Attestation {att_id!r} is EXPIRED (expires_at={att_dict.get('expires_at')!r})."
+            )
+        if ver_status != "VERIFIED" and ver_status not in ("WITHDRAWN", "EXPIRED"):
+            att_errors.append(
+                f"Attestation {att_id!r} verification_status is {ver_status!r} (requires 'VERIFIED')."
+            )
+        reviewed_by = str(att_dict.get("reviewed_by") or "").strip()
+        reviewed_at = str(att_dict.get("reviewed_at") or "").strip()
+        if not reviewed_by or not reviewed_at:
+            att_errors.append("Attestation is missing required reviewed_by or reviewed_at metadata.")
+
+        contradictions = _detect_attestation_contradictions(
+            authorization_basis=str(att_dict.get("authorization_basis") or "NONE"),
+            license_status=str(att_dict.get("license_status") or "UNKNOWN"),
+            license_spdx=att_dict.get("license_spdx"),
+            evidence_type=str(att_dict.get("evidence_type") or ""),
+            evidence_reference=str(att_dict.get("evidence_reference") or ""),
+            permits_metadata_indexing=bool(att_dict.get("permits_metadata_indexing", 1)),
+            permits_transcript_storage=bool(att_dict.get("permits_transcript_storage", 0)),
+            permits_verbatim_excerpts=bool(att_dict.get("permits_verbatim_excerpts", 0)),
+            permits_redistribution=bool(att_dict.get("permits_redistribution", 0)),
+        )
+        att_errors.extend(contradictions)
+
+        # Check for contradictions between explicit caller parameters and the attestation record
+        att_basis = str(att_dict.get("authorization_basis") or "NONE")
+        if authorization_basis != "NONE" and authorization_basis != att_basis:
+            att_errors.append(
+                f"Contradictory authorization_basis: caller specified {authorization_basis!r} but attestation {att_id!r} specifies {att_basis!r}."
+            )
+        att_lic_status = str(att_dict.get("license_status") or "UNKNOWN")
+        if license_status != "UNKNOWN" and license_status != att_lic_status:
+            att_errors.append(
+                f"Contradictory license_status: caller specified {license_status!r} but attestation {att_id!r} specifies {att_lic_status!r}."
+            )
+        att_spdx = (att_dict.get("license_spdx") or "").strip()
+        caller_spdx = (license_spdx or "").strip()
+        if caller_spdx and att_spdx and caller_spdx.upper() != att_spdx.upper():
+            att_errors.append(
+                f"Contradictory license_spdx: caller specified {caller_spdx!r} but attestation {att_id!r} specifies {att_spdx!r}."
+            )
+
+    effective_license_status = (
+        str(att_dict.get("license_status") or "UNKNOWN")
+        if (att_dict is not None and license_status == "UNKNOWN")
+        else license_status
+    )
+    effective_authorization_basis = (
+        str(att_dict.get("authorization_basis") or "NONE")
+        if (att_dict is not None and authorization_basis == "NONE")
+        else authorization_basis
+    )
+    effective_license_spdx = (
+        (att_dict.get("license_spdx") or None)
+        if (att_dict is not None and not license_spdx)
+        else license_spdx
+    )
+
     if acquisition_method == "METADATA_AND_LINK_ONLY":
+        if requested_attestation_id and att_dict is None:
+            return TranscriptPolicyDecision(
+                permits_transcript_storage=False,
+                permits_verbatim_excerpts=False,
+                permits_ai_synthesis=False,
+                permits_redistribution=False,
+                permits_metadata_indexing=False,
+                ingestion_state="BLOCKED_BY_POLICY",
+                transcript_storage_status="BLOCKED_NO_AUTHORIZATION",
+                block_or_review_reason=f"Referenced transcript authorization attestation {requested_attestation_id!r} was not found.",
+                authorization_attestation_id=None,
+            )
+        if att_dict is not None and (att_errors or not bool(att_dict.get("permits_metadata_indexing", 1))):
+            err_msg = " ".join(att_errors) if att_errors else "Attestation does not permit metadata indexing."
+            return TranscriptPolicyDecision(
+                permits_transcript_storage=False,
+                permits_verbatim_excerpts=False,
+                permits_ai_synthesis=False,
+                permits_redistribution=False,
+                permits_metadata_indexing=False,
+                ingestion_state="BLOCKED_BY_POLICY",
+                transcript_storage_status="BLOCKED_NO_AUTHORIZATION",
+                block_or_review_reason=err_msg,
+                authorization_attestation_id=att_id if att_dict is not None else None,
+            )
         return TranscriptPolicyDecision(
             permits_transcript_storage=False,
             permits_verbatim_excerpts=False,
-            permits_ai_synthesis=bool(requested_ai_synthesis),
+            permits_ai_synthesis=bool(
+                requested_ai_synthesis
+                and (att_dict is None or bool(att_dict.get("permits_ai_synthesis", 1)))
+            ),
+            permits_redistribution=False,
+            permits_metadata_indexing=True,
             ingestion_state="METADATA_ONLY_LINKED",
             transcript_storage_status="METADATA_AND_LINK_ONLY",
             block_or_review_reason=(
                 "Metadata and deep-link only mode; transcript text storage is disabled."
             ),
+            authorization_attestation_id=att_id if att_dict is not None else None,
+        )
+
+    # If a valid, verified attestation grants ONLY metadata indexing (`permits_metadata_indexing=1`,
+    # `permits_transcript_storage=0`) and the caller did NOT demand `requested_transcript_storage=True`
+    # (nor verbatim excerpts / redistribution), allow metadata-only registration while blocking text storage.
+    if (
+        att_dict is not None
+        and not att_errors
+        and bool(att_dict.get("permits_metadata_indexing", 1))
+        and not bool(att_dict.get("permits_transcript_storage", 0))
+        and not requested_transcript_storage
+        and not requested_verbatim_excerpts
+        and not requested_redistribution
+    ):
+        return TranscriptPolicyDecision(
+            permits_transcript_storage=False,
+            permits_verbatim_excerpts=False,
+            permits_ai_synthesis=bool(
+                requested_ai_synthesis and bool(att_dict.get("permits_ai_synthesis", 1))
+            ),
+            permits_redistribution=False,
+            permits_metadata_indexing=True,
+            ingestion_state="METADATA_ONLY_LINKED",
+            transcript_storage_status="METADATA_AND_LINK_ONLY",
+            block_or_review_reason=(
+                f"Attestation {att_id!r} permits metadata indexing only; transcript text storage is disabled."
+            ),
+            authorization_attestation_id=att_id,
         )
 
     reasons: list[str] = []
+    if att_dict is None:
+        if requested_attestation_id:
+            reasons.append(
+                f"Referenced transcript authorization attestation {requested_attestation_id!r} was not found."
+            )
+        else:
+            reasons.append(
+                "Missing auditable authorization attestation: caller-supplied flags alone cannot authorize transcript storage."
+            )
+    else:
+        reasons.extend(att_errors)
+        if not bool(att_dict.get("permits_transcript_storage", 0)):
+            reasons.append(
+                f"Attestation {att_id!r} does not grant permits_transcript_storage (metadata-only or storage disallowed)."
+            )
+        if requested_verbatim_excerpts and not bool(att_dict.get("permits_verbatim_excerpts", 0)):
+            reasons.append(
+                f"Requested permits_verbatim_excerpts=True exceeds attestation {att_id!r} scope (permits_verbatim_excerpts=0)."
+            )
+        if requested_redistribution and not bool(att_dict.get("permits_redistribution", 0)):
+            reasons.append(
+                f"Requested permits_redistribution=True exceeds attestation {att_id!r} scope (permits_redistribution=0)."
+            )
+
     if not requested_transcript_storage:
-        reasons.append("Explicit permits_transcript_storage attestation was not granted.")
-    if license_status != "VERIFIED_PERMISSIVE":
+        reasons.append("Explicit permits_transcript_storage flag was not requested.")
+    if effective_license_status != "VERIFIED_PERMISSIVE":
         reasons.append(
-            f"Transcript license_status is {license_status!r} (requires 'VERIFIED_PERMISSIVE')."
+            f"Transcript license_status is {effective_license_status!r} (requires 'VERIFIED_PERMISSIVE')."
         )
-    if authorization_basis not in AUTHORIZED_STORAGE_BASES:
+    if effective_authorization_basis not in AUTHORIZED_STORAGE_BASES:
         reasons.append(
-            f"Transcript authorization_basis is {authorization_basis!r} (requires verified open license, first-party ownership, or written permission)."
+            f"Transcript authorization_basis is {effective_authorization_basis!r} (requires verified open license, public domain, first-party ownership, or written permission)."
         )
-    if authorization_basis == "OPEN_LICENSE_VERIFIED" and not (license_spdx and license_spdx.strip()):
+    if effective_authorization_basis == "OPEN_LICENSE_VERIFIED" and not (
+        effective_license_spdx and str(effective_license_spdx).strip()
+    ):
         reasons.append(
             "authorization_basis 'OPEN_LICENSE_VERIFIED' requires a non-empty license_spdx identifier."
         )
@@ -600,19 +1018,40 @@ def evaluate_transcript_storage_policy(
         return TranscriptPolicyDecision(
             permits_transcript_storage=False,
             permits_verbatim_excerpts=False,
-            permits_ai_synthesis=bool(requested_ai_synthesis),
+            permits_ai_synthesis=bool(
+                requested_ai_synthesis
+                and (att_dict is not None and not att_errors and bool(att_dict.get("permits_ai_synthesis", 0)))
+            ),
+            permits_redistribution=False,
+            permits_metadata_indexing=bool(
+                att_dict is not None and not att_errors and bool(att_dict.get("permits_metadata_indexing", 1))
+            ),
             ingestion_state="BLOCKED_BY_POLICY",
             transcript_storage_status="BLOCKED_NO_AUTHORIZATION",
             block_or_review_reason=" ".join(reasons),
+            authorization_attestation_id=att_id if att_dict is not None else None,
         )
 
+    assert att_dict is not None
+    effective_excerpts = bool(
+        requested_verbatim_excerpts and bool(att_dict.get("permits_verbatim_excerpts", 0))
+    )
+    effective_synthesis = bool(
+        requested_ai_synthesis and bool(att_dict.get("permits_ai_synthesis", 1))
+    )
+    effective_redistribution = bool(
+        requested_redistribution and bool(att_dict.get("permits_redistribution", 0))
+    )
     return TranscriptPolicyDecision(
         permits_transcript_storage=True,
-        permits_verbatim_excerpts=bool(requested_verbatim_excerpts),
-        permits_ai_synthesis=bool(requested_ai_synthesis),
+        permits_verbatim_excerpts=effective_excerpts,
+        permits_ai_synthesis=effective_synthesis,
+        permits_redistribution=effective_redistribution,
+        permits_metadata_indexing=True,
         ingestion_state="READY_FOR_INGESTION",
         transcript_storage_status="NOT_STORED",
         block_or_review_reason=None,
+        authorization_attestation_id=att_id,
     )
 
 
@@ -2289,6 +2728,347 @@ def _migration_6_transcripts_and_segments(conn: sqlite3.Connection) -> None:
     conn.executescript(TRANSCRIPTS_AND_SEGMENTS_V6_SQL)
 
 
+TRANSCRIPT_AUTHORIZATION_ATTESTATIONS_V7_SQL = """
+CREATE TABLE IF NOT EXISTS transcript_authorization_attestations (
+    attestation_id              TEXT PRIMARY KEY,
+    resource_id                 TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+    transcript_id               TEXT REFERENCES transcripts(transcript_id) ON DELETE SET NULL,
+    language_bcp47              TEXT,
+    track_kind                  TEXT CHECK (
+                                    track_kind IS NULL OR track_kind IN (
+                                        'PRIMARY',
+                                        'TRANSLATION',
+                                        'DESCRIPTIVE_AUDIO_TEXT'
+                                    )
+                                ),
+    authorization_basis         TEXT NOT NULL CHECK (
+                                    authorization_basis IN (
+                                        'OPEN_LICENSE_VERIFIED',
+                                        'PUBLIC_DOMAIN_VERIFIED',
+                                        'FIRST_PARTY_OWNED',
+                                        'FIRST_PARTY_OWNED_MEDIA',
+                                        'WRITTEN_PERMISSION',
+                                        'WRITTEN_RIGHTS_HOLDER_PERMISSION',
+                                        'NONE'
+                                    )
+                                ),
+    license_status              TEXT NOT NULL DEFAULT 'UNKNOWN' CHECK (
+                                    license_status IN (
+                                        'VERIFIED_PERMISSIVE',
+                                        'ALL_RIGHTS_RESERVED',
+                                        'UNKNOWN',
+                                        'RESTRICTED_PROPRIETARY'
+                                    )
+                                ),
+    license_spdx                TEXT,
+    evidence_type               TEXT NOT NULL CHECK (
+                                    evidence_type IN (
+                                        'SPDX_LICENSE_URL',
+                                        'OFFICIAL_RIGHTS_STATEMENT',
+                                        'WRITTEN_PERMISSION_REF',
+                                        'FIRST_PARTY_POLICY_REF',
+                                        'PUBLIC_DOMAIN_DEDICATION',
+                                        'OTHER_VERIFIABLE_EVIDENCE',
+                                        'CREATOR_LICENSE_PAGE',
+                                        'WRITTEN_PERMISSION_RECORD',
+                                        'PUBLIC_DOMAIN_DECLARATION',
+                                        'FIRST_PARTY_OWNERSHIP_RECORD'
+                                    )
+                                ),
+    evidence_reference          TEXT NOT NULL CHECK (TRIM(evidence_reference) != ''),
+    evidence_url                TEXT,
+    evidence_sha256             TEXT CHECK (evidence_sha256 IS NULL OR length(evidence_sha256) = 64),
+    permits_metadata_indexing   INTEGER NOT NULL DEFAULT 1 CHECK (permits_metadata_indexing IN (0, 1)),
+    permits_transcript_storage  INTEGER NOT NULL DEFAULT 0 CHECK (permits_transcript_storage IN (0, 1)),
+    permits_verbatim_excerpts   INTEGER NOT NULL DEFAULT 0 CHECK (permits_verbatim_excerpts IN (0, 1)),
+    permits_ai_synthesis        INTEGER NOT NULL DEFAULT 0 CHECK (permits_ai_synthesis IN (0, 1)),
+    permits_redistribution      INTEGER NOT NULL DEFAULT 0 CHECK (permits_redistribution IN (0, 1)),
+    reviewed_by                 TEXT NOT NULL CHECK (TRIM(reviewed_by) != ''),
+    reviewed_at                 TEXT NOT NULL,
+    verification_status         TEXT NOT NULL DEFAULT 'PENDING_REVIEW' CHECK (
+                                    verification_status IN (
+                                        'VERIFIED',
+                                        'PENDING_REVIEW',
+                                        'CONTRADICTORY',
+                                        'REJECTED',
+                                        'WITHDRAWN',
+                                        'EXPIRED',
+                                        'UNKNOWN'
+                                    )
+                                ),
+    review_notes                TEXT,
+    expires_at                  TEXT,
+    withdrawn_at                TEXT,
+    withdrawn_by                TEXT,
+    withdrawal_reason           TEXT,
+    revision_number             INTEGER NOT NULL DEFAULT 1 CHECK (revision_number >= 1),
+    provenance_event_id         TEXT REFERENCES provenance_events(event_id) ON DELETE SET NULL,
+    created_at                  TEXT NOT NULL,
+    updated_at                  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transcript_attestations_resource
+    ON transcript_authorization_attestations(resource_id, verification_status);
+CREATE INDEX IF NOT EXISTS idx_transcript_attestations_transcript
+    ON transcript_authorization_attestations(transcript_id);
+"""
+
+TRANSCRIPT_AUTHORIZATION_ATTESTATIONS_V7_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS trg_transcript_attestations_prevent_delete
+BEFORE DELETE ON transcript_authorization_attestations
+BEGIN
+    SELECT RAISE(ABORT, 'Audit violation: transcript_authorization_attestations rows cannot be deleted; use WITHDRAWN status instead');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_transcript_attestations_verified_gate_insert
+BEFORE INSERT ON transcript_authorization_attestations
+BEGIN
+    SELECT CASE
+        WHEN NEW.verification_status = 'VERIFIED'
+          AND NEW.permits_transcript_storage = 1
+          AND (
+              NEW.license_status != 'VERIFIED_PERMISSIVE'
+              OR NEW.authorization_basis = 'NONE'
+              OR (NEW.authorization_basis = 'OPEN_LICENSE_VERIFIED' AND (NEW.license_spdx IS NULL OR TRIM(NEW.license_spdx) = ''))
+              OR NEW.withdrawn_at IS NOT NULL
+          )
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation granting transcript storage requires VERIFIED_PERMISSIVE license, valid authorization_basis, and non-withdrawn status')
+        WHEN NEW.verification_status = 'VERIFIED'
+          AND NEW.permits_transcript_storage = 0
+          AND (NEW.permits_verbatim_excerpts = 1 OR NEW.permits_redistribution = 1)
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation cannot grant verbatim excerpts or redistribution when permits_transcript_storage is 0')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_transcript_attestations_verified_gate_update
+BEFORE UPDATE ON transcript_authorization_attestations
+BEGIN
+    SELECT CASE
+        WHEN NEW.verification_status = 'VERIFIED'
+          AND NEW.permits_transcript_storage = 1
+          AND (
+              NEW.license_status != 'VERIFIED_PERMISSIVE'
+              OR NEW.authorization_basis = 'NONE'
+              OR (NEW.authorization_basis = 'OPEN_LICENSE_VERIFIED' AND (NEW.license_spdx IS NULL OR TRIM(NEW.license_spdx) = ''))
+              OR NEW.withdrawn_at IS NOT NULL
+          )
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation granting transcript storage requires VERIFIED_PERMISSIVE license, valid authorization_basis, and non-withdrawn status')
+        WHEN NEW.verification_status = 'VERIFIED'
+          AND NEW.permits_transcript_storage = 0
+          AND (NEW.permits_verbatim_excerpts = 1 OR NEW.permits_redistribution = 1)
+        THEN RAISE(ABORT, 'Policy violation: VERIFIED attestation cannot grant verbatim excerpts or redistribution when permits_transcript_storage is 0')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_transcripts_require_attestation_insert
+BEFORE INSERT ON transcripts
+BEGIN
+    SELECT CASE
+        WHEN NEW.permits_transcript_storage = 1
+          AND (
+              NEW.authorization_attestation_id IS NULL
+              OR NOT EXISTS (
+                  SELECT 1
+                    FROM transcript_authorization_attestations a
+                   WHERE a.attestation_id = NEW.authorization_attestation_id
+                     AND a.resource_id = NEW.resource_id
+                     AND (a.transcript_id IS NULL OR a.transcript_id = NEW.transcript_id)
+                     AND (a.language_bcp47 IS NULL OR a.language_bcp47 = NEW.language_bcp47)
+                     AND (a.track_kind IS NULL OR a.track_kind = NEW.track_kind)
+                     AND a.verification_status = 'VERIFIED'
+                     AND a.withdrawn_at IS NULL
+                     AND a.permits_transcript_storage = 1
+                     AND (NEW.permits_verbatim_excerpts = 0 OR a.permits_verbatim_excerpts = 1)
+                     AND (NEW.permits_redistribution = 0 OR a.permits_redistribution = 1)
+              )
+          )
+        THEN RAISE(ABORT, 'Policy violation: transcripts.permits_transcript_storage=1 requires a VERIFIED, non-withdrawn transcript_authorization_attestations record matching resource_id and requested scope')
+        WHEN NEW.permits_transcript_storage = 0
+          AND (NEW.permits_verbatim_excerpts = 1 OR NEW.permits_redistribution = 1)
+        THEN RAISE(ABORT, 'Policy violation: cannot enable verbatim excerpts or redistribution when permits_transcript_storage is 0')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_transcripts_require_attestation_update
+BEFORE UPDATE ON transcripts
+BEGIN
+    SELECT CASE
+        WHEN NEW.permits_transcript_storage = 1
+          AND (
+              NEW.authorization_attestation_id IS NULL
+              OR NOT EXISTS (
+                  SELECT 1
+                    FROM transcript_authorization_attestations a
+                   WHERE a.attestation_id = NEW.authorization_attestation_id
+                     AND a.resource_id = NEW.resource_id
+                     AND (a.transcript_id IS NULL OR a.transcript_id = NEW.transcript_id)
+                     AND (a.language_bcp47 IS NULL OR a.language_bcp47 = NEW.language_bcp47)
+                     AND (a.track_kind IS NULL OR a.track_kind = NEW.track_kind)
+                     AND a.verification_status = 'VERIFIED'
+                     AND a.withdrawn_at IS NULL
+                     AND a.permits_transcript_storage = 1
+                     AND (NEW.permits_verbatim_excerpts = 0 OR a.permits_verbatim_excerpts = 1)
+                     AND (NEW.permits_redistribution = 0 OR a.permits_redistribution = 1)
+              )
+          )
+        THEN RAISE(ABORT, 'Policy violation: transcripts.permits_transcript_storage=1 requires a VERIFIED, non-withdrawn transcript_authorization_attestations record matching resource_id and requested scope')
+        WHEN NEW.permits_transcript_storage = 0
+          AND (NEW.permits_verbatim_excerpts = 1 OR NEW.permits_redistribution = 1)
+        THEN RAISE(ABORT, 'Policy violation: cannot enable verbatim excerpts or redistribution when permits_transcript_storage is 0')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_transcript_versions_require_verified_attestation_insert
+BEFORE INSERT ON transcript_versions
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+              JOIN transcript_authorization_attestations a
+                ON a.attestation_id = t.authorization_attestation_id
+             WHERE t.transcript_id = NEW.transcript_id
+               AND t.permits_transcript_storage = 1
+               AND a.resource_id = t.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND a.permits_transcript_storage = 1
+        )
+        THEN RAISE(ABORT, 'Policy violation: cannot store transcript version without a VERIFIED, non-withdrawn authorization attestation')
+    END;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_transcript_segments_require_verified_attestation_insert
+BEFORE INSERT ON transcript_segments
+BEGIN
+    SELECT CASE
+        WHEN NOT EXISTS (
+            SELECT 1
+              FROM transcripts t
+              JOIN transcript_authorization_attestations a
+                ON a.attestation_id = t.authorization_attestation_id
+             WHERE t.transcript_id = NEW.transcript_id
+               AND t.permits_transcript_storage = 1
+               AND a.resource_id = t.resource_id
+               AND (a.transcript_id IS NULL OR a.transcript_id = t.transcript_id)
+               AND a.verification_status = 'VERIFIED'
+               AND a.withdrawn_at IS NULL
+               AND a.permits_transcript_storage = 1
+        )
+        THEN RAISE(ABORT, 'Policy violation: cannot store transcript segments without a VERIFIED, non-withdrawn authorization attestation')
+    END;
+END;
+"""
+
+
+def _migration_7_transcript_authorization_attestations(conn: sqlite3.Connection) -> None:
+    """Forward-only migration 7: create transcript_authorization_attestations, link transcripts, backfill v6 rows, and install triggers."""
+    conn.executescript(TRANSCRIPT_AUTHORIZATION_ATTESTATIONS_V7_SQL)
+    _ensure_column(
+        conn,
+        "transcripts",
+        "authorization_attestation_id",
+        "TEXT REFERENCES transcript_authorization_attestations(attestation_id) ON DELETE SET NULL",
+    )
+    _ensure_column(
+        conn,
+        "transcripts",
+        "permits_redistribution",
+        "INTEGER NOT NULL DEFAULT 0 CHECK (permits_redistribution IN (0, 1))",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_transcripts_attestation ON transcripts(authorization_attestation_id)"
+    )
+
+    # Backfill migration-generated verified attestations for any pre-existing v6 transcripts that already permitted storage
+    existing_authorized = conn.execute(
+        """
+        SELECT transcript_id, resource_id, language_bcp47, track_kind,
+               license_status, license_spdx, authorization_basis,
+               permits_transcript_storage, permits_verbatim_excerpts,
+               permits_ai_synthesis, attribution_text, media_canonical_url,
+               created_at, updated_at
+          FROM transcripts
+         WHERE permits_transcript_storage = 1
+           AND authorization_attestation_id IS NULL
+        """
+    ).fetchall()
+    now = utc_now()
+    for row in existing_authorized:
+        tr_id = str(row[0])
+        res_id = str(row[1])
+        lang = str(row[2])
+        kind = str(row[3])
+        lic_status = str(row[4])
+        lic_spdx = row[5]
+        auth_basis = str(row[6])
+        perm_storage = int(row[7])
+        perm_excerpts = int(row[8])
+        perm_synth = int(row[9])
+        attr_text = str(row[10])
+        media_url = str(row[11])
+        created = str(row[12] or now)
+        ev_type = (
+            "SPDX_LICENSE_URL"
+            if auth_basis == "OPEN_LICENSE_VERIFIED"
+            else (
+                "WRITTEN_PERMISSION_REF"
+                if auth_basis in ("WRITTEN_PERMISSION", "WRITTEN_RIGHTS_HOLDER_PERMISSION")
+                else "FIRST_PARTY_POLICY_REF"
+            )
+        )
+        ev_ref = f"migration_v7_backfill:{tr_id}:{attr_text}"
+        att_id = compute_transcript_attestation_id(
+            resource_id=res_id,
+            authorization_basis=auth_basis,
+            evidence_type=ev_type,
+            evidence_reference=ev_ref,
+            reviewed_by="migration_0007_backfill",
+            transcript_id=tr_id,
+            language_bcp47=lang,
+            track_kind=kind,
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO transcript_authorization_attestations (
+                attestation_id, resource_id, transcript_id, language_bcp47, track_kind,
+                authorization_basis, license_status, license_spdx,
+                evidence_type, evidence_reference, evidence_url, evidence_sha256,
+                permits_metadata_indexing, permits_transcript_storage,
+                permits_verbatim_excerpts, permits_ai_synthesis, permits_redistribution,
+                reviewed_by, reviewed_at, verification_status, review_notes,
+                revision_number, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, ?, 0, 'migration_0007_backfill', ?, 'VERIFIED', 'Backfilled from schema v6 authorized transcript record', 1, ?, ?)
+            """,
+            (
+                att_id,
+                res_id,
+                tr_id,
+                lang,
+                kind,
+                auth_basis,
+                lic_status,
+                lic_spdx,
+                ev_type,
+                ev_ref,
+                media_url,
+                perm_storage,
+                perm_excerpts,
+                perm_synth,
+                created,
+                created,
+                now,
+            ),
+        )
+        conn.execute(
+            "UPDATE transcripts SET authorization_attestation_id = ? WHERE transcript_id = ?",
+            (att_id, tr_id),
+        )
+
+    conn.executescript(TRANSCRIPT_AUTHORIZATION_ATTESTATIONS_V7_TRIGGERS_SQL)
+
+
 MIGRATIONS: tuple[tuple[int, str, str, Any], ...] = (
     (1, "0001_legacy_collector_tables", LEGACY_COLLECTOR_TABLES_SQL, _migration_1_legacy_tables),
     (2, "0002_canonical_knowledge_store_v1", CANONICAL_SCHEMA_V2_SQL, _migration_2_canonical_schema),
@@ -2296,6 +3076,7 @@ MIGRATIONS: tuple[tuple[int, str, str, Any], ...] = (
     (4, "0004_discovered_link_candidates", DISCOVERED_LINK_CANDIDATES_V4_SQL, _migration_4_discovered_link_candidates),
     (5, "0005_discovered_link_curation_reviews", DISCOVERED_LINK_CURATION_V5_SQL, _migration_5_discovered_link_curation_reviews),
     (6, "0006_transcripts_and_segments", TRANSCRIPTS_AND_SEGMENTS_V6_SQL, _migration_6_transcripts_and_segments),
+    (7, "0007_transcript_authorization_attestations", TRANSCRIPT_AUTHORIZATION_ATTESTATIONS_V7_SQL, _migration_7_transcript_authorization_attestations),
 )
 
 
@@ -4475,6 +5256,406 @@ class KnowledgeStore:
     # Transcript persistence, offline import, versioning & takedowns
     # ------------------------------------------------------------------
 
+    def get_transcript_attestation(self, attestation_id: str) -> dict[str, Any] | None:
+        """Retrieve a `transcript_authorization_attestations` row by `attestation_id`, or None if not found."""
+        row = self.conn.execute(
+            "SELECT * FROM transcript_authorization_attestations WHERE attestation_id = ?",
+            (attestation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d.setdefault("source_evidence_url", d.get("evidence_url"))
+        return d
+
+    def list_transcript_attestations(
+        self,
+        *,
+        resource_id: str | None = None,
+        transcript_id: str | None = None,
+        verification_status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List `transcript_authorization_attestations` rows matching optional filters."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if resource_id is not None:
+            clauses.append("resource_id = ?")
+            params.append(resource_id)
+        if transcript_id is not None:
+            clauses.append("transcript_id = ?")
+            params.append(transcript_id)
+        if verification_status is not None:
+            clauses.append("verification_status = ?")
+            params.append(verification_status)
+        query = "SELECT * FROM transcript_authorization_attestations"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, attestation_id"
+        rows = self.conn.execute(query, tuple(params)).fetchall()
+        results: list[dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d.setdefault("source_evidence_url", d.get("evidence_url"))
+            results.append(d)
+        return results
+
+    def record_transcript_attestation(
+        self,
+        *,
+        resource_id: str,
+        authorization_basis: str = "NONE",
+        license_status: str = "UNKNOWN",
+        license_spdx: str | None = None,
+        evidence_type: str = "OTHER_VERIFIABLE_EVIDENCE",
+        evidence_reference: str,
+        evidence_url: str | None = None,
+        source_evidence_url: str | None = None,
+        evidence_sha256: str | None = None,
+        attribution_text: str | None = None,
+        permits_metadata_indexing: bool = True,
+        permits_transcript_storage: bool = False,
+        permits_verbatim_excerpts: bool = False,
+        permits_ai_synthesis: bool = True,
+        permits_redistribution: bool = False,
+        reviewed_by: str = "rights_reviewer",
+        reviewed_at: str | None = None,
+        verification_status: str = "VERIFIED",
+        review_notes: str | None = None,
+        expires_at: str | None = None,
+        transcript_id: str | None = None,
+        language_bcp47: str | None = None,
+        track_kind: str | None = None,
+        strict_verification: bool = False,
+    ) -> dict[str, Any]:
+        """Record or update an auditable transcript authorization attestation in the local store."""
+        resource_row = self.get_resource(resource_id=resource_id)
+        if resource_row is None:
+            raise ValueError(f"Unknown parent resource_id: {resource_id!r}")
+        if authorization_basis not in VALID_AUTHORIZATION_BASES:
+            raise ValueError(f"Invalid authorization_basis: {authorization_basis!r}")
+        if license_status not in VALID_TRANSCRIPT_LICENSE_STATUSES:
+            raise ValueError(f"Invalid license_status: {license_status!r}")
+        if evidence_type not in VALID_ATTESTATION_EVIDENCE_TYPES:
+            raise ValueError(f"Invalid evidence_type: {evidence_type!r}")
+        if verification_status not in VALID_ATTESTATION_VERIFICATION_STATUSES:
+            raise ValueError(f"Invalid verification_status: {verification_status!r}")
+        if not isinstance(evidence_reference, str) or not evidence_reference.strip():
+            raise ValueError("evidence_reference must be a non-empty string")
+        if not isinstance(reviewed_by, str) or not reviewed_by.strip():
+            raise ValueError("reviewed_by must be a non-empty string")
+
+        lang_norm = validate_bcp47_language_tag(language_bcp47) if language_bcp47 else None
+        kind_norm: str | None = None
+        if track_kind is not None:
+            kind_norm = track_kind.strip().upper()
+            if kind_norm not in VALID_TRANSCRIPT_TRACK_KINDS:
+                raise ValueError(f"Invalid track_kind: {track_kind!r}")
+
+        if transcript_id is not None:
+            tr_row = self.get_transcript(transcript_id)
+            if tr_row is not None and str(tr_row["resource_id"]) != str(resource_id):
+                raise ValueError(
+                    f"transcript_id {transcript_id!r} belongs to resource {tr_row['resource_id']!r}, not {resource_id!r}"
+                )
+
+        effective_ev_url = evidence_url if evidence_url is not None else source_evidence_url
+        canonical_ev_url = (
+            validate_and_canonicalize_url(effective_ev_url) if effective_ev_url else None
+        )
+        norm_ev_sha256: str | None = None
+        if evidence_sha256 is not None:
+            cleaned_sha = evidence_sha256.strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", cleaned_sha):
+                raise ValueError("evidence_sha256 must be a 64-character hexadecimal SHA-256 digest")
+            norm_ev_sha256 = cleaned_sha
+
+        resolved_spdx = license_spdx.strip() if (license_spdx and license_spdx.strip()) else None
+        if (
+            authorization_basis == "PUBLIC_DOMAIN_VERIFIED"
+            and license_status == "VERIFIED_PERMISSIVE"
+            and resolved_spdx is None
+        ):
+            resolved_spdx = "CC0-1.0"
+
+        effective_status = verification_status
+        notes_parts: list[str] = [review_notes.strip()] if (review_notes and review_notes.strip()) else []
+        if attribution_text and attribution_text.strip():
+            notes_parts.append(f"Attribution: {attribution_text.strip()}")
+
+        contradictions = _detect_attestation_contradictions(
+            authorization_basis=authorization_basis,
+            license_status=license_status,
+            license_spdx=resolved_spdx,
+            evidence_type=evidence_type,
+            evidence_reference=evidence_reference,
+            permits_metadata_indexing=bool(permits_metadata_indexing),
+            permits_transcript_storage=bool(permits_transcript_storage),
+            permits_verbatim_excerpts=bool(permits_verbatim_excerpts),
+            permits_redistribution=bool(permits_redistribution),
+        )
+        eff_storage = bool(permits_transcript_storage)
+        eff_verbatim = bool(permits_verbatim_excerpts)
+        eff_redist = bool(permits_redistribution)
+        if contradictions and effective_status == "VERIFIED":
+            if strict_verification:
+                raise ValueError(" ".join(contradictions))
+            effective_status = "CONTRADICTORY"
+            eff_storage = False
+            eff_verbatim = False
+            eff_redist = False
+            notes_parts.append("Auto-flagged CONTRADICTORY: " + " ".join(contradictions))
+        elif effective_status != "VERIFIED":
+            eff_storage = False
+            eff_verbatim = False
+            eff_redist = False
+
+        now = utc_now()
+        rev_at = (reviewed_at or now).strip()
+        if effective_status == "VERIFIED" and _is_iso_timestamp_expired(expires_at, now_iso=now):
+            effective_status = "EXPIRED"
+            eff_storage = False
+            eff_verbatim = False
+            eff_redist = False
+            notes_parts.append(f"Attestation expired at {expires_at}.")
+
+        final_notes = " | ".join(notes_parts) if notes_parts else None
+        attestation_id = compute_transcript_attestation_id(
+            resource_id=resource_id,
+            authorization_basis=authorization_basis,
+            evidence_type=evidence_type,
+            evidence_reference=evidence_reference,
+            reviewed_by=reviewed_by,
+            transcript_id=transcript_id,
+            language_bcp47=lang_norm,
+            track_kind=kind_norm,
+        )
+        source_id = str(resource_row["source_id"])
+
+        with self.transaction() as conn:
+            existing = self.get_transcript_attestation(attestation_id)
+            prov = self.record_provenance(
+                event_type="TRANSCRIPT_ATTESTATION_RECORDED",
+                acquisition_method="FIRST_PARTY_CURATED_IMPORT",
+                actor=reviewed_by.strip(),
+                status=effective_status.lower(),
+                source_id=source_id,
+                resource_id=resource_id,
+                source_url=canonical_ev_url or str(resource_row["canonical_url"]),
+                content_hash=norm_ev_sha256,
+                details={
+                    "attestation_id": attestation_id,
+                    "transcript_id": transcript_id,
+                    "authorization_basis": authorization_basis,
+                    "license_status": license_status,
+                    "license_spdx": resolved_spdx,
+                    "evidence_type": evidence_type,
+                    "evidence_reference": evidence_reference.strip(),
+                    "verification_status": effective_status,
+                    "permits_metadata_indexing": int(bool(permits_metadata_indexing)),
+                    "permits_transcript_storage": int(eff_storage),
+                    "permits_verbatim_excerpts": int(eff_verbatim),
+                    "permits_ai_synthesis": int(bool(permits_ai_synthesis)),
+                    "permits_redistribution": int(eff_redist),
+                    "expires_at": expires_at,
+                },
+            )
+            prov_id = str(prov["event_id"])
+            tr_fk = transcript_id if (transcript_id and self.get_transcript(transcript_id) is not None) else None
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO transcript_authorization_attestations (
+                        attestation_id, resource_id, transcript_id, language_bcp47, track_kind,
+                        authorization_basis, license_status, license_spdx,
+                        evidence_type, evidence_reference, evidence_url, evidence_sha256,
+                        permits_metadata_indexing, permits_transcript_storage,
+                        permits_verbatim_excerpts, permits_ai_synthesis, permits_redistribution,
+                        reviewed_by, reviewed_at, verification_status, review_notes,
+                        expires_at, withdrawn_at, withdrawn_by, withdrawal_reason,
+                        revision_number, provenance_event_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 1, ?, ?, ?)
+                    """,
+                    (
+                        attestation_id,
+                        resource_id,
+                        tr_fk,
+                        lang_norm,
+                        kind_norm,
+                        authorization_basis,
+                        license_status,
+                        resolved_spdx,
+                        evidence_type,
+                        evidence_reference.strip(),
+                        canonical_ev_url,
+                        norm_ev_sha256,
+                        int(bool(permits_metadata_indexing)),
+                        int(eff_storage),
+                        int(eff_verbatim),
+                        int(bool(permits_ai_synthesis)),
+                        int(eff_redist),
+                        reviewed_by.strip(),
+                        rev_at,
+                        effective_status,
+                        final_notes,
+                        expires_at,
+                        prov_id,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                next_rev = int(existing["revision_number"]) + 1
+                conn.execute(
+                    """
+                    UPDATE transcript_authorization_attestations
+                       SET transcript_id = COALESCE(?, transcript_id),
+                           language_bcp47 = ?,
+                           track_kind = ?,
+                           authorization_basis = ?,
+                           license_status = ?,
+                           license_spdx = ?,
+                           evidence_type = ?,
+                           evidence_reference = ?,
+                           evidence_url = ?,
+                           evidence_sha256 = ?,
+                           permits_metadata_indexing = ?,
+                           permits_transcript_storage = ?,
+                           permits_verbatim_excerpts = ?,
+                           permits_ai_synthesis = ?,
+                           permits_redistribution = ?,
+                           reviewed_by = ?,
+                           reviewed_at = ?,
+                           verification_status = ?,
+                           review_notes = ?,
+                           expires_at = ?,
+                           withdrawn_at = NULL,
+                           withdrawn_by = NULL,
+                           withdrawal_reason = NULL,
+                           revision_number = ?,
+                           provenance_event_id = ?,
+                           updated_at = ?
+                     WHERE attestation_id = ?
+                    """,
+                    (
+                        tr_fk,
+                        lang_norm,
+                        kind_norm,
+                        authorization_basis,
+                        license_status,
+                        resolved_spdx,
+                        evidence_type,
+                        evidence_reference.strip(),
+                        canonical_ev_url,
+                        norm_ev_sha256,
+                        int(bool(permits_metadata_indexing)),
+                        int(eff_storage),
+                        int(eff_verbatim),
+                        int(bool(permits_ai_synthesis)),
+                        int(eff_redist),
+                        reviewed_by.strip(),
+                        rev_at,
+                        effective_status,
+                        final_notes,
+                        expires_at,
+                        next_rev,
+                        prov_id,
+                        now,
+                        attestation_id,
+                    ),
+                )
+        row = self.get_transcript_attestation(attestation_id)
+        assert row is not None
+        return row
+
+    def withdraw_transcript_attestation(
+        self,
+        attestation_id: str,
+        *,
+        reason: str,
+        actor: str = "rights_governance_officer",
+    ) -> dict[str, Any]:
+        """Withdraw an authorization attestation and cascade revocation/tombstone to all dependent transcripts."""
+        if not reason or not reason.strip():
+            raise ValueError("Attestation withdrawal reason must be non-empty")
+        if not actor or not actor.strip():
+            raise ValueError("actor must be non-empty")
+        existing = self.get_transcript_attestation(attestation_id)
+        if existing is None:
+            raise KeyError(f"Unknown attestation_id: {attestation_id!r}")
+
+        now = utc_now()
+        resource_id = str(existing["resource_id"])
+        resource_row = self.get_resource(resource_id=resource_id)
+        source_id = str(resource_row["source_id"]) if resource_row else None
+
+        with self.transaction() as conn:
+            # First tombstone any transcripts authorized by this attestation before revoking attestation flags
+            linked_transcripts = conn.execute(
+                """
+                SELECT transcript_id
+                  FROM transcripts
+                 WHERE authorization_attestation_id = ?
+                    OR (transcript_id = ? AND ? IS NOT NULL)
+                """,
+                (attestation_id, existing.get("transcript_id"), existing.get("transcript_id")),
+            ).fetchall()
+            tombstoned_ids: list[str] = []
+            for r in linked_transcripts:
+                tid = str(r[0])
+                self.tombstone_transcript_on_takedown(
+                    tid,
+                    reason=f"Authorization attestation {attestation_id} withdrawn: {reason.strip()}",
+                    actor=actor.strip(),
+                )
+                tombstoned_ids.append(tid)
+
+            next_rev = int(existing["revision_number"]) + 1
+            prov = self.record_provenance(
+                event_type="TRANSCRIPT_ATTESTATION_WITHDRAWN",
+                acquisition_method="FIRST_PARTY_CURATED_IMPORT",
+                actor=actor.strip(),
+                status="withdrawn",
+                source_id=source_id,
+                resource_id=resource_id,
+                source_url=existing.get("evidence_url")
+                or (str(resource_row["canonical_url"]) if resource_row else None),
+                details={
+                    "attestation_id": attestation_id,
+                    "previous_status": str(existing["verification_status"]),
+                    "withdrawal_reason": reason.strip(),
+                    "tombstoned_transcripts": tombstoned_ids,
+                },
+            )
+            conn.execute(
+                """
+                UPDATE transcript_authorization_attestations
+                   SET verification_status = 'WITHDRAWN',
+                       permits_transcript_storage = 0,
+                       permits_verbatim_excerpts = 0,
+                       permits_ai_synthesis = 0,
+                       permits_redistribution = 0,
+                       withdrawn_at = ?,
+                       withdrawn_by = ?,
+                       withdrawal_reason = ?,
+                       revision_number = ?,
+                       provenance_event_id = ?,
+                       updated_at = ?
+                 WHERE attestation_id = ?
+                """,
+                (
+                    now,
+                    actor.strip(),
+                    reason.strip(),
+                    next_rev,
+                    str(prov["event_id"]),
+                    now,
+                    attestation_id,
+                ),
+            )
+        updated = self.get_transcript_attestation(attestation_id)
+        assert updated is not None
+        return updated
+
     def get_transcript(self, transcript_id: str) -> dict[str, Any] | None:
         """Retrieve a `transcripts` row by `transcript_id`, or None if not found."""
         row = self.conn.execute(
@@ -4747,10 +5928,12 @@ class KnowledgeStore:
         now = utc_now()
         permits_storage = int(existing["permits_transcript_storage"])
         permits_excerpts = int(existing["permits_verbatim_excerpts"])
+        permits_redist = int(existing.get("permits_redistribution", 0))
         storage_status = str(existing["transcript_storage_status"])
         if new_state in ("BLOCKED_BY_POLICY", "METADATA_ONLY_LINKED", "RIGHTS_PENDING", "DISCOVERED"):
             permits_storage = 0
             permits_excerpts = 0
+            permits_redist = 0
             if new_state == "BLOCKED_BY_POLICY":
                 storage_status = "BLOCKED_NO_AUTHORIZATION"
             elif new_state == "METADATA_ONLY_LINKED":
@@ -4765,6 +5948,7 @@ class KnowledgeStore:
                    SET ingestion_state = ?,
                        permits_transcript_storage = ?,
                        permits_verbatim_excerpts = ?,
+                       permits_redistribution = ?,
                        transcript_storage_status = ?,
                        block_or_review_reason = COALESCE(?, block_or_review_reason),
                        updated_at = ?
@@ -4774,6 +5958,7 @@ class KnowledgeStore:
                     new_state,
                     permits_storage,
                     permits_excerpts,
+                    permits_redist,
                     storage_status,
                     reason,
                     now,
@@ -4817,6 +6002,9 @@ class KnowledgeStore:
         permits_transcript_storage: bool = False,
         permits_verbatim_excerpts: bool = False,
         permits_ai_synthesis: bool = True,
+        permits_redistribution: bool = False,
+        attestation_id: str | None = None,
+        attestation: dict[str, Any] | TranscriptAuthorizationAttestation | None = None,
         media_canonical_url: str | None = None,
         source_caption_url: str | None = None,
         duration_ms: int | None = None,
@@ -4826,14 +6014,16 @@ class KnowledgeStore:
         actor: str = "local_transcript_importer",
         run_id: str | None = None,
     ) -> TranscriptImportResult:
-        """Import a local transcript for an existing resource with strict offline policy gating.
+        """Import a local transcript for an existing resource with strict offline policy gating and auditable authorization attestation.
 
         - Performs zero network requests.
-        - Evaluates the 4-part conjunctive policy gate before storing any transcript text.
-        - If unauthorized or unresolved (`UNKNOWN`, `ALL_RIGHTS_RESERVED`, `RESTRICTED_PROPRIETARY`,
-          `authorization_basis='NONE'`, or `permits_transcript_storage=False`), records the blocked
-          or metadata-only state on `transcripts` and `provenance_events` and stores ZERO rows in
-          `transcript_versions` or `transcript_segments`.
+        - Evaluates the conjunctive policy gate AND verifies an auditable `transcript_authorization_attestations`
+          record before storing any transcript text.
+        - Caller-supplied flags (`permits_transcript_storage=True`, `license_status='VERIFIED_PERMISSIVE'`,
+          `authorization_basis=...`) NEVER authorize transcript storage on their own without a verified,
+          non-withdrawn, non-expired attestation matching `resource_id` and scope.
+        - If unauthorized or unresolved, records the blocked or metadata-only state on `transcripts` and
+          `provenance_events` and stores ZERO rows in `transcript_versions` or `transcript_segments`.
         - Never logs or persists full transcript text in `provenance_events`.
         """
         resource_row = self.get_resource(resource_id=resource_id)
@@ -4865,6 +6055,69 @@ class KnowledgeStore:
         source_id = str(resource_row["source_id"])
         transcript_id = compute_transcript_id(resource_id, lang, kind)
 
+        resolved_attestation: dict[str, Any] | None = None
+        requested_att_id = (attestation_id or "").strip() or None
+        if attestation is not None:
+            att_candidate = (
+                attestation.to_dict()
+                if isinstance(attestation, TranscriptAuthorizationAttestation)
+                else dict(attestation)
+            )
+            cand_id = str(att_candidate.get("attestation_id") or "").strip()
+            if cand_id:
+                existing_att = self.get_transcript_attestation(cand_id)
+                if existing_att is not None:
+                    resolved_attestation = existing_att
+                else:
+                    resolved_attestation = att_candidate
+            else:
+                resolved_attestation = att_candidate
+            # If the caller supplied an inline attestation dict/object that has not yet been persisted
+            # and its target resource exists in `resources`, persist it via `record_transcript_attestation`
+            # so the audit trail and foreign key on `transcripts.authorization_attestation_id` are satisfied.
+            if (
+                resolved_attestation is not None
+                and (not cand_id or self.get_transcript_attestation(cand_id) is None)
+                and resolved_attestation.get("resource_id")
+                and self.get_resource(resource_id=str(resolved_attestation["resource_id"])) is not None
+                and resolved_attestation.get("evidence_type") in VALID_ATTESTATION_EVIDENCE_TYPES
+                and resolved_attestation.get("evidence_reference")
+                and resolved_attestation.get("reviewed_by")
+            ):
+                persisted = self.record_transcript_attestation(
+                    resource_id=str(resolved_attestation["resource_id"]),
+                    transcript_id=resolved_attestation.get("transcript_id"),
+                    language_bcp47=resolved_attestation.get("language_bcp47"),
+                    track_kind=resolved_attestation.get("track_kind"),
+                    authorization_basis=str(resolved_attestation.get("authorization_basis") or "NONE"),
+                    license_status=str(resolved_attestation.get("license_status") or "UNKNOWN"),
+                    license_spdx=resolved_attestation.get("license_spdx"),
+                    evidence_type=str(resolved_attestation["evidence_type"]),
+                    evidence_reference=str(resolved_attestation["evidence_reference"]),
+                    source_evidence_url=resolved_attestation.get("source_evidence_url"),
+                    evidence_sha256=resolved_attestation.get("evidence_sha256"),
+                    permits_metadata_indexing=bool(resolved_attestation.get("permits_metadata_indexing", 1)),
+                    permits_transcript_storage=bool(resolved_attestation.get("permits_transcript_storage", 0)),
+                    permits_verbatim_excerpts=bool(resolved_attestation.get("permits_verbatim_excerpts", 0)),
+                    permits_ai_synthesis=bool(resolved_attestation.get("permits_ai_synthesis", 1)),
+                    permits_redistribution=bool(resolved_attestation.get("permits_redistribution", 0)),
+                    reviewed_by=str(resolved_attestation["reviewed_by"]),
+                    reviewed_at=resolved_attestation.get("reviewed_at"),
+                    verification_status=str(resolved_attestation.get("verification_status") or "VERIFIED"),
+                    review_notes=resolved_attestation.get("review_notes"),
+                    expires_at=resolved_attestation.get("expires_at"),
+                )
+                if resolved_attestation.get("withdrawn_at") or str(resolved_attestation.get("verification_status") or "").upper() == "WITHDRAWN":
+                    persisted = self.withdraw_transcript_attestation(
+                        str(persisted["attestation_id"]),
+                        reason=str(resolved_attestation.get("withdrawal_reason") or "Attestation supplied in withdrawn state"),
+                        actor=str(resolved_attestation["reviewed_by"]),
+                    )
+                resolved_attestation = persisted
+                requested_att_id = str(persisted["attestation_id"])
+        elif requested_att_id is not None:
+            resolved_attestation = self.get_transcript_attestation(requested_att_id)
+
         policy = evaluate_transcript_storage_policy(
             resource_row=resource_row,
             acquisition_method=acquisition_method,
@@ -4875,7 +6128,46 @@ class KnowledgeStore:
             requested_transcript_storage=bool(permits_transcript_storage),
             requested_verbatim_excerpts=bool(permits_verbatim_excerpts),
             requested_ai_synthesis=bool(permits_ai_synthesis),
+            requested_redistribution=bool(permits_redistribution),
+            attestation=resolved_attestation,
+            requested_attestation_id=requested_att_id,
+            expected_transcript_id=transcript_id,
+            expected_language_bcp47=lang,
+            expected_track_kind=kind,
         )
+
+        effective_license_status = (
+            str(resolved_attestation.get("license_status") or "UNKNOWN")
+            if (resolved_attestation is not None and license_status == "UNKNOWN")
+            else license_status
+        )
+        effective_basis = (
+            str(resolved_attestation.get("authorization_basis") or "NONE")
+            if (resolved_attestation is not None and authorization_basis == "NONE")
+            else authorization_basis
+        )
+        effective_spdx = (
+            (resolved_attestation.get("license_spdx") or None)
+            if (resolved_attestation is not None and not license_spdx)
+            else license_spdx
+        )
+        # Note: Migration 6 defined `transcripts.authorization_basis` CHECK with `'OPEN_LICENSE_VERIFIED'`
+        # for open/public-domain licenses, while `transcript_authorization_attestations` stores
+        # `'PUBLIC_DOMAIN_VERIFIED'` directly. Map `'PUBLIC_DOMAIN_VERIFIED'` -> `'OPEN_LICENSE_VERIFIED'`
+        # on the `transcripts` row (defaulting `license_spdx` to `'CC0-1.0'`) so Migration 6 CHECK constraints hold.
+        db_transcript_basis = (
+            "OPEN_LICENSE_VERIFIED"
+            if effective_basis == "PUBLIC_DOMAIN_VERIFIED"
+            else effective_basis
+        )
+        db_transcript_spdx = (
+            (effective_spdx or "CC0-1.0")
+            if effective_basis == "PUBLIC_DOMAIN_VERIFIED"
+            else effective_spdx
+        )
+        fk_attestation_id: str | None = None
+        if policy.authorization_attestation_id and self.get_transcript_attestation(policy.authorization_attestation_id) is not None:
+            fk_attestation_id = policy.authorization_attestation_id
 
         existing = self.get_transcript(transcript_id)
         if existing is not None and existing["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED":
@@ -4912,9 +6204,11 @@ class KnowledgeStore:
                                license_status = ?,
                                license_spdx = ?,
                                authorization_basis = ?,
+                               authorization_attestation_id = ?,
                                permits_transcript_storage = 0,
                                permits_verbatim_excerpts = 0,
                                permits_ai_synthesis = ?,
+                               permits_redistribution = 0,
                                attribution_text = ?,
                                ingestion_state = ?,
                                transcript_storage_status = ?,
@@ -4931,9 +6225,10 @@ class KnowledgeStore:
                             acquisition_method,
                             fmt if acquisition_method != "METADATA_AND_LINK_ONLY" else "NONE",
                             speaker_attribution_quality,
-                            license_status,
-                            license_spdx,
-                            authorization_basis,
+                            effective_license_status,
+                            db_transcript_spdx,
+                            db_transcript_basis,
+                            fk_attestation_id,
                             int(policy.permits_ai_synthesis),
                             attribution_text.strip(),
                             policy.ingestion_state,
@@ -4951,12 +6246,13 @@ class KnowledgeStore:
                             transcript_id, resource_id, source_id, media_canonical_url,
                             language_bcp47, track_kind, origin_type, acquisition_method,
                             caption_format, speaker_attribution_quality, license_status,
-                            license_spdx, authorization_basis, permits_transcript_storage,
-                            permits_verbatim_excerpts, permits_ai_synthesis, attribution_text,
+                            license_spdx, authorization_basis, authorization_attestation_id,
+                            permits_transcript_storage, permits_verbatim_excerpts,
+                            permits_ai_synthesis, permits_redistribution, attribution_text,
                             ingestion_state, transcript_storage_status, block_or_review_reason,
                             latest_transcript_version_id, segment_count, duration_ms,
                             created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
                         """,
                         (
                             transcript_id,
@@ -4969,9 +6265,10 @@ class KnowledgeStore:
                             acquisition_method,
                             fmt if acquisition_method != "METADATA_AND_LINK_ONLY" else "NONE",
                             speaker_attribution_quality,
-                            license_status,
-                            license_spdx,
-                            authorization_basis,
+                            effective_license_status,
+                            db_transcript_spdx,
+                            db_transcript_basis,
+                            fk_attestation_id,
                             int(policy.permits_ai_synthesis),
                             attribution_text.strip(),
                             policy.ingestion_state,
@@ -5005,9 +6302,10 @@ class KnowledgeStore:
                         "transcript_id": transcript_id,
                         "language_bcp47": lang,
                         "track_kind": kind,
-                        "license_status": license_status,
-                        "license_snapshot": license_spdx or license_status,
-                        "authorization_basis": authorization_basis,
+                        "license_status": effective_license_status,
+                        "license_snapshot": db_transcript_spdx or effective_license_status,
+                        "authorization_basis": effective_basis,
+                        "authorization_attestation_id": fk_attestation_id or requested_att_id,
                         "ingestion_state": policy.ingestion_state,
                         "transcript_storage_status": policy.transcript_storage_status,
                         "reason": policy.block_or_review_reason,
@@ -5026,6 +6324,8 @@ class KnowledgeStore:
                 transcript_storage_status=policy.transcript_storage_status,
                 permits_transcript_storage=False,
                 permits_verbatim_excerpts=False,
+                permits_redistribution=False,
+                authorization_attestation_id=fk_attestation_id,
                 transcript_version_id=None,
                 version_number=None,
                 stored_segments=0,
@@ -5042,7 +6342,7 @@ class KnowledgeStore:
             cues,
             language_bcp47=lang,
             attribution_text=attribution_text,
-            license_status=license_status,
+            license_status=effective_license_status,
             duration_ms=duration_ms,
         )
 
@@ -5086,7 +6386,8 @@ class KnowledgeStore:
                         "transcript_id": transcript_id,
                         "transcript_version_id": str(existing_ver["transcript_version_id"]),
                         "version_number": int(existing_ver["version_number"]),
-                        "license_snapshot": license_spdx or license_status,
+                        "authorization_attestation_id": fk_attestation_id,
+                        "license_snapshot": db_transcript_spdx or effective_license_status,
                         "segment_count": len(cues),
                     },
                 )
@@ -5102,6 +6403,8 @@ class KnowledgeStore:
                     transcript_storage_status=str(existing["transcript_storage_status"]),
                     permits_transcript_storage=bool(existing["permits_transcript_storage"]),
                     permits_verbatim_excerpts=bool(existing["permits_verbatim_excerpts"]),
+                    permits_redistribution=bool(existing.get("permits_redistribution", 0)),
+                    authorization_attestation_id=fk_attestation_id or existing.get("authorization_attestation_id"),
                     transcript_version_id=str(existing_ver["transcript_version_id"]),
                     version_number=int(existing_ver["version_number"]),
                     stored_segments=int(existing["segment_count"]),
@@ -5124,7 +6427,8 @@ class KnowledgeStore:
             )
 
             # First ensure parent `transcripts` row is in an authorized state (`READY_FOR_INGESTION`)
-            # before inserting `transcript_versions` and `transcript_segments` (enforced by SQLite triggers).
+            # with a valid `authorization_attestation_id` before inserting `transcript_versions`
+            # and `transcript_segments` (enforced by SQLite triggers in Migrations 6 and 7).
             if existing is None:
                 conn.execute(
                     """
@@ -5132,12 +6436,13 @@ class KnowledgeStore:
                         transcript_id, resource_id, source_id, media_canonical_url,
                         language_bcp47, track_kind, origin_type, acquisition_method,
                         caption_format, speaker_attribution_quality, license_status,
-                        license_spdx, authorization_basis, permits_transcript_storage,
-                        permits_verbatim_excerpts, permits_ai_synthesis, attribution_text,
+                        license_spdx, authorization_basis, authorization_attestation_id,
+                        permits_transcript_storage, permits_verbatim_excerpts,
+                        permits_ai_synthesis, permits_redistribution, attribution_text,
                         ingestion_state, transcript_storage_status, block_or_review_reason,
                         latest_transcript_version_id, segment_count, duration_ms,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'READY_FOR_INGESTION', 'NOT_STORED', ?, NULL, 0, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, 'READY_FOR_INGESTION', 'NOT_STORED', ?, NULL, 0, ?, ?, ?)
                     """,
                     (
                         transcript_id,
@@ -5150,11 +6455,13 @@ class KnowledgeStore:
                         acquisition_method,
                         fmt,
                         speaker_attribution_quality,
-                        license_status,
-                        license_spdx,
-                        authorization_basis,
+                        effective_license_status,
+                        db_transcript_spdx,
+                        db_transcript_basis,
+                        fk_attestation_id,
                         int(policy.permits_verbatim_excerpts),
                         int(policy.permits_ai_synthesis),
+                        int(policy.permits_redistribution),
                         attribution_text.strip(),
                         review_reason,
                         inferred_duration_ms,
@@ -5174,9 +6481,11 @@ class KnowledgeStore:
                            license_status = ?,
                            license_spdx = ?,
                            authorization_basis = ?,
+                           authorization_attestation_id = ?,
                            permits_transcript_storage = 1,
                            permits_verbatim_excerpts = ?,
                            permits_ai_synthesis = ?,
+                           permits_redistribution = ?,
                            attribution_text = ?,
                            ingestion_state = 'READY_FOR_INGESTION',
                            block_or_review_reason = ?,
@@ -5190,11 +6499,13 @@ class KnowledgeStore:
                         acquisition_method,
                         fmt,
                         speaker_attribution_quality,
-                        license_status,
-                        license_spdx,
-                        authorization_basis,
+                        effective_license_status,
+                        db_transcript_spdx,
+                        db_transcript_basis,
+                        fk_attestation_id,
                         int(policy.permits_verbatim_excerpts),
                         int(policy.permits_ai_synthesis),
+                        int(policy.permits_redistribution),
                         attribution_text.strip(),
                         review_reason,
                         inferred_duration_ms,
@@ -5340,7 +6651,11 @@ class KnowledgeStore:
                     "language_bcp47": lang,
                     "track_kind": kind,
                     "caption_format": fmt,
-                    "license_snapshot": license_spdx or license_status,
+                    "license_snapshot": db_transcript_spdx or effective_license_status,
+                    "authorization_basis": effective_basis,
+                    "authorization_attestation_id": fk_attestation_id,
+                    "permits_verbatim_excerpts": int(policy.permits_verbatim_excerpts),
+                    "permits_redistribution": int(policy.permits_redistribution),
                     "segment_count": len(cues),
                     "word_count": word_count,
                     "char_count": char_count,
@@ -5363,6 +6678,8 @@ class KnowledgeStore:
             transcript_storage_status=target_storage_status,
             permits_transcript_storage=True,
             permits_verbatim_excerpts=policy.permits_verbatim_excerpts,
+            permits_redistribution=policy.permits_redistribution,
+            authorization_attestation_id=fk_attestation_id,
             transcript_version_id=transcript_version_id,
             version_number=next_version_number,
             stored_segments=len(cues),
@@ -5388,6 +6705,9 @@ class KnowledgeStore:
         permits_transcript_storage: bool = False,
         permits_verbatim_excerpts: bool = False,
         permits_ai_synthesis: bool = True,
+        permits_redistribution: bool = False,
+        attestation_id: str | None = None,
+        attestation: dict[str, Any] | TranscriptAuthorizationAttestation | None = None,
         media_canonical_url: str | None = None,
         source_caption_url: str | None = None,
         duration_ms: int | None = None,
@@ -5424,6 +6744,9 @@ class KnowledgeStore:
             permits_transcript_storage=permits_transcript_storage,
             permits_verbatim_excerpts=permits_verbatim_excerpts,
             permits_ai_synthesis=permits_ai_synthesis,
+            permits_redistribution=permits_redistribution,
+            attestation_id=attestation_id,
+            attestation=attestation,
             media_canonical_url=media_canonical_url,
             source_caption_url=source_caption_url,
             duration_ms=duration_ms,
@@ -5465,6 +6788,7 @@ class KnowledgeStore:
                    SET permits_transcript_storage = 0,
                        permits_verbatim_excerpts = 0,
                        permits_ai_synthesis = 0,
+                       permits_redistribution = 0,
                        ingestion_state = 'WITHDRAWN_OR_TOMBSTONED',
                        transcript_storage_status = 'TOMBSTONED_ON_TAKEDOWN',
                        block_or_review_reason = ?,
@@ -5485,6 +6809,7 @@ class KnowledgeStore:
                 source_url=str(existing["media_canonical_url"]),
                 details={
                     "transcript_id": transcript_id,
+                    "authorization_attestation_id": existing.get("authorization_attestation_id"),
                     "previous_state": str(existing["ingestion_state"]),
                     "reason": reason.strip(),
                     "purged_segments": deleted_segments,
@@ -5494,6 +6819,166 @@ class KnowledgeStore:
         result = self.get_transcript(transcript_id)
         assert result is not None
         return result
+
+    def get_verbatim_transcript_excerpt(
+        self,
+        target_id: str,
+        *,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        actor: str = "excerpt_reader",
+    ) -> dict[str, Any] | list[dict[str, Any]]:
+        """Return verbatim transcript segment excerpt(s) only when authorized by both `transcripts` and its attestation."""
+        seg_row: sqlite3.Row | None = None
+        if target_id.startswith(("seg_", "tseg_")):
+            seg_row = self.conn.execute(
+                "SELECT * FROM transcript_segments WHERE segment_id = ?",
+                (target_id,),
+            ).fetchone()
+            if seg_row is None:
+                raise KeyError(f"Unknown segment_id: {target_id!r}")
+            transcript_id = str(seg_row["transcript_id"])
+        else:
+            transcript_id = target_id
+
+        tr = self.get_transcript(transcript_id)
+        if tr is None:
+            raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
+        if tr["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED" or not int(tr["permits_transcript_storage"]):
+            raise TranscriptPolicyViolationError(
+                f"Transcript {transcript_id} does not permit storage or verbatim excerpt retrieval (state={tr['ingestion_state']!r})."
+            )
+        if not int(tr["permits_verbatim_excerpts"]):
+            raise TranscriptPolicyViolationError(
+                f"Transcript {transcript_id} does not permit verbatim quoting/excerpts (permits_verbatim_excerpts=0)."
+            )
+        att_id = tr.get("authorization_attestation_id")
+        if not att_id:
+            raise TranscriptPolicyViolationError(
+                f"Transcript {transcript_id} is missing an authorization_attestation_id; verbatim quoting is blocked."
+            )
+        att = self.get_transcript_attestation(str(att_id))
+        if att is None:
+            raise TranscriptPolicyViolationError(
+                f"Authorization attestation {att_id!r} for transcript {transcript_id} was not found."
+            )
+        if (
+            att.get("withdrawn_at")
+            or str(att.get("verification_status")) != "VERIFIED"
+            or _is_iso_timestamp_expired(att.get("expires_at"))
+            or not int(att.get("permits_verbatim_excerpts", 0))
+        ):
+            raise TranscriptPolicyViolationError(
+                f"Attestation {att_id!r} does not permit verbatim quoting (status={att.get('verification_status')!r}, "
+                f"permits_verbatim_excerpts={att.get('permits_verbatim_excerpts')!r})."
+            )
+
+        if seg_row is not None:
+            item = dict(seg_row)
+            item["quality_flags"] = json.loads(item.get("quality_flags_json") or "[]")
+            item["attribution_text"] = tr["attribution_text"]
+            item["license_spdx"] = tr["license_spdx"]
+            item["authorization_attestation_id"] = str(att_id)
+            self.record_provenance(
+                event_type="TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED",
+                acquisition_method=str(tr["acquisition_method"]),
+                actor=actor,
+                status="allowed",
+                source_id=str(tr["source_id"]),
+                resource_id=str(tr["resource_id"]),
+                source_url=str(tr["media_canonical_url"]),
+                details={
+                    "transcript_id": transcript_id,
+                    "segment_id": str(seg_row["segment_id"]),
+                    "authorization_attestation_id": str(att_id),
+                    "excerpt_segment_count": 1,
+                },
+            )
+            return item
+
+        segments = self.get_transcript_segments(transcript_id)
+        filtered = [
+            seg
+            for seg in segments
+            if (start_ms is None or int(seg["end_ms"]) >= int(start_ms))
+            and (end_ms is None or int(seg["start_ms"]) <= int(end_ms))
+        ]
+        self.record_provenance(
+            event_type="TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED",
+            acquisition_method=str(tr["acquisition_method"]),
+            actor=actor,
+            status="allowed",
+            source_id=str(tr["source_id"]),
+            resource_id=str(tr["resource_id"]),
+            source_url=str(tr["media_canonical_url"]),
+            details={
+                "transcript_id": transcript_id,
+                "authorization_attestation_id": str(att_id),
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "excerpt_segment_count": len(filtered),
+            },
+        )
+        return filtered
+
+    def export_transcript_for_redistribution(
+        self,
+        transcript_id: str,
+        *,
+        actor: str = "redistribution_exporter",
+    ) -> dict[str, Any]:
+        """Export full transcript metadata and segments for external redistribution ONLY when authorized by attestation scope."""
+        tr = self.get_transcript(transcript_id)
+        if tr is None:
+            raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
+        if tr["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED" or not int(tr["permits_transcript_storage"]):
+            raise TranscriptPolicyViolationError(
+                f"Transcript {transcript_id} is not stored or has been withdrawn; redistribution is blocked."
+            )
+        if not int(tr.get("permits_redistribution", 0)):
+            raise TranscriptPolicyViolationError(
+                f"Transcript {transcript_id} does not permit redistribution (permits_redistribution=0)."
+            )
+        att_id = tr.get("authorization_attestation_id")
+        if not att_id:
+            raise TranscriptPolicyViolationError(
+                f"Transcript {transcript_id} has no authorization_attestation_id; redistribution is blocked."
+            )
+        att = self.get_transcript_attestation(str(att_id))
+        if att is None:
+            raise TranscriptPolicyViolationError(
+                f"Attestation {att_id!r} for transcript {transcript_id} was not found."
+            )
+        if (
+            att.get("withdrawn_at")
+            or str(att.get("verification_status")) != "VERIFIED"
+            or _is_iso_timestamp_expired(att.get("expires_at"))
+            or not int(att.get("permits_redistribution", 0))
+        ):
+            raise TranscriptPolicyViolationError(
+                f"Attestation {att_id!r} does not permit redistribution (status={att.get('verification_status')!r}, "
+                f"permits_redistribution={att.get('permits_redistribution')!r})."
+            )
+        segments = self.get_transcript_segments(transcript_id)
+        self.record_provenance(
+            event_type="TRANSCRIPT_REDISTRIBUTION_EXPORTED",
+            acquisition_method=str(tr["acquisition_method"]),
+            actor=actor,
+            status="exported",
+            source_id=str(tr["source_id"]),
+            resource_id=str(tr["resource_id"]),
+            source_url=str(tr["media_canonical_url"]),
+            details={
+                "transcript_id": transcript_id,
+                "authorization_attestation_id": str(att_id),
+                "segment_count": len(segments),
+            },
+        )
+        return {
+            "transcript": tr,
+            "attestation": att,
+            "segments": segments,
+        }
 
     def record_transcript_synthesis(
         self,
@@ -5514,7 +6999,19 @@ class KnowledgeStore:
         if tr is None:
             raise ValueError(f"Unknown transcript_id: {transcript_id!r}")
         if not int(tr["permits_ai_synthesis"]) or tr["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED":
-            raise ValueError(f"Transcript {transcript_id} does not permit synthesis storage")
+            raise TranscriptPolicyViolationError(f"Transcript {transcript_id} does not permit synthesis storage")
+        att_id = tr.get("authorization_attestation_id")
+        if att_id:
+            att = self.get_transcript_attestation(str(att_id))
+            if att is not None and (
+                att.get("withdrawn_at")
+                or str(att.get("verification_status")) in ("WITHDRAWN", "EXPIRED", "REJECTED", "CONTRADICTORY")
+                or _is_iso_timestamp_expired(att.get("expires_at"))
+                or not int(att.get("permits_ai_synthesis", 0))
+            ):
+                raise TranscriptPolicyViolationError(
+                    f"Linked attestation {att_id!r} for transcript {transcript_id} is withdrawn, expired, or disallows AI synthesis."
+                )
         if synthesis_type not in VALID_TRANSCRIPT_SYNTHESIS_TYPES:
             raise ValueError(f"Invalid synthesis_type: {synthesis_type!r}")
         if generator_type not in VALID_TRANSCRIPT_SYNTHESIS_GENERATORS:
@@ -5522,7 +7019,7 @@ class KnowledgeStore:
         if review_status not in VALID_TRANSCRIPT_SYNTHESIS_REVIEW_STATUSES:
             raise ValueError(f"Invalid review_status: {review_status!r}")
         if not is_original_transformative or contains_verbatim_transcript:
-            raise ValueError(
+            raise TranscriptPolicyViolationError(
                 "Transcript syntheses must be transformative (is_original_transformative=True) "
                 "and must not contain verbatim transcript text (contains_verbatim_transcript=False)"
             )
@@ -5693,10 +7190,12 @@ def format_transcript_import_result(result: TranscriptImportResult) -> str:
         f"  Resource ID:               {result.resource_id}",
         f"  Source ID:                 {result.source_id}",
         f"  Language / Track:          {result.language_bcp47} ({result.track_kind})",
+        f"  Attestation ID:            {result.authorization_attestation_id or 'none'}",
         f"  Ingestion state:           {result.ingestion_state}",
         f"  Storage status:            {result.transcript_storage_status}",
         f"  Permits text storage:      {int(result.permits_transcript_storage)}",
         f"  Permits verbatim excerpts: {int(result.permits_verbatim_excerpts)}",
+        f"  Permits redistribution:    {int(result.permits_redistribution)}",
         f"  Transcript version ID:     {result.transcript_version_id or 'none'}",
         f"  Version number:            {result.version_number if result.version_number is not None else 'none'}",
         f"  Stored segments:           {result.stored_segments}",
@@ -5720,12 +7219,123 @@ def main(argv: list[str] | None = None) -> int:
     import_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
     import_parser.add_argument("--manifest", type=Path, default=DEFAULT_SEED_PATH, help="Seed manifest JSON path")
 
+    att_parser = subparsers.add_parser(
+        "attest-transcript",
+        help="Record an auditable authorization attestation for transcript indexing/storage",
+    )
+    att_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
+    att_parser.add_argument("--resource-id", required=True, help="Existing parent resource_id")
+    att_parser.add_argument("--transcript-id", default=None, help="Optional specific transcript_id scope")
+    att_parser.add_argument("--language", default=None, help="Optional BCP-47 language tag scope (e.g. en)")
+    att_parser.add_argument(
+        "--track-kind",
+        default=None,
+        choices=VALID_TRANSCRIPT_TRACK_KINDS,
+        help="Optional transcript track kind scope",
+    )
+    att_parser.add_argument(
+        "--authorization-basis",
+        required=True,
+        choices=VALID_AUTHORIZATION_BASES,
+        help="Authorization basis (e.g. OPEN_LICENSE_VERIFIED, PUBLIC_DOMAIN_VERIFIED, FIRST_PARTY_OWNED_MEDIA, WRITTEN_RIGHTS_HOLDER_PERMISSION)",
+    )
+    att_parser.add_argument(
+        "--license-status",
+        required=True,
+        choices=VALID_TRANSCRIPT_LICENSE_STATUSES,
+        help="License classification (e.g. VERIFIED_PERMISSIVE, ALL_RIGHTS_RESERVED, UNKNOWN)",
+    )
+    att_parser.add_argument("--license-spdx", default=None, help="SPDX license identifier (e.g. CC-BY-4.0, CC0-1.0)")
+    att_parser.add_argument(
+        "--evidence-type",
+        required=True,
+        choices=VALID_ATTESTATION_EVIDENCE_TYPES,
+        help="Category of authorization evidence",
+    )
+    att_parser.add_argument(
+        "--evidence-ref",
+        "--evidence-reference",
+        dest="evidence_ref",
+        required=True,
+        help="Auditable reference, agreement ID, or license declaration excerpt",
+    )
+    att_parser.add_argument(
+        "--evidence-url",
+        "--source-evidence-url",
+        dest="evidence_url",
+        default=None,
+        help="Optional canonical HTTPS URL to public license/terms",
+    )
+    att_parser.add_argument("--evidence-sha256", default=None, help="Optional 64-hex SHA-256 digest of evidence artifact")
+    att_parser.add_argument("--attribution", default=None, help="Optional human-readable attribution text")
+    att_parser.add_argument(
+        "--permit-storage",
+        action="store_true",
+        help="Grant permission to store transcript text locally",
+    )
+    att_parser.add_argument(
+        "--permit-verbatim-excerpts",
+        action="store_true",
+        help="Grant permission to quote verbatim transcript excerpts",
+    )
+    att_parser.add_argument(
+        "--permit-ai-synthesis",
+        action="store_true",
+        help="Explicitly grant permission for transformative AI synthesis notes",
+    )
+    att_parser.add_argument(
+        "--permit-redistribution",
+        action="store_true",
+        help="Grant permission to redistribute transcript text externally",
+    )
+    att_parser.add_argument(
+        "--disallow-ai-synthesis",
+        action="store_true",
+        help="Disallow transformative AI synthesis notes on this resource/transcript",
+    )
+    att_parser.add_argument("--reviewed-by", required=True, help="Curator or reviewer recording the attestation")
+    att_parser.add_argument(
+        "--verification-status",
+        default="VERIFIED",
+        choices=VALID_ATTESTATION_VERIFICATION_STATUSES,
+        help="Verification status (default: VERIFIED)",
+    )
+    att_parser.add_argument("--notes", default=None, help="Optional human review notes")
+    att_parser.add_argument("--expires-at", default=None, help="Optional ISO-8601 UTC expiration timestamp")
+
+    att_list_parser = subparsers.add_parser(
+        "list-transcript-attestations",
+        help="List transcript authorization attestations in the local store",
+    )
+    att_list_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
+    att_list_parser.add_argument("--resource-id", default=None, help="Filter by resource_id")
+    att_list_parser.add_argument(
+        "--status",
+        default=None,
+        choices=VALID_ATTESTATION_VERIFICATION_STATUSES,
+        help="Filter by verification_status",
+    )
+
+    att_withdraw_parser = subparsers.add_parser(
+        "withdraw-transcript-attestation",
+        help="Withdraw a transcript authorization attestation and cascade takedown to dependent transcripts",
+    )
+    att_withdraw_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
+    att_withdraw_parser.add_argument("--attestation-id", required=True, help="Attestation ID to withdraw")
+    att_withdraw_parser.add_argument("--reason", required=True, help="Mandatory audit reason for withdrawal")
+    att_withdraw_parser.add_argument("--actor", default="rights_governance_officer", help="Actor recording withdrawal")
+
     tr_import_parser = subparsers.add_parser(
         "import-transcript",
         help="Import a local transcript (.vtt, .srt, .txt) for an existing resource under offline policy gates",
     )
     tr_import_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
     tr_import_parser.add_argument("--resource-id", required=True, help="Existing parent resource_id")
+    tr_import_parser.add_argument(
+        "--attestation-id",
+        default=None,
+        help="Auditable authorization attestation ID (required to store transcript text)",
+    )
     tr_import_parser.add_argument(
         "--file",
         type=Path,
@@ -5781,12 +7391,17 @@ def main(argv: list[str] | None = None) -> int:
     tr_import_parser.add_argument(
         "--permit-storage",
         action="store_true",
-        help="Explicitly attest that full transcript storage is permitted",
+        help="Request full transcript storage (must be backed by --attestation-id)",
     )
     tr_import_parser.add_argument(
         "--permit-verbatim-excerpts",
         action="store_true",
-        help="Explicitly attest that verbatim transcript excerpts are permitted",
+        help="Request verbatim transcript excerpts (must be backed by --attestation-id scope)",
+    )
+    tr_import_parser.add_argument(
+        "--permit-redistribution",
+        action="store_true",
+        help="Request external transcript redistribution (must be backed by --attestation-id scope)",
     )
     tr_import_parser.add_argument(
         "--duration-ms",
@@ -5845,6 +7460,72 @@ def main(argv: list[str] | None = None) -> int:
         print(format_import_summary(summary))
         return 0 if summary.rejected_count == 0 else 1
 
+    if cmd == "attest-transcript":
+        with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
+            att = store.record_transcript_attestation(
+                resource_id=args.resource_id,
+                transcript_id=args.transcript_id,
+                language_bcp47=args.language,
+                track_kind=args.track_kind,
+                authorization_basis=args.authorization_basis,
+                license_status=args.license_status,
+                license_spdx=args.license_spdx,
+                evidence_type=args.evidence_type,
+                evidence_reference=args.evidence_ref,
+                source_evidence_url=args.evidence_url,
+                evidence_sha256=args.evidence_sha256,
+                attribution_text=args.attribution,
+                permits_metadata_indexing=True,
+                permits_transcript_storage=bool(args.permit_storage),
+                permits_verbatim_excerpts=bool(args.permit_verbatim_excerpts),
+                permits_ai_synthesis=(not bool(args.disallow_ai_synthesis)) or bool(args.permit_ai_synthesis),
+                permits_redistribution=bool(args.permit_redistribution),
+                reviewed_by=args.reviewed_by,
+                verification_status=args.verification_status,
+                review_notes=args.notes,
+                expires_at=args.expires_at,
+            )
+        print("Transcript Authorization Attestation Recorded (offline / no network requests)")
+        print(f"  Attestation ID:            {att['attestation_id']}")
+        print(f"  Resource ID:               {att['resource_id']}")
+        print(f"  Verification status:       {att['verification_status']}")
+        print(f"  Authorization basis:       {att['authorization_basis']}")
+        print(f"  License status / SPDX:     {att['license_status']} ({att['license_spdx'] or 'no-spdx'})")
+        print(f"  Evidence type / ref:       {att['evidence_type']} | {att['evidence_reference']}")
+        print(f"  Permits text storage:      {int(att['permits_transcript_storage'])}")
+        print(f"  Permits verbatim excerpts: {int(att['permits_verbatim_excerpts'])}")
+        print(f"  Permits redistribution:    {int(att['permits_redistribution'])}")
+        return 0
+
+    if cmd == "list-transcript-attestations":
+        with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
+            rows = store.list_transcript_attestations(
+                resource_id=args.resource_id,
+                verification_status=args.status,
+            )
+        print(f"Transcript Authorization Attestations ({len(rows)}):")
+        for row in rows:
+            print(
+                f"  - {row['attestation_id']} | resource={row['resource_id']} | "
+                f"status={row['verification_status']} | basis={row['authorization_basis']} | "
+                f"storage={row['permits_transcript_storage']} | excerpts={row['permits_verbatim_excerpts']} | "
+                f"redistribution={row['permits_redistribution']}"
+            )
+        return 0
+
+    if cmd == "withdraw-transcript-attestation":
+        with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
+            updated = store.withdraw_transcript_attestation(
+                args.attestation_id,
+                reason=args.reason,
+                actor=args.actor,
+            )
+        print(
+            f"Attestation {updated['attestation_id']} withdrawn: "
+            f"status={updated['verification_status']}, reason={updated['withdrawal_reason']}"
+        )
+        return 0
+
     if cmd == "import-transcript":
         with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
             result = store.import_local_transcript_file(
@@ -5862,6 +7543,8 @@ def main(argv: list[str] | None = None) -> int:
                 attribution_text=args.attribution,
                 permits_transcript_storage=bool(args.permit_storage),
                 permits_verbatim_excerpts=bool(args.permit_verbatim_excerpts),
+                permits_redistribution=bool(args.permit_redistribution),
+                attestation_id=args.attestation_id,
                 duration_ms=args.duration_ms,
                 actor=args.actor,
             )
@@ -5881,6 +7564,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"  - {row['transcript_id']} | resource={row['resource_id']} | "
                 f"lang={row['language_bcp47']} ({row['track_kind']}) | "
                 f"state={row['ingestion_state']} | storage={row['transcript_storage_status']} | "
+                f"attestation={row.get('authorization_attestation_id') or 'none'} | "
                 f"segments={row['segment_count']}"
             )
         return 0
@@ -5899,6 +7583,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Origin / Method:      {tr['origin_type']} / {tr['acquisition_method']}")
         print(f"  Format:               {tr['caption_format']}")
         print(f"  License / Basis:      {tr['license_status']} ({tr['license_spdx'] or 'no-spdx'}) / {tr['authorization_basis']}")
+        print(f"  Attestation ID:       {tr.get('authorization_attestation_id') or 'none'}")
         print(f"  Ingestion State:      {tr['ingestion_state']}")
         print(f"  Storage Status:       {tr['transcript_storage_status']}")
         print(f"  Latest Version ID:    {tr['latest_transcript_version_id'] or 'none'}")
@@ -5943,6 +7628,7 @@ def main(argv: list[str] | None = None) -> int:
                     "resource_versions",
                     "discovered_link_candidates",
                     "discovered_link_reviews",
+                    "transcript_authorization_attestations",
                     "transcripts",
                     "transcript_versions",
                     "transcript_segments",
@@ -5956,7 +7642,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Knowledge store status ({db_target}):")
         print(f"  Schema version: {version}")
         for tbl, cnt in counts.items():
-            print(f"  {tbl:<26}: {cnt}")
+            print(f"  {tbl:<38}: {cnt}")
         return 0
 
     return 2
