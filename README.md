@@ -151,6 +151,7 @@ python3 knowledge_store.py list-transcripts --db data/runtime/inventory.sqlite
 python3 knowledge_store.py show-transcript <tr_id> --db data/runtime/inventory.sqlite --show-segments
 python3 knowledge_store.py withdraw-transcript-attestation <tatt_id> --db data/runtime/inventory.sqlite --withdrawn-by "curator:alice" --reason "Rights withdrawal request"
 python3 knowledge_store.py withdraw-transcript <tr_id> --db data/runtime/inventory.sqlite --reason "Rights withdrawal request"
+python3 knowledge_store.py expire-transcripts --db data/runtime/inventory.sqlite
 ```
 
 ### Transcript Subsystem Status: Implemented vs. Deferred
@@ -162,7 +163,7 @@ python3 knowledge_store.py withdraw-transcript <tr_id> --db data/runtime/invento
 | Auditable authorization attestations & scope enforcement (storage, quoting, AI synthesis, redistribution) | **Implemented** | Blocks caller-supplied permission flags unless backed by a `VERIFIED`, non-expired, non-withdrawn attestation matching resource/transcript/language/track scope |
 | Offline parser & normalizer (`WEBVTT`, `SRT`, `PLAIN_TEXT`) + validation (`TV-01`..`TV-08`) | **Implemented** | Strips markup, extracts speaker labels, flags low-confidence cues, validates intervals |
 | Fail-closed policy gate & hardened SQLite triggers blocking direct-SQL bypasses | **Implemented** | SQLite write triggers enforce verified non-expired attestation scope on `transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, and `provenance_events`, plus automatic revocation cascades |
-| Idempotent re-imports, version superseding (`ACTIVE` -> `SUPERSEDED`), and takedown/attestation withdrawal cascading | **Implemented** | Purges segments/syntheses on takedown or attestation withdrawal while retaining `TOMBSTONED` audit history |
+| Idempotent re-imports, version superseding (`ACTIVE` -> `SUPERSEDED`), takedown/attestation withdrawal cascading, and natural expiration enforcement | **Implemented** | Purges segments/syntheses and tombstones transcripts on takedown, attestation withdrawal, or natural `expires_at` expiration across all initialization, read, write, and `expire-transcripts` maintenance paths |
 | Live remote caption downloading (`OFFICIAL_PLATFORM_API`, YouTube/Vimeo HTTP fetching) | **Deferred** | Requires future task & explicit platform API credentials/terms review |
 | Automated Speech Recognition (`LOCAL_ASR_WHISPER` audio download & model execution) | **Deferred** | Schema fields exist, but no audio downloading or ASR execution is implemented |
 | Vector embeddings, semantic transcript search, learning UI, and cloud synchronization | **Deferred** | Local SQLite only; no Firebase/GCP provisioning or vector indexing |

@@ -1713,6 +1713,308 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         (att_b["attestation_id"],),
                     )
 
+    def test_14_natural_expiry_without_manual_update_blocks_reads_and_tombstones_idempotently(self) -> None:
+        """Verify natural attestation expiration (clock advancing past expires_at without a manual DB UPDATE) across all read/write/maintenance paths."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_natural_expiry.db"
+            current_time = ["2026-10-25T12:00:00+00:00"]
+
+            with KnowledgeStore(db_path, clock=lambda: current_time[0]) as store:
+                res_id = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/natural-expiry-lecture",
+                    title="Natural Expiry Verification Lecture",
+                )
+                future_expiry = "2026-10-26T00:00:00+00:00"
+
+                # 1. Create a valid, verified attestation with a future expires_at
+                att = self._create_open_license_attestation(
+                    store,
+                    res_id,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=True,
+                    expires_at=future_expiry,
+                )
+                att_id = str(att["attestation_id"])
+                self.assertEqual(att["verification_status"], "VERIFIED")
+                self.assertEqual(att["expires_at"], future_expiry)
+
+                # 2. Import a synthetic transcript and verify authorized access works before expires_at
+                imported = store.import_local_transcript_file(
+                    resource_id=res_id,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    origin_type="AUTHOR_PROVIDED",
+                    acquisition_method="OPEN_LICENSED_DIRECT_CAPTION",
+                    speaker_attribution_quality="VERIFIED_SINGLE_SPEAKER",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="3Blue1Brown CC-BY-4.0 Temporary Grant",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=True,
+                    attestation_id=att_id,
+                )
+                self.assertEqual(imported.status, "imported")
+                tr_id = imported.transcript_id
+
+                syn = store.record_transcript_synthesis(
+                    transcript_id=tr_id,
+                    synthesis_type="STRUCTURED_SUMMARY",
+                    generator_type="HUMAN_CURATED",
+                    content_markdown="## Summary\nAuthorized synthesis before expiry.",
+                )
+                self.assertTrue(syn["synthesis_id"].startswith("tsyn_"))
+
+                segments_before = store.get_transcript_segments(tr_id)
+                self.assertEqual(len(segments_before), 3)
+                first_seg_id = str(segments_before[0]["segment_id"])
+
+                link = store.record_transcript_segment_link(
+                    segment_id=first_seg_id,
+                    target_type="CONCEPT",
+                    target_id="concept_backprop_chain_rule",
+                    relation_type="EXPLAINS",
+                )
+                self.assertTrue(link["link_id"].startswith("tslnk_"))
+                self.assertEqual(len(store.get_transcript_segment_links(first_seg_id)), 1)
+
+                excerpts_before = store.get_verbatim_transcript_excerpt(tr_id, actor="tester")
+                self.assertEqual(len(excerpts_before), 3)
+                single_excerpt_before = store.get_verbatim_transcript_excerpt(first_seg_id, actor="tester")
+                self.assertEqual(single_excerpt_before["segment_id"], first_seg_id)
+
+                export_before = store.export_transcript_for_redistribution(tr_id, actor="tester")
+                self.assertEqual(len(export_before["segments"]), 3)
+                self.assertEqual(len(store.get_transcript_syntheses(tr_id)), 1)
+                self.assertEqual(store.get_transcript(tr_id)["ingestion_state"], "INGESTED")
+                self.assertEqual(len(store.list_transcripts(ingestion_state="INGESTED")), 1)
+                self.assertEqual(store.get_transcript_versions(tr_id)[0]["status"], "ACTIVE")
+
+                # 3. Advance the controllable test clock beyond expires_at WITHOUT updating the attestation row
+                current_time[0] = "2026-10-26T00:00:05+00:00"
+
+                # Confirm raw SQLite state before any application call is still VERIFIED / INGESTED
+                raw_att_before_call = store.conn.execute(
+                    "SELECT verification_status FROM transcript_authorization_attestations WHERE attestation_id = ?",
+                    (att_id,),
+                ).fetchone()
+                self.assertEqual(raw_att_before_call["verification_status"], "VERIFIED")
+
+                # 4a. Calling get_verbatim_transcript_excerpt by segment_id as the VERY FIRST call after natural expiry
+                # must fail closed with TranscriptPolicyViolationError (not return stale text or KeyError)
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(first_seg_id, actor="tester_after_expiry")
+
+                # 4b. Calling get_verbatim_transcript_excerpt by transcript_id also raises TranscriptPolicyViolationError
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(tr_id, actor="tester_after_expiry")
+
+                # 4c. Calling export_transcript_for_redistribution raises TranscriptPolicyViolationError
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.export_transcript_for_redistribution(tr_id, actor="tester_after_expiry")
+
+                # 4d. Calling get_transcript_segments returns [] and raw segments table has 0 rows
+                self.assertEqual(store.get_transcript_segments(tr_id), [])
+                raw_seg_count = store.conn.execute(
+                    "SELECT COUNT(*) FROM transcript_segments WHERE transcript_id = ?",
+                    (tr_id,),
+                ).fetchone()[0]
+                self.assertEqual(raw_seg_count, 0)
+
+                # 4e. Calling get_transcript_syntheses and get_transcript_segment_links returns []
+                self.assertEqual(store.get_transcript_syntheses(tr_id), [])
+                self.assertEqual(store.get_transcript_segment_links(first_seg_id), [])
+                raw_syn_count = store.conn.execute(
+                    "SELECT COUNT(*) FROM transcript_syntheses WHERE transcript_id = ?",
+                    (tr_id,),
+                ).fetchone()[0]
+                self.assertEqual(raw_syn_count, 0)
+
+                # 4f. get_transcript, list_transcripts, and get_transcript_versions reflect tombstoned/revoked state
+                tr_after = store.get_transcript(tr_id)
+                self.assertIsNotNone(tr_after)
+                self.assertEqual(tr_after["ingestion_state"], "WITHDRAWN_OR_TOMBSTONED")
+                self.assertEqual(tr_after["transcript_storage_status"], "TOMBSTONED_ON_TAKEDOWN")
+                self.assertEqual(tr_after["permits_transcript_storage"], 0)
+                self.assertEqual(tr_after["permits_verbatim_excerpts"], 0)
+                self.assertEqual(tr_after["permits_ai_synthesis"], 0)
+                self.assertEqual(tr_after["permits_redistribution"], 0)
+                self.assertEqual(tr_after["segment_count"], 0)
+                self.assertIsNone(tr_after["latest_transcript_version_id"])
+
+                self.assertEqual(store.list_transcripts(ingestion_state="INGESTED"), [])
+                tombstoned_list = store.list_transcripts(ingestion_state="WITHDRAWN_OR_TOMBSTONED")
+                self.assertEqual(len(tombstoned_list), 1)
+                self.assertEqual(tombstoned_list[0]["transcript_id"], tr_id)
+
+                versions_after = store.get_transcript_versions(tr_id)
+                self.assertEqual(len(versions_after), 1)
+                self.assertEqual(versions_after[0]["status"], "TOMBSTONED")
+
+                # 4g. get_transcript_attestation and list_transcript_attestations reflect EXPIRED status
+                att_after = store.get_transcript_attestation(att_id)
+                self.assertIsNotNone(att_after)
+                self.assertEqual(att_after["verification_status"], "EXPIRED")
+                self.assertEqual(att_after["permits_transcript_storage"], 0)
+                self.assertEqual(att_after["permits_verbatim_excerpts"], 0)
+                self.assertEqual(att_after["permits_ai_synthesis"], 0)
+                self.assertEqual(att_after["permits_redistribution"], 0)
+
+                self.assertEqual(store.list_transcript_attestations(verification_status="VERIFIED"), [])
+                expired_atts = store.list_transcript_attestations(verification_status="EXPIRED")
+                self.assertEqual(len(expired_atts), 1)
+                self.assertEqual(expired_atts[0]["attestation_id"], att_id)
+
+                # 4h. Write operations (import, synthesis, segment link) are blocked after natural expiry
+                with self.assertRaises(ValueError):
+                    store.import_local_transcript_file(
+                        resource_id=res_id,
+                        transcript_path=VTT_FIXTURE,
+                        language_bcp47="en",
+                        track_kind="PRIMARY",
+                        license_status="VERIFIED_PERMISSIVE",
+                        license_spdx="CC-BY-4.0",
+                        authorization_basis="OPEN_LICENSE_VERIFIED",
+                        attribution_text="Re-import attempt after natural expiry",
+                        permits_transcript_storage=True,
+                        attestation_id=att_id,
+                    )
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.record_transcript_synthesis(
+                        transcript_id=tr_id,
+                        synthesis_type="STRUCTURED_SUMMARY",
+                        generator_type="HUMAN_CURATED",
+                        content_markdown="## Blocked\nCannot synthesize expired transcript.",
+                    )
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.record_transcript_segment_link(
+                        segment_id=first_seg_id,
+                        target_type="CONCEPT",
+                        target_id="concept_blocked",
+                        relation_type="EXPLAINS",
+                    )
+
+                # 4i. Provenance events recorded once and repeated expiry maintenance is idempotent
+                exp_events = store.conn.execute(
+                    "SELECT * FROM provenance_events WHERE event_type = 'TRANSCRIPT_ATTESTATION_EXPIRED'"
+                ).fetchall()
+                tomb_events = store.conn.execute(
+                    "SELECT * FROM provenance_events WHERE event_type = 'TRANSCRIPT_TOMBSTONED_ON_TAKEDOWN'"
+                ).fetchall()
+                self.assertEqual(len(exp_events), 1)
+                self.assertEqual(len(tomb_events), 1)
+
+                # Repeated maintenance calls must be a no-op returning [] and adding 0 duplicate events
+                self.assertEqual(store.expire_due_transcript_attestations(), [])
+                self.assertEqual(store.run_transcript_expiry_maintenance(), [])
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT COUNT(*) FROM provenance_events WHERE event_type = 'TRANSCRIPT_ATTESTATION_EXPIRED'"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    store.conn.execute(
+                        "SELECT COUNT(*) FROM provenance_events WHERE event_type = 'TRANSCRIPT_TOMBSTONED_ON_TAKEDOWN'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_15_natural_expiry_triggered_by_first_read_on_segments_or_store_init_or_cli(self) -> None:
+        """Verify natural expiry when first triggered by get_transcript_segments, store re-initialization, or CLI expire-transcripts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_natural_expiry_paths.db"
+            current_time = ["2026-10-25T12:00:00+00:00"]
+
+            with KnowledgeStore(db_path, clock=lambda: current_time[0]) as store:
+                res_1 = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/expiry-path-1",
+                    title="Expiry Path 1",
+                )
+                res_2 = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/expiry-path-2",
+                    title="Expiry Path 2",
+                )
+                att_1 = self._create_open_license_attestation(
+                    store,
+                    res_1,
+                    expires_at="2026-10-26T00:00:00+00:00",
+                )
+                att_2 = self._create_open_license_attestation(
+                    store,
+                    res_2,
+                    expires_at="2026-10-27T00:00:00+00:00",
+                )
+                imp_1 = store.import_local_transcript_file(
+                    resource_id=res_1,
+                    transcript_path=VTT_FIXTURE,
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Path 1 CC-BY-4.0",
+                    permits_transcript_storage=True,
+                    attestation_id=att_1["attestation_id"],
+                )
+                imp_2 = store.import_local_transcript_file(
+                    resource_id=res_2,
+                    transcript_path=SRT_FIXTURE,
+                    caption_format="SRT",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Path 2 CC-BY-4.0",
+                    permits_transcript_storage=True,
+                    attestation_id=att_2["attestation_id"],
+                )
+                self.assertEqual(len(store.get_transcript_segments(imp_1.transcript_id)), 3)
+                self.assertEqual(len(store.get_transcript_segments(imp_2.transcript_id)), 2)
+
+                # Advance clock past att_1's expires_at (but before att_2's expires_at)
+                current_time[0] = "2026-10-26T01:00:00+00:00"
+
+                # Calling get_transcript_segments directly as the first read after expiry:
+                self.assertEqual(store.get_transcript_segments(imp_1.transcript_id), [])
+                self.assertEqual(store.get_transcript(imp_1.transcript_id)["ingestion_state"], "WITHDRAWN_OR_TOMBSTONED")
+                # Meanwhile imp_2 (whose expires_at is 2026-10-27) remains active and accessible!
+                self.assertEqual(len(store.get_transcript_segments(imp_2.transcript_id)), 2)
+                self.assertEqual(store.get_transcript(imp_2.transcript_id)["ingestion_state"], "INGESTED")
+
+            # Re-open/initialize the store with clock advanced past att_2's expires_at
+            with KnowledgeStore(db_path, clock=lambda: "2026-10-27T01:00:00+00:00") as store2:
+                # KnowledgeStore.__init__(auto_initialize=True) -> initialize() -> expire_due_transcript_attestations()
+                raw_seg_2 = store2.conn.execute(
+                    "SELECT COUNT(*) FROM transcript_segments WHERE transcript_id = ?",
+                    (imp_2.transcript_id,),
+                ).fetchone()[0]
+                self.assertEqual(raw_seg_2, 0)
+                self.assertEqual(store2.get_transcript(imp_2.transcript_id)["ingestion_state"], "WITHDRAWN_OR_TOMBSTONED")
+                self.assertEqual(store2.get_transcript_attestation(att_2["attestation_id"])["verification_status"], "EXPIRED")
+
+            # Verify CLI expire-transcripts subcommand works offline and is idempotent
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = knowledge_store.main(
+                    [
+                        "expire-transcripts",
+                        "--db",
+                        str(db_path),
+                        "--now",
+                        "2026-10-28T00:00:00+00:00",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("Expired transcript attestations processed (0):", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

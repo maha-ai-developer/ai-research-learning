@@ -3865,6 +3865,8 @@ class KnowledgeStore:
         *,
         conn: sqlite3.Connection | None = None,
         auto_initialize: bool = True,
+        clock: Callable[[], str] | None = None,
+        now_fn: Callable[[], str] | None = None,
     ) -> None:
         if conn is not None:
             self.db_path: Path | None = Path(db_path) if db_path else None
@@ -3877,12 +3879,24 @@ class KnowledgeStore:
             self.conn = sqlite3.connect(str(resolved_path))
             self._owns_connection = True
 
+        self._clock: Callable[[], str] = now_fn or clock or utc_now
+        self._expiry_maintenance_in_progress = False
         self._tx_depth = 0
         self._savepoint_seq = 0
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         if auto_initialize:
             self.initialize()
+
+    def set_clock(self, clock: Callable[[], str] | None) -> None:
+        """Configure or reset the store's time source (used for deterministic expiry testing)."""
+        self._clock = clock or utc_now
+
+    def _now_iso(self, now_iso: str | None = None) -> str:
+        """Return an explicit ISO-8601 timestamp or the current timestamp from the configured clock."""
+        if now_iso is not None and now_iso.strip():
+            return now_iso.strip()
+        return self._clock()
 
     def close(self) -> None:
         if self._owns_connection and self.conn is not None:
@@ -3916,8 +3930,10 @@ class KnowledgeStore:
             self._tx_depth -= 1
 
     def initialize(self) -> list[int]:
-        """Initialize the database and apply any pending migrations idempotently."""
-        return apply_migrations(self.conn)
+        """Initialize the database, apply pending migrations idempotently, and expire due transcript attestations."""
+        newly_applied = apply_migrations(self.conn)
+        self.expire_due_transcript_attestations()
+        return newly_applied
 
     def get_schema_version(self) -> int:
         """Return the current schema version recorded in `schema_migrations`."""
@@ -3983,7 +3999,8 @@ class KnowledgeStore:
         else:
             host_paths_json = json.dumps(list(approved_host_paths), ensure_ascii=False)
 
-        now = utc_now()
+        now = self._now_iso()
+        self.expire_due_transcript_attestations(now_iso=now)
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -4270,7 +4287,7 @@ class KnowledgeStore:
         recorded_at: str | None = None,
     ) -> dict[str, Any]:
         """Record an immutable provenance event in `provenance_events`."""
-        timestamp = recorded_at or utc_now()
+        timestamp = recorded_at or self._now_iso()
         generated_event_id = event_id or (
             "prov_"
             + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -5983,8 +6000,8 @@ class KnowledgeStore:
     # Transcript persistence, offline import, versioning & takedowns
     # ------------------------------------------------------------------
 
-    def get_transcript_attestation(self, attestation_id: str) -> dict[str, Any] | None:
-        """Retrieve a `transcript_authorization_attestations` row by `attestation_id`, or None if not found."""
+    def _get_transcript_attestation_raw(self, attestation_id: str) -> dict[str, Any] | None:
+        """Fetch a `transcript_authorization_attestations` row without triggering expiry maintenance."""
         row = self.conn.execute(
             "SELECT * FROM transcript_authorization_attestations WHERE attestation_id = ?",
             (attestation_id,),
@@ -5995,6 +6012,298 @@ class KnowledgeStore:
         d.setdefault("source_evidence_url", d.get("evidence_url"))
         return d
 
+    def _is_transcript_authorized_for_read(
+        self,
+        tr: dict[str, Any] | None,
+        *,
+        require_storage: bool = True,
+        require_verbatim: bool = False,
+        require_synthesis: bool = False,
+        require_redistribution: bool = False,
+        now_iso: str | None = None,
+    ) -> tuple[bool, dict[str, Any] | None, str | None]:
+        """Evaluate live transcript & attestation authorization for read-path operations at `now_iso`."""
+        if tr is None:
+            return False, None, "Transcript record was not found."
+
+        effective_now = self._now_iso(now_iso)
+        state = str(tr.get("ingestion_state") or "")
+        if require_storage:
+            if state not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW") or not int(
+                tr.get("permits_transcript_storage", 0)
+            ):
+                return (
+                    False,
+                    None,
+                    f"Transcript {tr.get('transcript_id')} does not permit storage or segment retrieval (state={state!r}).",
+                )
+        else:
+            if state not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW", "METADATA_ONLY_LINKED"):
+                return (
+                    False,
+                    None,
+                    f"Transcript {tr.get('transcript_id')} is not in an active state (state={state!r}).",
+                )
+
+        if require_verbatim and not int(tr.get("permits_verbatim_excerpts", 0)):
+            return (
+                False,
+                None,
+                f"Transcript {tr.get('transcript_id')} does not permit verbatim quoting/excerpts (permits_verbatim_excerpts=0).",
+            )
+        if require_synthesis and not int(tr.get("permits_ai_synthesis", 0)):
+            return (
+                False,
+                None,
+                f"Transcript {tr.get('transcript_id')} does not permit AI synthesis (permits_ai_synthesis=0).",
+            )
+        if require_redistribution and not int(tr.get("permits_redistribution", 0)):
+            return (
+                False,
+                None,
+                f"Transcript {tr.get('transcript_id')} does not permit redistribution (permits_redistribution=0).",
+            )
+
+        att_id = tr.get("authorization_attestation_id")
+        needs_attestation = (
+            require_storage
+            or require_verbatim
+            or require_redistribution
+            or bool(int(tr.get("permits_transcript_storage", 0)))
+        )
+        if needs_attestation and not att_id:
+            return (
+                False,
+                None,
+                f"Transcript {tr.get('transcript_id')} is missing a required authorization_attestation_id.",
+            )
+        if not att_id:
+            return True, None, None
+
+        att = self._get_transcript_attestation_raw(str(att_id))
+        if att is None:
+            return (
+                False,
+                None,
+                f"Authorization attestation {att_id!r} for transcript {tr.get('transcript_id')} was not found.",
+            )
+        if att.get("withdrawn_at") or str(att.get("verification_status")) != "VERIFIED":
+            return (
+                False,
+                att,
+                f"Attestation {att_id!r} is not active/VERIFIED (status={att.get('verification_status')!r}).",
+            )
+        if _is_iso_timestamp_expired(att.get("expires_at"), now_iso=effective_now):
+            return (
+                False,
+                att,
+                f"Attestation {att_id!r} expired at {att.get('expires_at')!r} (now={effective_now!r}).",
+            )
+        if (
+            str(att.get("resource_id")) != str(tr["resource_id"])
+            or (att.get("transcript_id") and str(att.get("transcript_id")) != str(tr["transcript_id"]))
+            or (att.get("language_bcp47") and str(att.get("language_bcp47")) != str(tr["language_bcp47"]))
+            or (att.get("track_kind") and str(att.get("track_kind")) != str(tr["track_kind"]))
+        ):
+            return (
+                False,
+                att,
+                f"Attestation {att_id!r} scope does not match transcript {tr.get('transcript_id')}.",
+            )
+        if require_storage and not int(att.get("permits_transcript_storage", 0)):
+            return (
+                False,
+                att,
+                f"Attestation {att_id!r} does not permit transcript storage (permits_transcript_storage=0).",
+            )
+        if require_verbatim and not int(att.get("permits_verbatim_excerpts", 0)):
+            return (
+                False,
+                att,
+                f"Attestation {att_id!r} does not permit verbatim quoting (permits_verbatim_excerpts=0).",
+            )
+        if require_synthesis and not int(att.get("permits_ai_synthesis", 0)):
+            return (
+                False,
+                att,
+                f"Attestation {att_id!r} does not permit AI synthesis (permits_ai_synthesis=0).",
+            )
+        if require_redistribution and not int(att.get("permits_redistribution", 0)):
+            return (
+                False,
+                att,
+                f"Attestation {att_id!r} does not permit redistribution (permits_redistribution=0).",
+            )
+        return True, att, None
+
+    def expire_due_transcript_attestations(
+        self,
+        *,
+        now_iso: str | None = None,
+        actor: str = "transcript_expiry_maintenance",
+    ) -> list[dict[str, Any]]:
+        """Transition any naturally expired transcript attestations to `EXPIRED` and tombstone dependent transcripts."""
+        if self._expiry_maintenance_in_progress:
+            return []
+        table_check = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'transcript_authorization_attestations'"
+        ).fetchone()
+        if table_check is None:
+            return []
+
+        effective_now = self._now_iso(now_iso)
+        self._expiry_maintenance_in_progress = True
+        expired_records: list[dict[str, Any]] = []
+        try:
+            rows = self.conn.execute(
+                """
+                SELECT *
+                  FROM transcript_authorization_attestations
+                 WHERE expires_at IS NOT NULL
+                   AND trim(expires_at) != ''
+                   AND withdrawn_at IS NULL
+                   AND (
+                       verification_status != 'EXPIRED'
+                       OR permits_transcript_storage != 0
+                       OR permits_verbatim_excerpts != 0
+                       OR permits_ai_synthesis != 0
+                       OR permits_redistribution != 0
+                   )
+                 ORDER BY created_at, attestation_id
+                """
+            ).fetchall()
+            due_rows = [
+                dict(r)
+                for r in rows
+                if _is_iso_timestamp_expired(r["expires_at"], now_iso=effective_now)
+            ]
+
+            lingering_transcripts = self.conn.execute(
+                """
+                SELECT t.transcript_id, a.attestation_id, a.expires_at
+                  FROM transcripts t
+                  JOIN transcript_authorization_attestations a
+                    ON a.attestation_id = t.authorization_attestation_id
+                 WHERE a.expires_at IS NOT NULL
+                   AND trim(a.expires_at) != ''
+                   AND (
+                       t.ingestion_state != 'WITHDRAWN_OR_TOMBSTONED'
+                       OR t.transcript_storage_status != 'TOMBSTONED_ON_TAKEDOWN'
+                       OR t.permits_transcript_storage != 0
+                       OR t.segment_count != 0
+                   )
+                """
+            ).fetchall()
+            due_lingering = [
+                dict(r)
+                for r in lingering_transcripts
+                if _is_iso_timestamp_expired(r["expires_at"], now_iso=effective_now)
+            ]
+
+            if not due_rows and not due_lingering:
+                return []
+
+            with self.transaction() as conn:
+                for cand in due_rows:
+                    att_id = str(cand["attestation_id"])
+                    resource_id = str(cand["resource_id"])
+                    expires_at = str(cand["expires_at"])
+                    resource_row = self.get_resource(resource_id=resource_id)
+                    source_id = str(resource_row["source_id"]) if resource_row else None
+
+                    linked_transcripts = conn.execute(
+                        """
+                        SELECT transcript_id
+                          FROM transcripts
+                         WHERE authorization_attestation_id = ?
+                            OR (transcript_id = ? AND ? IS NOT NULL)
+                        """,
+                        (att_id, cand.get("transcript_id"), cand.get("transcript_id")),
+                    ).fetchall()
+                    tombstoned_ids: list[str] = []
+                    for tr_row in linked_transcripts:
+                        tid = str(tr_row[0])
+                        self.tombstone_transcript_on_takedown(
+                            tid,
+                            reason=f"Authorization attestation {att_id} expired at {expires_at}.",
+                            actor=actor.strip(),
+                            now_iso=effective_now,
+                        )
+                        tombstoned_ids.append(tid)
+
+                    next_rev = int(cand["revision_number"]) + 1
+                    existing_notes = (cand.get("review_notes") or "").strip()
+                    expiry_note = f"Attestation expired at {expires_at} (evaluated at {effective_now})."
+                    updated_notes = (
+                        f"{existing_notes} | {expiry_note}"
+                        if existing_notes and f"Attestation expired at {expires_at}" not in existing_notes
+                        else (existing_notes or expiry_note)
+                    )
+                    prov = self.record_provenance(
+                        event_type="TRANSCRIPT_ATTESTATION_EXPIRED",
+                        acquisition_method="FIRST_PARTY_CURATED_IMPORT",
+                        actor=actor.strip(),
+                        status="expired",
+                        source_id=source_id,
+                        resource_id=resource_id,
+                        source_url=cand.get("evidence_url")
+                        or (str(resource_row["canonical_url"]) if resource_row else None),
+                        details={
+                            "attestation_id": att_id,
+                            "previous_status": str(cand["verification_status"]),
+                            "expires_at": expires_at,
+                            "evaluated_at": effective_now,
+                            "tombstoned_transcripts": tombstoned_ids,
+                        },
+                        recorded_at=effective_now,
+                    )
+                    conn.execute(
+                        """
+                        UPDATE transcript_authorization_attestations
+                           SET verification_status = 'EXPIRED',
+                               permits_transcript_storage = 0,
+                               permits_verbatim_excerpts = 0,
+                               permits_ai_synthesis = 0,
+                               permits_redistribution = 0,
+                               review_notes = ?,
+                               revision_number = ?,
+                               provenance_event_id = ?,
+                               updated_at = ?
+                         WHERE attestation_id = ?
+                        """,
+                        (
+                            updated_notes,
+                            next_rev,
+                            str(prov["event_id"]),
+                            effective_now,
+                            att_id,
+                        ),
+                    )
+                    updated_row = self._get_transcript_attestation_raw(att_id)
+                    if updated_row is not None:
+                        expired_records.append(updated_row)
+
+                for ling in due_lingering:
+                    tid = str(ling["transcript_id"])
+                    att_id = str(ling["attestation_id"])
+                    expires_at = str(ling["expires_at"])
+                    self.tombstone_transcript_on_takedown(
+                        tid,
+                        reason=f"Authorization attestation {att_id} expired at {expires_at}.",
+                        actor=actor.strip(),
+                        now_iso=effective_now,
+                    )
+            return expired_records
+        finally:
+            self._expiry_maintenance_in_progress = False
+
+    run_transcript_expiry_maintenance = expire_due_transcript_attestations
+
+    def get_transcript_attestation(self, attestation_id: str) -> dict[str, Any] | None:
+        """Retrieve a `transcript_authorization_attestations` row by `attestation_id`, or None if not found."""
+        self.expire_due_transcript_attestations()
+        return self._get_transcript_attestation_raw(attestation_id)
+
     def list_transcript_attestations(
         self,
         *,
@@ -6003,6 +6312,7 @@ class KnowledgeStore:
         verification_status: str | None = None,
     ) -> list[dict[str, Any]]:
         """List `transcript_authorization_attestations` rows matching optional filters."""
+        self.expire_due_transcript_attestations()
         clauses: list[str] = []
         params: list[Any] = []
         if resource_id is not None:
@@ -6136,7 +6446,7 @@ class KnowledgeStore:
             eff_verbatim = False
             eff_redist = False
 
-        now = utc_now()
+        now = self._now_iso()
         rev_at = (reviewed_at or now).strip()
         if effective_status == "VERIFIED" and _is_iso_timestamp_expired(expires_at, now_iso=now):
             effective_status = "EXPIRED"
@@ -6159,7 +6469,7 @@ class KnowledgeStore:
         source_id = str(resource_row["source_id"])
 
         with self.transaction() as conn:
-            existing = self.get_transcript_attestation(attestation_id)
+            existing = self._get_transcript_attestation_raw(attestation_id)
             prov = self.record_provenance(
                 event_type="TRANSCRIPT_ATTESTATION_RECORDED",
                 acquisition_method="FIRST_PARTY_CURATED_IMPORT",
@@ -6290,7 +6600,7 @@ class KnowledgeStore:
                         attestation_id,
                     ),
                 )
-        row = self.get_transcript_attestation(attestation_id)
+        row = self._get_transcript_attestation_raw(attestation_id)
         assert row is not None
         return row
 
@@ -6306,11 +6616,11 @@ class KnowledgeStore:
             raise ValueError("Attestation withdrawal reason must be non-empty")
         if not actor or not actor.strip():
             raise ValueError("actor must be non-empty")
-        existing = self.get_transcript_attestation(attestation_id)
+        existing = self._get_transcript_attestation_raw(attestation_id)
         if existing is None:
             raise KeyError(f"Unknown attestation_id: {attestation_id!r}")
 
-        now = utc_now()
+        now = self._now_iso()
         resource_id = str(existing["resource_id"])
         resource_row = self.get_resource(resource_id=resource_id)
         source_id = str(resource_row["source_id"]) if resource_row else None
@@ -6333,6 +6643,7 @@ class KnowledgeStore:
                     tid,
                     reason=f"Authorization attestation {attestation_id} withdrawn: {reason.strip()}",
                     actor=actor.strip(),
+                    now_iso=now,
                 )
                 tombstoned_ids.append(tid)
 
@@ -6352,6 +6663,7 @@ class KnowledgeStore:
                     "withdrawal_reason": reason.strip(),
                     "tombstoned_transcripts": tombstoned_ids,
                 },
+                recorded_at=now,
             )
             conn.execute(
                 """
@@ -6379,12 +6691,13 @@ class KnowledgeStore:
                     attestation_id,
                 ),
             )
-        updated = self.get_transcript_attestation(attestation_id)
+        updated = self._get_transcript_attestation_raw(attestation_id)
         assert updated is not None
         return updated
 
     def get_transcript(self, transcript_id: str) -> dict[str, Any] | None:
         """Retrieve a `transcripts` row by `transcript_id`, or None if not found."""
+        self.expire_due_transcript_attestations()
         row = self.conn.execute(
             "SELECT * FROM transcripts WHERE transcript_id = ?",
             (transcript_id,),
@@ -6400,6 +6713,7 @@ class KnowledgeStore:
         license_status: str | None = None,
     ) -> list[dict[str, Any]]:
         """List transcripts matching optional filters ordered by `created_at, transcript_id`."""
+        self.expire_due_transcript_attestations()
         clauses: list[str] = []
         params: list[Any] = []
         if resource_id is not None:
@@ -6422,8 +6736,32 @@ class KnowledgeStore:
         rows = self.conn.execute(query, tuple(params)).fetchall()
         return [dict(r) for r in rows]
 
-    def get_transcript_versions(self, transcript_id: str) -> list[dict[str, Any]]:
-        """Return all `transcript_versions` for `transcript_id` ordered by `version_number` ascending."""
+    def get_transcript_versions(
+        self,
+        transcript_id: str,
+        *,
+        active_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return `transcript_versions` for `transcript_id` ordered by `version_number` ascending.
+
+        Expires any due attestations first so naturally expired transcripts have `status = 'TOMBSTONED'`.
+        When `active_only=True`, returns only `ACTIVE` versions if the transcript is currently authorized for storage.
+        """
+        self.expire_due_transcript_attestations()
+        if active_only:
+            tr = self.get_transcript(transcript_id)
+            ok, _, _ = self._is_transcript_authorized_for_read(tr, require_storage=True)
+            if not ok:
+                return []
+            rows = self.conn.execute(
+                """
+                SELECT * FROM transcript_versions
+                 WHERE transcript_id = ? AND status = 'ACTIVE'
+                 ORDER BY version_number ASC
+                """,
+                (transcript_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
         rows = self.conn.execute(
             """
             SELECT * FROM transcript_versions
@@ -6440,20 +6778,32 @@ class KnowledgeStore:
         *,
         transcript_version_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return ordered `transcript_segments` for `transcript_id` (defaults to `latest_transcript_version_id`)."""
-        target_version_id = transcript_version_id
-        if target_version_id is None:
-            tr = self.get_transcript(transcript_id)
-            if tr is None or not tr.get("latest_transcript_version_id"):
-                return []
-            target_version_id = str(tr["latest_transcript_version_id"])
+        """Return ordered `transcript_segments` for `transcript_id` ONLY when currently authorized for storage.
+
+        Runs natural-expiry maintenance first and enforces live read-path authorization against
+        `transcripts` and `transcript_authorization_attestations` before returning any segment rows.
+        """
+        self.expire_due_transcript_attestations()
+        tr = self.get_transcript(transcript_id)
+        ok, _, _ = self._is_transcript_authorized_for_read(tr, require_storage=True)
+        if not ok or tr is None:
+            return []
+        target_version_id = transcript_version_id or tr.get("latest_transcript_version_id")
+        if not target_version_id:
+            return []
+        ver_row = self.conn.execute(
+            "SELECT status FROM transcript_versions WHERE transcript_version_id = ? AND transcript_id = ?",
+            (str(target_version_id), transcript_id),
+        ).fetchone()
+        if ver_row is None or str(ver_row["status"]) != "ACTIVE":
+            return []
         rows = self.conn.execute(
             """
             SELECT * FROM transcript_segments
              WHERE transcript_id = ? AND transcript_version_id = ?
              ORDER BY sequence_index ASC
             """,
-            (transcript_id, target_version_id),
+            (transcript_id, str(target_version_id)),
         ).fetchall()
         results: list[dict[str, Any]] = []
         for r in rows:
@@ -6528,7 +6878,8 @@ class KnowledgeStore:
                 else "NOT_STORED"
             )
         )
-        now = utc_now()
+        now = self._now_iso()
+        self.expire_due_transcript_attestations(now_iso=now)
         with self.transaction() as conn:
             existing = self.get_transcript(transcript_id)
             if existing is not None:
@@ -6753,6 +7104,7 @@ class KnowledgeStore:
           `provenance_events` and stores ZERO rows in `transcript_versions` or `transcript_segments`.
         - Never logs or persists full transcript text in `provenance_events`.
         """
+        self.expire_due_transcript_attestations()
         resource_row = self.get_resource(resource_id=resource_id)
         if resource_row is None:
             raise ValueError(f"Parent resource_id does not exist in resources table: {resource_id!r}")
@@ -6861,6 +7213,7 @@ class KnowledgeStore:
             expected_transcript_id=transcript_id,
             expected_language_bcp47=lang,
             expected_track_kind=kind,
+            now_iso=self._now_iso(),
         )
 
         effective_license_status = (
@@ -7149,7 +7502,7 @@ class KnowledgeStore:
                     provenance_event_id=event_id,
                 )
 
-            now = utc_now()
+            now = self._now_iso()
             max_ver_row = conn.execute(
                 "SELECT COALESCE(MAX(version_number), 0) FROM transcript_versions WHERE transcript_id = ?",
                 (transcript_id,),
@@ -7497,15 +7850,41 @@ class KnowledgeStore:
         *,
         reason: str,
         actor: str = "rights_governance_officer",
+        now_iso: str | None = None,
     ) -> dict[str, Any]:
         """Withdraw/tombstone a transcript, purging stored segments and syntheses while retaining audit metadata."""
         if not reason or not reason.strip():
             raise ValueError("Takedown/withdrawal reason must be non-empty")
-        existing = self.get_transcript(transcript_id)
-        if existing is None:
+        existing_row = self.conn.execute(
+            "SELECT * FROM transcripts WHERE transcript_id = ?",
+            (transcript_id,),
+        ).fetchone()
+        if existing_row is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
+        existing = dict(existing_row)
 
-        now = utc_now()
+        if (
+            existing["ingestion_state"] == "WITHDRAWN_OR_TOMBSTONED"
+            and existing["transcript_storage_status"] == "TOMBSTONED_ON_TAKEDOWN"
+            and int(existing["permits_transcript_storage"]) == 0
+            and int(existing["segment_count"]) == 0
+        ):
+            rem_seg = self.conn.execute(
+                "SELECT COUNT(*) FROM transcript_segments WHERE transcript_id = ?",
+                (transcript_id,),
+            ).fetchone()[0]
+            rem_syn = self.conn.execute(
+                "SELECT COUNT(*) FROM transcript_syntheses WHERE transcript_id = ?",
+                (transcript_id,),
+            ).fetchone()[0]
+            rem_ver = self.conn.execute(
+                "SELECT COUNT(*) FROM transcript_versions WHERE transcript_id = ? AND status != 'TOMBSTONED'",
+                (transcript_id,),
+            ).fetchone()[0]
+            if rem_seg == 0 and rem_syn == 0 and rem_ver == 0:
+                return existing
+
+        now = self._now_iso(now_iso)
         with self.transaction() as conn:
             deleted_segments = conn.execute(
                 "DELETE FROM transcript_segments WHERE transcript_id = ?",
@@ -7544,6 +7923,7 @@ class KnowledgeStore:
                 source_id=str(existing["source_id"]),
                 resource_id=str(existing["resource_id"]),
                 source_url=str(existing["media_canonical_url"]),
+                recorded_at=now,
                 details={
                     "transcript_id": transcript_id,
                     "authorization_attestation_id": existing.get("authorization_attestation_id"),
@@ -7553,9 +7933,12 @@ class KnowledgeStore:
                     "purged_syntheses": deleted_syntheses,
                 },
             )
-        result = self.get_transcript(transcript_id)
-        assert result is not None
-        return result
+        result_row = self.conn.execute(
+            "SELECT * FROM transcripts WHERE transcript_id = ?",
+            (transcript_id,),
+        ).fetchone()
+        assert result_row is not None
+        return dict(result_row)
 
     def get_verbatim_transcript_excerpt(
         self,
@@ -7574,18 +7957,33 @@ class KnowledgeStore:
           read-time payload gating for verbatim excerpt retrieval is enforced here in the repository method
           before returning segment text.
         """
+        is_segment_request = target_id.startswith(("seg_", "tseg_"))
         seg_row: sqlite3.Row | None = None
-        if target_id.startswith(("seg_", "tseg_")):
+        if is_segment_request:
             seg_row = self.conn.execute(
                 "SELECT * FROM transcript_segments WHERE segment_id = ?",
                 (target_id,),
             ).fetchone()
-            if seg_row is None:
-                raise KeyError(f"Unknown segment_id: {target_id!r}")
-            transcript_id = str(seg_row["transcript_id"])
+            if seg_row is not None:
+                transcript_id = str(seg_row["transcript_id"])
+            else:
+                match = re.match(r"^seg_(tr_[0-9a-f]{16})(?:_v\d+)?_\d+$", target_id)
+                if match is not None:
+                    cand_tr_id = match.group(1)
+                    exists_tr = self.conn.execute(
+                        "SELECT transcript_id FROM transcripts WHERE transcript_id = ?",
+                        (cand_tr_id,),
+                    ).fetchone()
+                    if exists_tr is not None:
+                        transcript_id = cand_tr_id
+                    else:
+                        raise KeyError(f"Unknown segment_id: {target_id!r}")
+                else:
+                    raise KeyError(f"Unknown segment_id: {target_id!r}")
         else:
             transcript_id = target_id
 
+        self.expire_due_transcript_attestations()
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
@@ -7610,23 +8008,23 @@ class KnowledgeStore:
             raise TranscriptPolicyViolationError(
                 f"Authorization attestation {att_id!r} for transcript {transcript_id} was not found."
             )
-        if (
-            att.get("withdrawn_at")
-            or str(att.get("verification_status")) != "VERIFIED"
-            or _is_iso_timestamp_expired(att.get("expires_at"))
-            or not int(att.get("permits_transcript_storage", 0))
-            or not int(att.get("permits_verbatim_excerpts", 0))
-            or str(att.get("resource_id")) != str(tr["resource_id"])
-            or (att.get("transcript_id") and str(att.get("transcript_id")) != transcript_id)
-            or (att.get("language_bcp47") and str(att.get("language_bcp47")) != str(tr["language_bcp47"]))
-            or (att.get("track_kind") and str(att.get("track_kind")) != str(tr["track_kind"]))
+        if not self._is_transcript_authorized_for_read(
+            tr,
+            require_storage=True,
+            require_verbatim=True,
         ):
             raise TranscriptPolicyViolationError(
                 f"Attestation {att_id!r} does not permit verbatim quoting (status={att.get('verification_status')!r}, "
                 f"permits_verbatim_excerpts={att.get('permits_verbatim_excerpts')!r})."
             )
 
-        if seg_row is not None:
+        if is_segment_request:
+            seg_row = self.conn.execute(
+                "SELECT * FROM transcript_segments WHERE segment_id = ?",
+                (target_id,),
+            ).fetchone()
+            if seg_row is None:
+                raise KeyError(f"Unknown segment_id: {target_id!r}")
             item = dict(seg_row)
             item["quality_flags"] = json.loads(item.get("quality_flags_json") or "[]")
             item["attribution_text"] = tr["attribution_text"]
@@ -7688,6 +8086,7 @@ class KnowledgeStore:
         - Because SQLite does not support `BEFORE SELECT` triggers, read-time redistribution export gating is
           enforced in this repository method before returning transcript segments.
         """
+        self.expire_due_transcript_attestations()
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
@@ -7712,16 +8111,10 @@ class KnowledgeStore:
             raise TranscriptPolicyViolationError(
                 f"Attestation {att_id!r} for transcript {transcript_id} was not found."
             )
-        if (
-            att.get("withdrawn_at")
-            or str(att.get("verification_status")) != "VERIFIED"
-            or _is_iso_timestamp_expired(att.get("expires_at"))
-            or not int(att.get("permits_transcript_storage", 0))
-            or not int(att.get("permits_redistribution", 0))
-            or str(att.get("resource_id")) != str(tr["resource_id"])
-            or (att.get("transcript_id") and str(att.get("transcript_id")) != transcript_id)
-            or (att.get("language_bcp47") and str(att.get("language_bcp47")) != str(tr["language_bcp47"]))
-            or (att.get("track_kind") and str(att.get("track_kind")) != str(tr["track_kind"]))
+        if not self._is_transcript_authorized_for_read(
+            tr,
+            require_storage=True,
+            require_redistribution=True,
         ):
             raise TranscriptPolicyViolationError(
                 f"Attestation {att_id!r} does not permit redistribution (status={att.get('verification_status')!r}, "
@@ -7763,6 +8156,7 @@ class KnowledgeStore:
         review_status: str = "PENDING_REVIEW",
     ) -> dict[str, Any]:
         """Persist a transformative study synthesis artifact linked to a transcript."""
+        self.expire_due_transcript_attestations()
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise ValueError(f"Unknown transcript_id: {transcript_id!r}")
@@ -7776,22 +8170,14 @@ class KnowledgeStore:
             raise TranscriptPolicyViolationError(
                 f"Transcript {transcript_id} is missing a required authorization_attestation_id for synthesis storage."
             )
-        if att_id:
-            att = self.get_transcript_attestation(str(att_id))
-            if (
-                att is None
-                or att.get("withdrawn_at")
-                or str(att.get("verification_status")) != "VERIFIED"
-                or _is_iso_timestamp_expired(att.get("expires_at"))
-                or not int(att.get("permits_ai_synthesis", 0))
-                or str(att.get("resource_id")) != str(tr["resource_id"])
-                or (att.get("transcript_id") and str(att.get("transcript_id")) != transcript_id)
-                or (att.get("language_bcp47") and str(att.get("language_bcp47")) != str(tr["language_bcp47"]))
-                or (att.get("track_kind") and str(att.get("track_kind")) != str(tr["track_kind"]))
-            ):
-                raise TranscriptPolicyViolationError(
-                    f"Linked attestation {att_id!r} for transcript {transcript_id} is missing, withdrawn, expired, scope-mismatched, or disallows AI synthesis."
-                )
+        if not self._is_transcript_authorized_for_read(
+            tr,
+            require_storage=False,
+            require_synthesis=True,
+        ):
+            raise TranscriptPolicyViolationError(
+                f"Linked attestation {att_id!r} for transcript {transcript_id} is missing, withdrawn, expired, scope-mismatched, or disallows AI synthesis."
+            )
         if synthesis_type not in VALID_TRANSCRIPT_SYNTHESIS_TYPES:
             raise ValueError(f"Invalid synthesis_type: {synthesis_type!r}")
         if generator_type not in VALID_TRANSCRIPT_SYNTHESIS_GENERATORS:
@@ -7813,7 +8199,7 @@ class KnowledgeStore:
             synthesis_type=synthesis_type,
             content_markdown=content_markdown,
         )
-        now = utc_now()
+        now = self._now_iso()
         ranges_json = json.dumps(referenced_time_ranges or [], ensure_ascii=False)
         with self.transaction() as conn:
             conn.execute(
@@ -7852,6 +8238,14 @@ class KnowledgeStore:
 
     def get_transcript_syntheses(self, transcript_id: str) -> list[dict[str, Any]]:
         """Return all `transcript_syntheses` for `transcript_id` ordered by `created_at`."""
+        self.expire_due_transcript_attestations()
+        tr = self.get_transcript(transcript_id)
+        if tr is None or not self._is_transcript_authorized_for_read(
+            tr,
+            require_storage=False,
+            require_synthesis=True,
+        ):
+            return []
         rows = self.conn.execute(
             "SELECT * FROM transcript_syntheses WHERE transcript_id = ? ORDER BY created_at, synthesis_id",
             (transcript_id,),
@@ -7883,13 +8277,30 @@ class KnowledgeStore:
         if not (0.0 <= float(confidence) <= 1.0):
             raise ValueError("confidence must be between 0.0 and 1.0")
 
+        now = self._now_iso()
+        self.expire_due_transcript_attestations(now_iso=now)
+        seg_row = self.conn.execute(
+            "SELECT transcript_id FROM transcript_segments WHERE segment_id = ?",
+            (segment_id,),
+        ).fetchone()
+        if seg_row is None:
+            raise TranscriptPolicyViolationError(
+                f"Cannot link segment {segment_id!r}: segment does not exist or has been purged due to expiry/withdrawal."
+            )
+        tr = self.get_transcript(str(seg_row["transcript_id"]))
+        if tr is None or not self._is_transcript_authorized_for_read(
+            tr,
+            require_storage=True,
+        ):
+            raise TranscriptPolicyViolationError(
+                f"Cannot link segment {segment_id!r}: parent transcript is not authorized for storage."
+            )
         link_id = compute_transcript_segment_link_id(
             segment_id=segment_id,
             target_type=target_type,
             target_id=target_id,
             relation_type=relation_type,
         )
-        now = utc_now()
         with self.transaction() as conn:
             conn.execute(
                 """
@@ -7921,6 +8332,19 @@ class KnowledgeStore:
 
     def get_transcript_segment_links(self, segment_id: str) -> list[dict[str, Any]]:
         """Return all `transcript_segment_links` for `segment_id`."""
+        self.expire_due_transcript_attestations()
+        seg_row = self.conn.execute(
+            "SELECT transcript_id FROM transcript_segments WHERE segment_id = ?",
+            (segment_id,),
+        ).fetchone()
+        if seg_row is None:
+            return []
+        tr = self.get_transcript(str(seg_row["transcript_id"]))
+        if tr is None or not self._is_transcript_authorized_for_read(
+            tr,
+            require_storage=True,
+        ):
+            return []
         rows = self.conn.execute(
             "SELECT * FROM transcript_segment_links WHERE segment_id = ? ORDER BY created_at, link_id",
             (segment_id,),
@@ -7928,9 +8352,14 @@ class KnowledgeStore:
         return [dict(r) for r in rows]
 
 
-def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> KnowledgeStore:
+def init_db(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    *,
+    clock: Callable[[], str] | None = None,
+    now_fn: Callable[[], str] | None = None,
+) -> KnowledgeStore:
     """Initialize or migrate the SQLite knowledge store at `db_path` and return a `KnowledgeStore`."""
-    return KnowledgeStore(db_path=db_path, auto_initialize=True)
+    return KnowledgeStore(db_path=db_path, auto_initialize=True, clock=clock, now_fn=now_fn)
 
 
 def import_seed_manifest(
@@ -8218,6 +8647,14 @@ def main(argv: list[str] | None = None) -> int:
     tr_withdraw_parser.add_argument("--reason", required=True, help="Mandatory audit reason for withdrawal")
     tr_withdraw_parser.add_argument("--actor", default="rights_governance_officer", help="Actor recording withdrawal")
 
+    tr_expire_parser = subparsers.add_parser(
+        "expire-transcripts",
+        help="Enforce natural expiration on due transcript authorization attestations and tombstone dependent transcripts",
+    )
+    tr_expire_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
+    tr_expire_parser.add_argument("--now", default=None, help="Optional ISO-8601 UTC timestamp override for evaluation")
+    tr_expire_parser.add_argument("--actor", default="expiry_enforcer", help="Actor recording expiration events")
+
     status_parser = subparsers.add_parser("status", help="Show local knowledge store schema and table counts")
     status_parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path")
 
@@ -8389,6 +8826,21 @@ def main(argv: list[str] | None = None) -> int:
             f"state={updated['ingestion_state']}, storage={updated['transcript_storage_status']}, "
             f"segments={updated['segment_count']}"
         )
+        return 0
+
+    if cmd == "expire-transcripts":
+        with KnowledgeStore(db_path=args.db, auto_initialize=False) as store:
+            store.initialize()
+            expired = store.expire_due_transcript_attestations(
+                now_iso=args.now,
+                actor=args.actor,
+            )
+        print(f"Expired transcript attestations processed ({len(expired)}):")
+        for row in expired:
+            print(
+                f"  - {row['attestation_id']} | resource={row['resource_id']} | "
+                f"status={row['verification_status']} | expires_at={row['expires_at']}"
+            )
         return 0
 
     if cmd == "status":
