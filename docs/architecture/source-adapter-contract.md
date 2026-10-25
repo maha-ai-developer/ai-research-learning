@@ -2,9 +2,10 @@
 
 **Document ID:** `ARCH-ADAPTER-003`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-24  
+**Last Updated:** 2026-10-25  
 **Baseline Implementation Reference:** `collect.py` (`ConservativeCollector`), `src/ai_research_learning/sources/`  
-**Related Decisions:** [ADR-0005 (`0005-arxiv-api-access-policy.md`)](decisions/0005-arxiv-api-access-policy.md)
+**Related Decisions:** [ADR-0005 (`0005-arxiv-api-access-policy.md`)](decisions/0005-arxiv-api-access-policy.md), [ADR-0006 (`0006-transcript-acquisition-and-storage.md`)](decisions/0006-transcript-acquisition-and-storage.md)  
+**Companion Docs:** [`transcript-ingestion.md`](./transcript-ingestion.md) (`ARCH-TRANSCRIPT-007`)
 
 ---
 
@@ -278,24 +279,26 @@ When an adapter parses HTML from `SRC-HINTON`, `SRC-BENGIO`, or `SRC-3B1B`, it e
 
 ## 7. Transcript Availability and Authorized Acquisition Methods
 
-Lecture, talk, and interview transcripts are high-value learning assets (e.g., Hinton's 2012 Coursera neural network lectures, Bengio's speeches and interviews, and 3Blue1Brown's visual math lessons), but they carry strict copyright and platform terms.
+Lecture, talk, and interview transcripts are high-value learning assets (e.g., Hinton's lectures and interviews, Bengio's speeches and interviews, and 3Blue1Brown's visual math lessons), but they carry strict copyright and platform terms. The complete transcript ingestion architecture, data model, state machine, and source-by-source rules are specified in [`transcript-ingestion.md`](./transcript-ingestion.md) (`ARCH-TRANSCRIPT-007`) and [`decisions/0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md) (`ADR-0006`).
 
 ### 7.1 Permitted Acquisition Hierarchy
 
-An adapter may ingest transcript text **only** through one of the following authorized methods:
+An adapter or transcript workflow may acquire transcript text **only** through one of the four mutually exclusive methods defined in `ADR-0006`:
 
-1. **Method A — First-Party Open Lesson Text / Captions (`SRC-3B1B` / Open Repositories):**
-   - Where a creator publishes written lesson text or open caption files under an explicit open license or public first-party educational page that permits indexing, the adapter records the license/terms and extracts timestamped concept anchors. Where full text is All Rights Reserved (default for 3Blue1Brown lesson narratives), the adapter indexes **section headings, mathematical concept tags, timestamp deep-links, and short AI-generated summaries** rather than duplicating the verbatim lesson article.
-2. **Method B — Creative Commons Licensed Media / Official Open Transcripts:**
-   - Videos or audio tracks published with an explicit Creative Commons license (`CC BY` or `CC BY-SA`) or official public-domain/open-access transcript text (e.g., official UN speech transcript release or CC-licensed academic talk).
-3. **Method C — Curator-Uploaded / Rights-Cleared Transcript Files:**
-   - Transcripts manually vetted and uploaded by a project curator with a documented `authorization_basis` and `license_status` in `transcripts/{transcript_id}`.
+1. **Method A — Official Transcript or Caption Published on Approved Source Page (`METHOD_A_OFFICIAL_SOURCE_PAGE`):**
+   - Where a first-party page publishes written lesson text or open caption files under an explicit open license or documented permission, the pipeline records the license/terms and extracts timestamped concept anchors. Where full text is All Rights Reserved (`SRC-3B1B`, `SRC-HINTON`, `SRC-BENGIO` by default), the adapter indexes **section headings, mathematical concept tags, timestamp deep-links, and short AI-generated summaries** rather than storing or redistributing the verbatim lesson narrative (`permits_full_text_storage = false`, `permits_verbatim_excerpts = false`).
+2. **Method B — Public Transcript URL or Official API Explicitly Permitted by Terms and Access Controls (`METHOD_B_PERMITTED_URL_OR_API`):**
+   - Publicly hosted `.vtt`/`.srt`/`.txt`/TimedText files or official APIs where both technical access policy (`robots.txt` or official API Terms of Service) and reuse license (`CC-BY-4.0`, `CC-BY-SA-4.0`, `CC0-1.0`, or written permission) are verified. Viewing captions in a third-party video player (such as YouTube's web UI or IFrame player) does **not** grant API download permission (`captions.download` requires video-owner OAuth `youtube.force-ssl` / `youtubepartner`).
+3. **Method C — Authorized User-Supplied Transcript or Approved ASR Output (`METHOD_C_AUTHORIZED_USER_SUPPLIED_ASR`):**
+   - Offline curator-uploaded transcript files or approved speech-to-text (ASR) output accompanied by a mandatory `AuthorizationAttestation` verifying that the underlying audio/video is public domain, openly licensed (`CC BY`, `CC BY-SA`, `CC0`), or covered by written rights-holder permission.
+4. **Method D — Metadata-Only Fallback (`METHOD_D_UNAVAILABLE`):**
+   - When no authorized transcript source passes the policy and rights gates, the resource transitions to `UNAVAILABLE` (or `BLOCKED_BY_POLICY`) and retains metadata, outbound links, and optional curator-authored timestamp index points (`original_segment_text = null`, `normalized_segment_text = null`).
 
 ### 7.2 Strictly Prohibited Transcript Practices
 
-- **No unauthorized third-party YouTube scraping:** Do not use unofficial scraper libraries (`youtube-dl`, `yt-dlp`, or unauthenticated transcript scrapers bypassing platform terms) to bulk-download audio or closed captions from third-party YouTube channels without permission or API compliance.
-- **No Whisper/ASR transcription of copyrighted streams without rights:** Do not download copyrighted video/audio files to run speech-to-text transcription unless the media itself carries an open license or explicit permission from the copyright holder.
-- **Timestamp Deep-Linking as the Default:** Whenever full transcript storage is not licensed, the system stores structured **Topic & Timestamp Index Points** (`start_ms`, `end_ms`, `concept_ids`, and an AI-generated one-sentence description of what is taught in that segment) so learners can click through directly to the exact timestamp on the official hosting platform.
+- **No unauthorized third-party YouTube or video platform scraping:** Do not use unofficial scraper libraries (`youtube-transcript-api`, `youtube-dl`, `yt-dlp`, headless browsers, or undocumented internal timedtext endpoints) to download audio or closed captions from third-party video platforms.
+- **No Whisper/ASR transcription of copyrighted streams without rights:** Do not download copyrighted video/audio files to run speech-to-text transcription unless the media itself carries a verified open license or explicit written permission from the copyright holder.
+- **Discovery and Curation Never Grant Transcript Fetching Permission:** Recording a candidate link in `discovered_link_candidates` or approving it in `discovered_link_reviews` never triggers a transcript download and never bypasses the pre-acquisition policy gate.
 
 ---
 
