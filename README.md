@@ -21,6 +21,7 @@ ai-research-learning/
 ├── knowledge_store.py          # local SQLite persistence store, migrations, and manifest importer
 ├── src/
 │   └── ai_research_learning/
+│       ├── api.py              # local read-only Research Library HTTP API (v1)
 │       └── sources/            # modular source adapters (Hinton, Bengio, 3B1B, arXiv, Wikipedia) & pilot coordinator
 ├── seed_urls.json              # 52-record source manifest
 ├── collection_plan.csv         # initial collection plan
@@ -167,6 +168,64 @@ python3 knowledge_store.py expire-transcripts --db data/runtime/inventory.sqlite
 | Live remote caption downloading (`OFFICIAL_PLATFORM_API`, YouTube/Vimeo HTTP fetching) | **Deferred** | Requires future task & explicit platform API credentials/terms review |
 | Automated Speech Recognition (`LOCAL_ASR_WHISPER` audio download & model execution) | **Deferred** | Schema fields exist, but no audio downloading or ASR execution is implemented |
 | Vector embeddings, semantic transcript search, learning UI, and cloud synchronization | **Deferred** | Local SQLite only; no Firebase/GCP provisioning or vector indexing |
+
+## 2.2 Local Research Library HTTP API (Read-Only `v1`)
+
+`src/ai_research_learning/api.py` provides a local, zero-dependency, strictly read-only HTTP API (`v1`) over the SQLite `KnowledgeStore`.
+
+### Safety & Architecture Boundaries
+
+- **Strictly read-only:** Every database connection is opened with SQLite URI `mode=ro` and enforces `PRAGMA query_only = ON`. No API route can mutate database state, and only `GET` requests are accepted (`405 Method Not Allowed` with `Allow: GET` on other HTTP methods).
+- **Zero network requests:** All endpoints read exclusively from local SQLite tables (`sources`, `site_policies`, `resources`, `resource_versions`, `transcripts`, `transcript_versions`, `transcript_authorization_attestations`).
+- **Loopback binding by default:** The server binds to `127.0.0.1:8000` by default.
+- **Transcript content protection boundary:** `GET /api/v1/transcripts` and `GET /api/v1/transcripts/{transcript_id}` expose registry and `transcript_versions` status metadata only (`content_disclosure_policy: "METADATA_ONLY_NO_SEGMENTS_OR_SYNTHESES"`). They never query or return `transcript_segments`, verbatim excerpts, protected transcript text, or `transcript_syntheses` content. Naturally expired or withdrawn attestations are projected in-memory as `WITHDRAWN_OR_TOMBSTONED` / `TOMBSTONED_ON_TAKEDOWN` without mutating the database.
+- **Current schema search scope (`metadata_lexical`):** Because `knowledge_chunks`, FTS5 virtual tables, and vector embeddings are deferred in the current schema (`v8`), `GET /api/v1/search?q=...` performs deterministic parameterized lexical search with relevance scoring over stored `resources` metadata columns (`title`, `abstract_or_description`, `authors`, `topic_tags`, `external_identifier`, `canonical_url`, `manifest_id`, `domain_scope`).
+
+### Starting the Local API Server
+
+```bash
+# Ensure the local SQLite database is initialized and seeded:
+python3 knowledge_store.py init --db data/runtime/inventory.sqlite
+python3 knowledge_store.py import-manifest --db data/runtime/inventory.sqlite
+
+# Start the local read-only HTTP server on 127.0.0.1:8000:
+python3 -m src.ai_research_learning.api --db data/runtime/inventory.sqlite --host 127.0.0.1 --port 8000
+```
+
+### Endpoint Reference & Example `curl` Requests
+
+| Endpoint | Description | Supported Query Parameters |
+| --- | --- | --- |
+| `GET /healthz` | Service health and SQLite schema readiness | *(none)* |
+| `GET /api/v1/sources` | Registered sources, `site_policies` status, and resource/transcript counts | `status`, `source_category`, `adapter_type`, `only_complete` |
+| `GET /api/v1/resources` | Paginated resource inventory | `source_id`, `resource_type`, `media_modality`, `lifecycle_state`, `collection_decision`, `limit` (`1..100`), `offset` (`>=0`) |
+| `GET /api/v1/resources/{resource_id}` | Single resource metadata, `resource_versions` history, and metadata-only `transcripts_summary` | *(none)* |
+| `GET /api/v1/search?q=...` | Deterministic lexical search over resource metadata | `q` *(required)*, `source_id`, `resource_type`, `media_modality`, `lifecycle_state`, `limit` (`1..100`), `offset` (`>=0`) |
+| `GET /api/v1/transcripts` | Paginated transcript registry metadata (no segment text) | `resource_id`, `source_id`, `language_bcp47`, `track_kind`, `ingestion_state`, `license_status`, `transcript_storage_status`, `limit` (`1..100`), `offset` (`>=0`) |
+| `GET /api/v1/transcripts/{transcript_id}` | Single transcript metadata, attestation summary, and `transcript_versions` status (no segment or synthesis text) | *(none)* |
+
+```bash
+# 1. Check service and database health:
+curl -s http://127.0.0.1:8000/healthz | python3 -m json.tool
+
+# 2. List registered sources and crawl-policy status:
+curl -s "http://127.0.0.1:8000/api/v1/sources?only_complete=true" | python3 -m json.tool
+
+# 3. List resources with pagination and source filter:
+curl -s "http://127.0.0.1:8000/api/v1/resources?source_id=SRC-HINTON&limit=5&offset=0" | python3 -m json.tool
+
+# 4. Inspect a single resource (metadata, version history, and transcript summary):
+curl -s "http://127.0.0.1:8000/api/v1/resources/res_0123456789abcdef" | python3 -m json.tool
+
+# 5. Search resource metadata:
+curl -s "http://127.0.0.1:8000/api/v1/search?q=backpropagation&limit=10" | python3 -m json.tool
+
+# 6. List transcript registry metadata:
+curl -s "http://127.0.0.1:8000/api/v1/transcripts?limit=10&offset=0" | python3 -m json.tool
+
+# 7. Inspect a single transcript's metadata and version-status ledger:
+curl -s "http://127.0.0.1:8000/api/v1/transcripts/tr_0123456789abcdef" | python3 -m json.tool
+```
 
 ## 3. Before enabling network collection
 
