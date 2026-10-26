@@ -696,21 +696,51 @@ class TranscriptIngestionRepositoryProtocol(Protocol):
     ) -> None: ...
 ```
 
-### 8.2 Future SQLite Migration `6` (`_migration_6_transcripts_and_segments`) Implications
+### 8.2 SQLite Migrations `6`, `7`, and `8` (`0006_transcripts_and_segments`, `0007_transcript_authorization_attestations`, and `0008_harden_transcript_authorization_triggers`)
 
-When a future task implements transcript storage in [`../../knowledge_store.py`](../../knowledge_store.py):
+Implemented in [`../../knowledge_store.py`](../../knowledge_store.py):
 
-1. **Forward-Only Migration (`version 5 -> 6`):**
-   - Add `_migration_6_transcripts_and_segments(conn)` creating `transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, and `transcript_segment_links` with `PRAGMA foreign_keys = ON`.
-   - Preserve all existing tables (`sources`, `resources`, `resource_versions`, `provenance_events`, `discovered_link_candidates`, `discovered_link_reviews`, and legacy collector tables) with zero data loss.
-2. **Database-Level Safety Constraints (`CHECK` & Triggers):**
-   - `transcripts`: `CHECK (permits_transcript_storage IN (0, 1))` and `CHECK (NOT (ingestion_state IN ('UNAVAILABLE', 'BLOCKED_BY_POLICY', 'WITHDRAWN_OR_TOMBSTONED') AND permits_transcript_storage = 1))`.
-   - `transcript_segments`: `CHECK (start_ms >= 0 AND end_ms >= start_ms)` and `CHECK (sequence_index >= 0)`.
-   - Repository transaction guard: `ingest_permitted_transcript_version` must verify inside the SQLite transaction that `policy_result.next_state == 'READY_FOR_INGESTION'` and `policy_result.permits_transcript_storage is True` before inserting any row into `transcript_segments`.
-3. **Deterministic ID Helpers to Add in `knowledge_store.py`:**
+1. **Forward-Only Migration `6` (`0006_transcripts_and_segments`, `version 5 -> 6`):**
+   - Adds `transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, and `transcript_segment_links` with `PRAGMA foreign_keys = ON`.
+   - Preserves all existing tables (`sources`, `resources`, `resource_versions`, `provenance_events`, `discovered_link_candidates`, `discovered_link_reviews`, and legacy collector tables) with zero data loss.
+2. **Forward-Only Migration `7` (`0007_transcript_authorization_attestations`, `version 6 -> 7`):**
+   - Adds `transcript_authorization_attestations` (`attestation_id` `tatt_<sha256_16>`) and extends `transcripts` with `permits_redistribution` while preserving Migration `6` untouched for forward-only checksum stability.
+   - Captures structured, human-verifiable authorization records for transcript rights:
+     - **Target linkage:** `resource_id`, optional `transcript_id`, `language_bcp47`, and `track_kind`.
+     - **Authorization basis & evidence:** `authorization_basis` (`OPEN_LICENSE_VERIFIED`, `PUBLIC_DOMAIN_VERIFIED`, `FIRST_PARTY_OWNED`, `FIRST_PARTY_OWNED_MEDIA`, `WRITTEN_PERMISSION`, `WRITTEN_RIGHTS_HOLDER_PERMISSION`, `NONE`), `license_status`, `license_spdx`, `evidence_type` (`LICENSE_URL`, `SPDX_HEADER_OR_PAGE_FOOTER`, `FIRST_PARTY_STATEMENT`, `WRITTEN_PERMISSION_RECORD`, `PUBLIC_DOMAIN_DEDICATION`, `SOURCE_REGISTRY_POLICY`, `OTHER_DOCUMENTED_EVIDENCE`), `evidence_reference`, optional `evidence_url`, and optional `evidence_sha256`.
+     - **Four-Part Granular Scope Distinction:**
+       1. `permits_transcript_storage`: Permission to persist `transcript_versions` and `transcript_segments` in the local SQLite store.
+       2. `permits_verbatim_excerpts`: Permission to quote verbatim segment spans (`get_verbatim_transcript_excerpt`). May be `0` even when storage is `1` (e.g., internal study index where verbatim display is restricted).
+       3. `permits_ai_synthesis`: Permission to generate transformative study notes or summaries (`record_transcript_synthesis` / `transcript_syntheses`).
+       4. `permits_redistribution`: Permission to export or redistribute full transcript text (`export_transcript_for_redistribution`). Defaults to `0` and is enforced independently of local storage and verbatim excerpt permissions.
+     - **Verification & Lifecycle State:** `verification_status` (`VERIFIED`, `PENDING_REVIEW`, `CONTRADICTORY`, `REJECTED`, `WITHDRAWN`, `EXPIRED`, `UNKNOWN`), `reviewed_by`, `reviewed_at`, optional `expires_at`, and withdrawal audit columns (`withdrawn_at`, `withdrawn_by`, `withdrawal_reason`).
+3. **Forward-Only Migration `8` (`0008_harden_transcript_authorization_triggers`, `version 7 -> 8`):**
+   - Hardens database-level SQLite triggers while keeping Migrations `6` and `7` untouched:
+     - Enforces live `expires_at` (`expires_at IS NULL OR datetime(expires_at) > datetime('now')`), `verification_status = 'VERIFIED'`, `withdrawn_at IS NULL`, `authorization_basis` / `license_spdx` consistency, and full scope alignment (`resource_id`, `transcript_id`, `language_bcp47`, `track_kind`) on `INSERT` and `UPDATE` across `transcripts`, `transcript_versions`, `transcript_segments`, and `transcript_syntheses`.
+     - Prevents un-withdrawing an attestation, broadening/retargeting attestation scope after creation, mutating `transcripts` identity/scope columns, or reactivating `'TOMBSTONED'` versions or `'WITHDRAWN_OR_TOMBSTONED'` transcripts via direct SQL.
+     - Enforces write-side permission checks on `transcript_syntheses` (`permits_ai_synthesis = 1` + active verified attestation) and `provenance_events` (`TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED` `status='allowed'` requires `permits_verbatim_excerpts = 1`; `TRANSCRIPT_REDISTRIBUTION_EXPORTED` `status='exported'` requires `permits_redistribution = 1`).
+     - Adds automatic `AFTER UPDATE` revocation cascade triggers (`trg_transcript_attestations_cascade_revocation_after_update` and `trg_transcripts_cascade_revocation_after_update`) so direct-SQL withdrawal, expiry, un-verification, or permission narrowing on an attestation immediately purges stored `transcript_segments` and `transcript_syntheses` and tombstones affected `transcript_versions` and `transcripts`.
+4. **Database-Level Write Triggers vs. Repository Read-Path Enforcement Boundary:**
+   - **Caller-Supplied Flags Are Never Sufficient on Their Own:** Passing `permits_transcript_storage=True` or `--permits-storage` without a `VERIFIED`, non-withdrawn, non-expired attestation matching the resource (and transcript/language/track scope) is rejected (`permits_transcript_storage = False`, `permits_ai_synthesis = False`, `ingestion_state = 'BLOCKED_BY_POLICY'` or `'NEEDS_REVIEW'`), and zero segment text rows are written.
+   - **Operation-Specific Permission Matrix & Disclosure Boundaries:**
+     - `permits_transcript_storage`: Required to persist `transcript_versions`, `transcript_segments`, and `transcript_segment_links`, and to inspect structural segment metadata via `get_transcript_segments(..., include_text=False)` (which returns timing, speaker labels, confidence, hashes, and `char_count` while redacting `original_segment_text` and `normalized_segment_text` to `None`) or `get_transcript_segment_links`.
+     - `permits_verbatim_excerpts`: Required alongside `permits_transcript_storage` for `get_verbatim_transcript_excerpt(transcript_id, start_ms=..., end_ms=...)`. When `permits_redistribution = 0`, excerpt windows are bounded to `<= 120,000 ms` (`120s`) so callers cannot reconstruct the full transcript via an unbounded window.
+     - `permits_ai_synthesis`: Required alongside `permits_transcript_storage` for `record_transcript_synthesis` and `get_transcript_syntheses`, and independently gated by `evaluate_transcript_storage_policy(..., requested_ai_synthesis=...)`.
+     - `permits_redistribution`: Required alongside `permits_transcript_storage` for `export_transcript_for_redistribution` and `get_transcript_segments(..., include_text=True)`.
+     - **Blocked-Operation Provenance Audit:** Any denied excerpt, full-segment text read, synthesis creation, or redistribution export records a `status='blocked'` provenance event (`TRANSCRIPT_VERBATIM_EXCERPT_BLOCKED`, `TRANSCRIPT_SEGMENTS_TEXT_BLOCKED`, `TRANSCRIPT_SYNTHESIS_BLOCKED`, `TRANSCRIPT_REDISTRIBUTION_BLOCKED`) without storing or returning transcript text.
+   - **SQLite Write Enforcement vs. Read-Path Payload Enforcement:** Because SQLite is an embedded file database without `BEFORE SELECT` triggers or row-level read ACLs on stored tables, a caller with raw SQLite read access can `SELECT` from `transcript_segments` whenever `permits_transcript_storage = 1`. Therefore, read-time payload gating for `permits_verbatim_excerpts`, `permits_ai_synthesis`, and `permits_redistribution` is enforced in the repository read methods (`get_transcript_segments`, `get_verbatim_transcript_excerpt`, `get_transcript_syntheses`, and `export_transcript_for_redistribution`), while SQLite triggers enforce all write-side flag escalation, synthesis persistence (`transcript_syntheses`), audit-event integrity (`provenance_events`), and revocation cascades.
+   - **Engineering Control vs. Legal Advice:** Attestation records provide an auditable engineering control and evidence trail for human reviewers; they do not perform automated legal interpretation.
+   - **Cascading Withdrawal & Natural Expiration Enforcement:**
+      - Withdrawing an attestation via `withdraw_transcript_attestation` (or via direct SQL `UPDATE`) marks the attestation `WITHDRAWN`, revokes active scope flags, and cascades tombstone purging across linked transcripts while preserving provenance history.
+      - Because SQLite triggers only fire on `INSERT`, `UPDATE`, or `DELETE` statements—and SQLite is an embedded, serverless file database with no background daemon or `BEFORE SELECT` triggers—passing an attestation's `expires_at` timestamp while the database sits idle does not mutate rows on disk until the next database operation. To prevent stale access after natural expiration without relying on a manual `UPDATE` at expiry time:
+        1. `KnowledgeStore.expire_due_transcript_attestations()` (aliased as `run_transcript_expiry_maintenance()` and exposed via the `expire-transcripts` CLI command) runs automatically on `KnowledgeStore.initialize()` and at the start of every transcript/attestation read and write method (`get_transcript`, `list_transcripts`, `get_transcript_versions`, `get_transcript_segments`, `get_verbatim_transcript_excerpt`, `export_transcript_for_redistribution`, `get_transcript_syntheses`, `get_transcript_segment_links`, `get_transcript_attestation`, `list_transcript_attestations`, `import_local_transcript`, `record_transcript_synthesis`, and `record_transcript_segment_link`), using the store's injectable clock (`clock` / `now_fn` / `set_clock`).
+        2. Any non-withdrawn attestation whose `expires_at <= effective_now` is atomically transitioned to `verification_status = 'EXPIRED'` with all permission flags (`permits_transcript_storage`, `permits_verbatim_excerpts`, `permits_ai_synthesis`, `permits_redistribution`) cleared to `0`, all linked active transcripts tombstoned (`ingestion_state = 'WITHDRAWN_OR_TOMBSTONED'`, `transcript_storage_status = 'TOMBSTONED_ON_TAKEDOWN'`), stored `transcript_segments` and `transcript_syntheses` purged, `transcript_versions` marked `'TOMBSTONED'`, and `TRANSCRIPT_ATTESTATION_EXPIRED` + `TRANSCRIPT_TOMBSTONED_ON_TAKEDOWN` provenance events recorded idempotently.
+        3. As defense-in-depth, `_is_transcript_authorized_for_read` verifies live attestation validity on every transcript read path before returning segments, syntheses, segment links, excerpts, or exports.
+5. **Deterministic ID Helpers in `knowledge_store.py`:**
    - `compute_transcript_id(resource_id: str, language_bcp47: str, track_kind: str) -> str` (`tr_<sha256_16>`)
-   - `compute_transcript_version_id(transcript_id: str, raw_content_sha256: str, version_number: int, created_at: str) -> str` (`tver_<yyyymmdd>_<hash8>_v<n>`)
-   - `compute_transcript_segment_id(transcript_id: str, sequence_index: int) -> str` (`seg_<transcript_id>_<sequence_index:05d>`)
+   - `compute_transcript_attestation_id(...) -> str` (`tatt_<sha256_16>`)
+   - `compute_transcript_version_id(transcript_id: str, raw_content_sha256: str, version_number: int) -> str` (`tver_<sha256_16>`)
+   - `compute_transcript_segment_id(transcript_version_id: str, sequence_index: int) -> str` (`tseg_<sha256_16>`)
 
 ---
 

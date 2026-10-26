@@ -1,0 +1,14 @@
+WEBVTT
+Kind: captions
+Language: en
+
+NOTE Synthetic test fixture only (not a real lecture transcript). Licensed CC-BY-4.0 for unit testing.
+
+00:00:00.000 --> 00:00:04.500
+<v Instructor>Welcome to this <c.highlight>synthetic</c> test lecture on backpropagation &amp; chain rule derivatives.</v>
+
+00:00:04.500 --> 00:00:09.250
+<v Instructor>We define the scalar loss L(w) = 1/2 * ||y - f(x; w)||^2 and compute dL/dw_i.</v>
+
+00:00:09.250 --> 00:00:14.000
+<v Student>How does gradient clipping affect <i>exploding gradients</i> when ||g||_2 &gt; tau?</v>

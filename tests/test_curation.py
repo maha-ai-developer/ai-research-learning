@@ -598,7 +598,7 @@ class OfflineCurationTests(unittest.TestCase):
                 store.conn.commit()
 
                 applied = store.initialize()
-                self.assertEqual(applied, [5])
+                self.assertEqual(applied, list(range(5, LATEST_SCHEMA_VERSION + 1)))
                 self.assertEqual(store.get_schema_version(), LATEST_SCHEMA_VERSION)
 
                 migrated_row = store.get_discovered_link_candidate(

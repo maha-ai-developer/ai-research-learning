@@ -1,0 +1,2 @@
+[00:00:00 - 00:00:05] Narrator: Synthetic plain-text test transcript (CC0-1.0) introducing matrix multiplication C = A * B.
+[00:00:05 - 00:00:11] Narrator: Each output entry C_{i,j} equals sum_k A_{i,k} * B_{k,j} across the shared inner dimension.

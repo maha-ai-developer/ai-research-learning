@@ -77,12 +77,96 @@ python collect.py --init-db
 python collect.py --import-manifest
 ```
 
-Run the offline unit tests:
+Run the offline unit tests and syntax verification:
 
 ```bash
-python -m unittest discover -s tests -v
-python -m compileall -q collect.py knowledge_store.py src tests
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q collect.py curation.py knowledge_store.py src tests
 ```
+
+## 2.1 Offline Transcript Data Model, Authorization Attestations, and Local Import Workflow (Schema v6, v7 & v8)
+
+Schema migrations `0006_transcripts_and_segments`, `0007_transcript_authorization_attestations`, and `0008_harden_transcript_authorization_triggers` (`LATEST_SCHEMA_VERSION = 8`) extend the local SQLite store with six transcript persistence and authorization tables defined in `docs/architecture/transcript-ingestion.md` (`ARCH-TRANSCRIPT-007`) and `docs/architecture/decisions/0006-transcript-acquisition-and-storage.md` (`ADR-0006`):
+
+- `transcripts` — canonical transcript registry, license/rights status, authorization basis, redistribution permission (`permits_redistribution`), and 8-state ingestion machine (`DISCOVERED`, `RIGHTS_PENDING`, `READY_FOR_INGESTION`, `INGESTED`, `NEEDS_REVIEW`, `BLOCKED_BY_POLICY`, `METADATA_ONLY_LINKED`, `WITHDRAWN_OR_TOMBSTONED`).
+- `transcript_authorization_attestations` — auditable authorization records (`tatt_*`, added in Migration 7) capturing who verified permission to store/quote/synthesize/redistribute a transcript (`reviewed_by`, `reviewed_at`), the authorization basis (`OPEN_LICENSE_VERIFIED`, `PUBLIC_DOMAIN_VERIFIED`, `FIRST_PARTY_OWNED`, `WRITTEN_PERMISSION`, `NONE`), the evidence reference/artifact (`evidence_type`, `evidence_reference`, `evidence_url`, `evidence_sha256`), granular scope flags (`permits_metadata_indexing`, `permits_transcript_storage`, `permits_verbatim_excerpts`, `permits_ai_synthesis`, `permits_redistribution`), verification status (`VERIFIED`, `PENDING_REVIEW`, `CONTRADICTORY`, `REJECTED`, `WITHDRAWN`, `EXPIRED`, `UNKNOWN`), expiry (`expires_at`), and withdrawal tracking.
+- `transcript_versions` — immutable version ledger (`tver_*`) tracking SHA-256 digests (`raw_content_sha256`, `normalized_text_sha256`), normalizer version (`norm-v1.0`), segment/word/character counts, and confidence statistics.
+- `transcript_segments` — normalized, timestamped segment cues (`tseg_*`) with monotonic `start_ms` / `end_ms`, preserved `original_segment_text`, `normalized_segment_text`, speaker attribution, quality flags, and timestamped deep links (`#t=<seconds>s` or `?t=<seconds>`).
+- `transcript_syntheses` — transformative study notes/summaries (`tsyn_*`) enforced to exclude verbatim transcript dumps and gated by `permits_ai_synthesis`.
+- `transcript_segment_links` — cross-modal links (`tslnk_*`) connecting transcript segments to concepts, paper resources, modules, equations, or chunks.
+
+### Offline Transcript CLI Usage
+
+All transcript commands in `knowledge_store.py` are strictly offline and make zero network requests. **Caller-supplied flags (`--permits-storage`, `--permits-excerpts`, `--permit-redistribution`) are never trusted on their own**: storing transcript text requires a `VERIFIED`, non-withdrawn, non-expired record in `transcript_authorization_attestations` matching the resource (and transcript/language/track scope) whose verified scope covers every requested permission. Note that this is an auditable engineering control and human-verifiable evidence ledger, not an automated legal determination.
+
+```bash
+# Step 1: Record a verified authorization attestation with concrete evidence and explicit scope:
+python3 knowledge_store.py attest-transcript \
+  --db data/runtime/inventory.sqlite \
+  --resource-id <res_id> \
+  --language en \
+  --track-kind PRIMARY \
+  --authorization-basis OPEN_LICENSE_VERIFIED \
+  --license-status CC_BY_4_0 \
+  --license-spdx CC-BY-4.0 \
+  --evidence-type SPDX_HEADER_OR_PAGE_FOOTER \
+  --evidence-reference "Lecture page footer declares CC BY 4.0 license" \
+  --evidence-url "https://example.org/lectures/1" \
+  --reviewed-by "curator:alice" \
+  --verification-status VERIFIED \
+  --permit-storage \
+  --permit-verbatim-excerpts \
+  --permit-ai-synthesis
+
+# Step 2: Import a local WebVTT (.vtt), SubRip (.srt), or plain-text (.txt) transcript referencing the verified attestation:
+python3 knowledge_store.py import-transcript \
+  --db data/runtime/inventory.sqlite \
+  --resource-id <res_id> \
+  --attestation-id <tatt_id> \
+  --file path/to/transcript.vtt \
+  --language en \
+  --track-kind PRIMARY \
+  --origin-type MANUAL_CURATED_IMPORT \
+  --acquisition-method FIRST_PARTY_CURATED_IMPORT \
+  --license-status CC_BY_4_0 \
+  --license-spdx CC-BY-4.0 \
+  --authorization-basis CREATIVE_COMMONS_LICENSE \
+  --attribution "Author Name — Lecture Title (CC BY 4.0)" \
+  --permits-storage \
+  --permits-excerpts
+
+# Record a metadata-only or policy-blocked transcript entry (stores 0 rows in transcript_versions/transcript_segments):
+python3 knowledge_store.py import-transcript \
+  --db data/runtime/inventory.sqlite \
+  --resource-id <res_id> \
+  --language en \
+  --acquisition-method METADATA_AND_LINK_ONLY \
+  --license-status ALL_RIGHTS_RESERVED \
+  --authorization-basis NONE \
+  --attribution "External Lecture (All Rights Reserved — Metadata & Deep-Link Only)"
+
+# Inspect attestations, list transcripts, inspect segments, or withdraw an attestation / transcript on takedown:
+python3 knowledge_store.py list-transcript-attestations --db data/runtime/inventory.sqlite --resource-id <res_id>
+python3 knowledge_store.py list-transcripts --db data/runtime/inventory.sqlite
+python3 knowledge_store.py show-transcript <tr_id> --db data/runtime/inventory.sqlite --show-segments
+python3 knowledge_store.py withdraw-transcript-attestation <tatt_id> --db data/runtime/inventory.sqlite --withdrawn-by "curator:alice" --reason "Rights withdrawal request"
+python3 knowledge_store.py withdraw-transcript <tr_id> --db data/runtime/inventory.sqlite --reason "Rights withdrawal request"
+python3 knowledge_store.py expire-transcripts --db data/runtime/inventory.sqlite
+```
+
+### Transcript Subsystem Status: Implemented vs. Deferred
+
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Forward-only SQLite migrations v6, v7 & v8 (`0006_transcripts_and_segments`, `0007_transcript_authorization_attestations`, `0008_harden_transcript_authorization_triggers`) | **Implemented** | Preserves all v1–v7 tables, resources, versions, candidates, and provenance |
+| Deterministic IDs (`tr_*`, `tatt_*`, `tver_*`, `tseg_*`, `tsyn_*`, `tslnk_*`) | **Implemented** | Content-addressed and sequence-addressed SHA-256 identifiers |
+| Auditable authorization attestations & scope enforcement (storage, quoting, AI synthesis, redistribution) | **Implemented** | Enforces operation-specific permissions (`permits_transcript_storage`, `permits_verbatim_excerpts`, `permits_ai_synthesis`, `permits_redistribution`) across all read/write methods and redacts segment text by default in `get_transcript_segments(..., include_text=False)` unless `permits_redistribution=1` |
+| Offline parser & normalizer (`WEBVTT`, `SRT`, `PLAIN_TEXT`) + validation (`TV-01`..`TV-08`) | **Implemented** | Strips markup, extracts speaker labels, flags low-confidence cues, validates intervals |
+| Fail-closed policy gate & hardened SQLite triggers blocking direct-SQL bypasses | **Implemented** | SQLite write triggers enforce verified non-expired attestation scope on `transcripts`, `transcript_versions`, `transcript_segments`, `transcript_syntheses`, and `provenance_events`, plus automatic revocation cascades |
+| Idempotent re-imports, version superseding (`ACTIVE` -> `SUPERSEDED`), takedown/attestation withdrawal cascading, and natural expiration enforcement | **Implemented** | Purges segments/syntheses and tombstones transcripts on takedown, attestation withdrawal, or natural `expires_at` expiration across all initialization, read, write, and `expire-transcripts` maintenance paths |
+| Live remote caption downloading (`OFFICIAL_PLATFORM_API`, YouTube/Vimeo HTTP fetching) | **Deferred** | Requires future task & explicit platform API credentials/terms review |
+| Automated Speech Recognition (`LOCAL_ASR_WHISPER` audio download & model execution) | **Deferred** | Schema fields exist, but no audio downloading or ASR execution is implemented |
+| Vector embeddings, semantic transcript search, learning UI, and cloud synchronization | **Deferred** | Local SQLite only; no Firebase/GCP provisioning or vector indexing |
 
 ## 3. Before enabling network collection
 

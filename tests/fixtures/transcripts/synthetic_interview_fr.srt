@@ -1,0 +1,7 @@
+1
+00:00:00,000 --> 00:00:03,800
+[Moderator]: Bonjour à ce dialogue synthétique de test sur l'apprentissage profond.
+
+2
+00:00:03,800 --> 00:00:08,400
+[Researcher]: Nous étudions la régularisation et l'entropie croisée H(p, q) = -sum_x p(x) log q(x).
