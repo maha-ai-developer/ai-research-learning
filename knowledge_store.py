@@ -677,6 +677,7 @@ class TranscriptImportResult:
     provenance_event_id: str | None = None
     authorization_attestation_id: str | None = None
     permits_redistribution: bool = False
+    permits_ai_synthesis: bool = False
 
 
 def _is_iso_timestamp_expired(expires_at: str | None, now_iso: str | None = None) -> bool:
@@ -769,7 +770,7 @@ def evaluate_transcript_storage_policy(
     attribution_text: str,
     requested_transcript_storage: bool,
     requested_verbatim_excerpts: bool,
-    requested_ai_synthesis: bool = True,
+    requested_ai_synthesis: bool | None = None,
     requested_redistribution: bool = False,
     attestation: dict[str, Any] | TranscriptAuthorizationAttestation | None = None,
     requested_attestation_id: str | None = None,
@@ -901,6 +902,12 @@ def evaluate_transcript_storage_policy(
         else license_spdx
     )
 
+    effective_requested_synthesis = (
+        bool(requested_ai_synthesis)
+        if requested_ai_synthesis is not None
+        else (bool(att_dict.get("permits_ai_synthesis", 1)) if att_dict is not None else True)
+    )
+
     if acquisition_method == "METADATA_AND_LINK_ONLY":
         if requested_attestation_id and att_dict is None:
             return TranscriptPolicyDecision(
@@ -927,12 +934,28 @@ def evaluate_transcript_storage_policy(
                 block_or_review_reason=err_msg,
                 authorization_attestation_id=att_id if att_dict is not None else None,
             )
+        if (
+            requested_ai_synthesis is True
+            and att_dict is not None
+            and not bool(att_dict.get("permits_ai_synthesis", 0))
+        ):
+            return TranscriptPolicyDecision(
+                permits_transcript_storage=False,
+                permits_verbatim_excerpts=False,
+                permits_ai_synthesis=False,
+                permits_redistribution=False,
+                permits_metadata_indexing=False,
+                ingestion_state="BLOCKED_BY_POLICY",
+                transcript_storage_status="BLOCKED_NO_AUTHORIZATION",
+                block_or_review_reason=f"Requested permits_ai_synthesis=True exceeds attestation {att_id!r} scope (permits_ai_synthesis=0).",
+                authorization_attestation_id=att_id,
+            )
         return TranscriptPolicyDecision(
             permits_transcript_storage=False,
             permits_verbatim_excerpts=False,
             permits_ai_synthesis=bool(
-                requested_ai_synthesis
-                and (att_dict is None or bool(att_dict.get("permits_ai_synthesis", 1)))
+                effective_requested_synthesis
+                and (att_dict is None or bool(att_dict.get("permits_ai_synthesis", 0)))
             ),
             permits_redistribution=False,
             permits_metadata_indexing=True,
@@ -955,12 +978,13 @@ def evaluate_transcript_storage_policy(
         and not requested_transcript_storage
         and not requested_verbatim_excerpts
         and not requested_redistribution
+        and not (requested_ai_synthesis is True and not bool(att_dict.get("permits_ai_synthesis", 0)))
     ):
         return TranscriptPolicyDecision(
             permits_transcript_storage=False,
             permits_verbatim_excerpts=False,
             permits_ai_synthesis=bool(
-                requested_ai_synthesis and bool(att_dict.get("permits_ai_synthesis", 1))
+                effective_requested_synthesis and bool(att_dict.get("permits_ai_synthesis", 0))
             ),
             permits_redistribution=False,
             permits_metadata_indexing=True,
@@ -992,6 +1016,10 @@ def evaluate_transcript_storage_policy(
             reasons.append(
                 f"Requested permits_verbatim_excerpts=True exceeds attestation {att_id!r} scope (permits_verbatim_excerpts=0)."
             )
+        if requested_ai_synthesis is True and not bool(att_dict.get("permits_ai_synthesis", 0)):
+            reasons.append(
+                f"Requested permits_ai_synthesis=True exceeds attestation {att_id!r} scope (permits_ai_synthesis=0)."
+            )
         if requested_redistribution and not bool(att_dict.get("permits_redistribution", 0)):
             reasons.append(
                 f"Requested permits_redistribution=True exceeds attestation {att_id!r} scope (permits_redistribution=0)."
@@ -1018,10 +1046,7 @@ def evaluate_transcript_storage_policy(
         return TranscriptPolicyDecision(
             permits_transcript_storage=False,
             permits_verbatim_excerpts=False,
-            permits_ai_synthesis=bool(
-                requested_ai_synthesis
-                and (att_dict is not None and not att_errors and bool(att_dict.get("permits_ai_synthesis", 0)))
-            ),
+            permits_ai_synthesis=False,
             permits_redistribution=False,
             permits_metadata_indexing=bool(
                 att_dict is not None and not att_errors and bool(att_dict.get("permits_metadata_indexing", 1))
@@ -1037,7 +1062,7 @@ def evaluate_transcript_storage_policy(
         requested_verbatim_excerpts and bool(att_dict.get("permits_verbatim_excerpts", 0))
     )
     effective_synthesis = bool(
-        requested_ai_synthesis and bool(att_dict.get("permits_ai_synthesis", 1))
+        effective_requested_synthesis and bool(att_dict.get("permits_ai_synthesis", 0))
     )
     effective_redistribution = bool(
         requested_redistribution and bool(att_dict.get("permits_redistribution", 0))
@@ -6136,6 +6161,39 @@ class KnowledgeStore:
             )
         return True, att, None
 
+    def _record_blocked_transcript_operation(
+        self,
+        *,
+        tr: dict[str, Any] | None,
+        transcript_id: str,
+        event_type: str,
+        actor: str,
+        required_permission: str,
+        reason: str,
+        segment_id: str | None = None,
+    ) -> None:
+        """Record an auditable `provenance_events` row (`status='blocked'`) without leaking transcript text."""
+        if tr is None:
+            return
+        details: dict[str, Any] = {
+            "transcript_id": transcript_id,
+            "authorization_attestation_id": tr.get("authorization_attestation_id"),
+            "required_permission": required_permission,
+            "reason": reason,
+        }
+        if segment_id is not None:
+            details["segment_id"] = segment_id
+        self.record_provenance(
+            event_type=event_type,
+            acquisition_method=str(tr.get("acquisition_method") or "METADATA_AND_LINK_ONLY"),
+            actor=actor,
+            status="blocked",
+            source_id=str(tr["source_id"]) if tr.get("source_id") else None,
+            resource_id=str(tr["resource_id"]) if tr.get("resource_id") else None,
+            source_url=str(tr["media_canonical_url"]) if tr.get("media_canonical_url") else None,
+            details=details,
+        )
+
     def expire_due_transcript_attestations(
         self,
         *,
@@ -6772,17 +6830,13 @@ class KnowledgeStore:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_transcript_segments(
+    def _get_transcript_segments_internal(
         self,
         transcript_id: str,
         *,
         transcript_version_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return ordered `transcript_segments` for `transcript_id` ONLY when currently authorized for storage.
-
-        Runs natural-expiry maintenance first and enforces live read-path authorization against
-        `transcripts` and `transcript_authorization_attestations` before returning any segment rows.
-        """
+        """Internal segment loader after verifying storage authorization."""
         self.expire_due_transcript_attestations()
         tr = self.get_transcript(transcript_id)
         ok, _, _ = self._is_transcript_authorized_for_read(tr, require_storage=True)
@@ -6811,6 +6865,84 @@ class KnowledgeStore:
             item["quality_flags"] = json.loads(item.get("quality_flags_json") or "[]")
             results.append(item)
         return results
+
+    def get_transcript_segments(
+        self,
+        transcript_id: str,
+        *,
+        transcript_version_id: str | None = None,
+        include_text: bool = False,
+        actor: str = "segment_reader",
+    ) -> list[dict[str, Any]]:
+        """Return ordered `transcript_segments` for `transcript_id` ONLY when currently authorized for storage.
+
+        Disclosure boundary:
+        - By default (`include_text=False`), returns segment timing, speaker, confidence, deep-link,
+          `char_count`, and hash metadata (`permits_transcript_storage=1`), with `original_segment_text=None`
+          and `normalized_segment_text=None` so callers cannot reconstruct the full verbatim transcript
+          when `permits_verbatim_excerpts=0` or `permits_redistribution=0`.
+        - When `include_text=True`, requires `permits_redistribution=1` on both `transcripts` and its
+          linked `transcript_authorization_attestations` record; otherwise records a blocked provenance
+          event and raises `TranscriptPolicyViolationError`.
+        - For bounded verbatim quoting of a specific segment or time window under `permits_verbatim_excerpts=1`,
+          use `get_verbatim_transcript_excerpt(...)`.
+        """
+        self.expire_due_transcript_attestations()
+        tr = self.get_transcript(transcript_id)
+        ok, _, _ = self._is_transcript_authorized_for_read(tr, require_storage=True)
+        if not ok or tr is None:
+            if include_text and tr is not None:
+                _, _, block_reason = self._is_transcript_authorized_for_read(
+                    tr, require_storage=True, require_redistribution=True
+                )
+                self._record_blocked_transcript_operation(
+                    tr=tr,
+                    transcript_id=transcript_id,
+                    event_type="TRANSCRIPT_SEGMENTS_TEXT_BLOCKED",
+                    actor=actor,
+                    required_permission="permits_redistribution",
+                    reason=block_reason or f"Transcript {transcript_id} is not authorized for full-text segment disclosure.",
+                )
+                raise TranscriptPolicyViolationError(
+                    block_reason or f"Transcript {transcript_id} is not authorized for full-text segment disclosure."
+                )
+            return []
+
+        if include_text:
+            ok_redist, _, reason = self._is_transcript_authorized_for_read(
+                tr, require_storage=True, require_redistribution=True
+            )
+            if not ok_redist:
+                block_msg = (
+                    reason
+                    or f"Full-transcript segment text retrieval requires permits_redistribution=1 on transcript {transcript_id} and its attestation."
+                )
+                self._record_blocked_transcript_operation(
+                    tr=tr,
+                    transcript_id=transcript_id,
+                    event_type="TRANSCRIPT_SEGMENTS_TEXT_BLOCKED",
+                    actor=actor,
+                    required_permission="permits_redistribution",
+                    reason=block_msg,
+                )
+                raise TranscriptPolicyViolationError(block_msg)
+
+        raw_segments = self._get_transcript_segments_internal(
+            transcript_id, transcript_version_id=transcript_version_id
+        )
+        if include_text:
+            for seg in raw_segments:
+                seg["char_count"] = len(seg.get("normalized_segment_text") or "")
+            return raw_segments
+
+        redacted_segments: list[dict[str, Any]] = []
+        for seg in raw_segments:
+            redacted = dict(seg)
+            redacted["char_count"] = len(seg.get("normalized_segment_text") or "")
+            redacted["original_segment_text"] = None
+            redacted["normalized_segment_text"] = None
+            redacted_segments.append(redacted)
+        return redacted_segments
 
     def register_transcript_discovery(
         self,
@@ -6878,6 +7010,7 @@ class KnowledgeStore:
                 else "NOT_STORED"
             )
         )
+        permits_synthesis = 0 if ingestion_state == "BLOCKED_BY_POLICY" else 1
         now = self._now_iso()
         self.expire_due_transcript_attestations(now_iso=now)
         with self.transaction() as conn:
@@ -6899,6 +7032,8 @@ class KnowledgeStore:
                            authorization_basis = ?,
                            permits_transcript_storage = 0,
                            permits_verbatim_excerpts = 0,
+                           permits_ai_synthesis = ?,
+                           permits_redistribution = 0,
                            attribution_text = ?,
                            ingestion_state = ?,
                            transcript_storage_status = ?,
@@ -6916,6 +7051,7 @@ class KnowledgeStore:
                         license_status,
                         license_spdx,
                         authorization_basis,
+                        permits_synthesis,
                         attribution_text.strip(),
                         ingestion_state,
                         storage_status,
@@ -6937,7 +7073,7 @@ class KnowledgeStore:
                         ingestion_state, transcript_storage_status, block_or_review_reason,
                         latest_transcript_version_id, segment_count, duration_ms,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?)
                     """,
                     (
                         transcript_id,
@@ -6953,6 +7089,7 @@ class KnowledgeStore:
                         license_status,
                         license_spdx,
                         authorization_basis,
+                        permits_synthesis,
                         attribution_text.strip(),
                         ingestion_state,
                         storage_status,
@@ -6993,6 +7130,7 @@ class KnowledgeStore:
         actor: str = "transcript_state_machine",
     ) -> dict[str, Any]:
         """Validate and execute an explicit state transition on an existing transcript record."""
+        self.expire_due_transcript_attestations()
         existing = self.get_transcript(transcript_id)
         if existing is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
@@ -7003,9 +7141,18 @@ class KnowledgeStore:
                 transcript_id, reason=reason or "Transitioned to WITHDRAWN_OR_TOMBSTONED", actor=actor
             )
 
-        now = utc_now()
+        if new_state in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW"):
+            ok, _, block_reason = self._is_transcript_authorized_for_read(existing, require_storage=True)
+            if not ok:
+                raise TranscriptPolicyViolationError(
+                    block_reason
+                    or f"Cannot transition transcript {transcript_id} to {new_state!r} without active storage authorization."
+                )
+
+        now = self._now_iso()
         permits_storage = int(existing["permits_transcript_storage"])
         permits_excerpts = int(existing["permits_verbatim_excerpts"])
+        permits_synthesis = int(existing.get("permits_ai_synthesis", 0))
         permits_redist = int(existing.get("permits_redistribution", 0))
         storage_status = str(existing["transcript_storage_status"])
         if new_state in ("BLOCKED_BY_POLICY", "METADATA_ONLY_LINKED", "RIGHTS_PENDING", "DISCOVERED"):
@@ -7013,6 +7160,7 @@ class KnowledgeStore:
             permits_excerpts = 0
             permits_redist = 0
             if new_state == "BLOCKED_BY_POLICY":
+                permits_synthesis = 0
                 storage_status = "BLOCKED_NO_AUTHORIZATION"
             elif new_state == "METADATA_ONLY_LINKED":
                 storage_status = "METADATA_AND_LINK_ONLY"
@@ -7026,6 +7174,7 @@ class KnowledgeStore:
                    SET ingestion_state = ?,
                        permits_transcript_storage = ?,
                        permits_verbatim_excerpts = ?,
+                       permits_ai_synthesis = ?,
                        permits_redistribution = ?,
                        transcript_storage_status = ?,
                        block_or_review_reason = COALESCE(?, block_or_review_reason),
@@ -7036,6 +7185,7 @@ class KnowledgeStore:
                     new_state,
                     permits_storage,
                     permits_excerpts,
+                    permits_synthesis,
                     permits_redist,
                     storage_status,
                     reason,
@@ -7079,7 +7229,7 @@ class KnowledgeStore:
         attribution_text: str,
         permits_transcript_storage: bool = False,
         permits_verbatim_excerpts: bool = False,
-        permits_ai_synthesis: bool = True,
+        permits_ai_synthesis: bool | None = None,
         permits_redistribution: bool = False,
         attestation_id: str | None = None,
         attestation: dict[str, Any] | TranscriptAuthorizationAttestation | None = None,
@@ -7206,7 +7356,7 @@ class KnowledgeStore:
             attribution_text=attribution_text,
             requested_transcript_storage=bool(permits_transcript_storage),
             requested_verbatim_excerpts=bool(permits_verbatim_excerpts),
-            requested_ai_synthesis=bool(permits_ai_synthesis),
+            requested_ai_synthesis=permits_ai_synthesis,
             requested_redistribution=bool(permits_redistribution),
             attestation=resolved_attestation,
             requested_attestation_id=requested_att_id,
@@ -7414,6 +7564,7 @@ class KnowledgeStore:
                 transcript_storage_status=policy.transcript_storage_status,
                 permits_transcript_storage=False,
                 permits_verbatim_excerpts=False,
+                permits_ai_synthesis=bool(policy.permits_ai_synthesis),
                 permits_redistribution=False,
                 authorization_attestation_id=fk_attestation_id,
                 transcript_version_id=None,
@@ -7493,6 +7644,7 @@ class KnowledgeStore:
                     transcript_storage_status=str(existing["transcript_storage_status"]),
                     permits_transcript_storage=bool(existing["permits_transcript_storage"]),
                     permits_verbatim_excerpts=bool(existing["permits_verbatim_excerpts"]),
+                    permits_ai_synthesis=bool(existing.get("permits_ai_synthesis", 0)),
                     permits_redistribution=bool(existing.get("permits_redistribution", 0)),
                     authorization_attestation_id=fk_attestation_id or existing.get("authorization_attestation_id"),
                     transcript_version_id=str(existing_ver["transcript_version_id"]),
@@ -7768,6 +7920,7 @@ class KnowledgeStore:
             transcript_storage_status=target_storage_status,
             permits_transcript_storage=True,
             permits_verbatim_excerpts=policy.permits_verbatim_excerpts,
+            permits_ai_synthesis=policy.permits_ai_synthesis,
             permits_redistribution=policy.permits_redistribution,
             authorization_attestation_id=fk_attestation_id,
             transcript_version_id=transcript_version_id,
@@ -7794,7 +7947,7 @@ class KnowledgeStore:
         attribution_text: str,
         permits_transcript_storage: bool = False,
         permits_verbatim_excerpts: bool = False,
-        permits_ai_synthesis: bool = True,
+        permits_ai_synthesis: bool | None = None,
         permits_redistribution: bool = False,
         attestation_id: str | None = None,
         attestation: dict[str, Any] | TranscriptAuthorizationAttestation | None = None,
@@ -7987,36 +8140,27 @@ class KnowledgeStore:
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
-        if (
-            tr["ingestion_state"] not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW")
-            or not int(tr["permits_transcript_storage"])
-        ):
-            raise TranscriptPolicyViolationError(
-                f"Transcript {transcript_id} does not permit storage or verbatim excerpt retrieval (state={tr['ingestion_state']!r})."
-            )
-        if not int(tr["permits_verbatim_excerpts"]):
-            raise TranscriptPolicyViolationError(
-                f"Transcript {transcript_id} does not permit verbatim quoting/excerpts (permits_verbatim_excerpts=0)."
-            )
-        att_id = tr.get("authorization_attestation_id")
-        if not att_id:
-            raise TranscriptPolicyViolationError(
-                f"Transcript {transcript_id} is missing an authorization_attestation_id; verbatim quoting is blocked."
-            )
-        att = self.get_transcript_attestation(str(att_id))
-        if att is None:
-            raise TranscriptPolicyViolationError(
-                f"Authorization attestation {att_id!r} for transcript {transcript_id} was not found."
-            )
-        if not self._is_transcript_authorized_for_read(
+        ok, att, reason = self._is_transcript_authorized_for_read(
             tr,
             require_storage=True,
             require_verbatim=True,
-        ):
-            raise TranscriptPolicyViolationError(
-                f"Attestation {att_id!r} does not permit verbatim quoting (status={att.get('verification_status')!r}, "
-                f"permits_verbatim_excerpts={att.get('permits_verbatim_excerpts')!r})."
+        )
+        if not ok or att is None:
+            block_msg = (
+                reason
+                or f"Transcript {transcript_id} is not authorized for verbatim quoting/excerpts."
             )
+            self._record_blocked_transcript_operation(
+                tr=tr,
+                transcript_id=transcript_id,
+                event_type="TRANSCRIPT_VERBATIM_EXCERPT_BLOCKED",
+                actor=actor,
+                required_permission="permits_verbatim_excerpts",
+                reason=block_msg,
+                segment_id=target_id if is_segment_request else None,
+            )
+            raise TranscriptPolicyViolationError(block_msg)
+        att_id = str(tr["authorization_attestation_id"])
 
         if is_segment_request:
             seg_row = self.conn.execute(
@@ -8047,13 +8191,42 @@ class KnowledgeStore:
             )
             return item
 
-        segments = self.get_transcript_segments(transcript_id)
+        segments = self._get_transcript_segments_internal(transcript_id)
         filtered = [
             seg
             for seg in segments
             if (start_ms is None or int(seg["end_ms"]) >= int(start_ms))
             and (end_ms is None or int(seg["start_ms"]) <= int(end_ms))
         ]
+        ok_redist, _, _ = self._is_transcript_authorized_for_read(
+            tr,
+            require_storage=True,
+            require_redistribution=True,
+        )
+        if not ok_redist and (
+            (start_ms is None and end_ms is None)
+            or (len(segments) > 1 and len(filtered) >= len(segments))
+        ):
+            block_msg = (
+                f"Excerpt permission on transcript {transcript_id} does not authorize full-transcript disclosure; "
+                "specify a segment_id or a bounded excerpt window (start_ms/end_ms) that selects a strict subset of segments, "
+                "or require permits_redistribution=1."
+            )
+            self._record_blocked_transcript_operation(
+                tr=tr,
+                transcript_id=transcript_id,
+                event_type="TRANSCRIPT_VERBATIM_EXCERPT_BLOCKED",
+                actor=actor,
+                required_permission="permits_redistribution",
+                reason=block_msg,
+            )
+            raise TranscriptPolicyViolationError(block_msg)
+
+        for seg in filtered:
+            seg["attribution_text"] = tr["attribution_text"]
+            seg["license_spdx"] = tr["license_spdx"]
+            seg["authorization_attestation_id"] = str(att_id)
+
         self.record_provenance(
             event_type="TRANSCRIPT_VERBATIM_EXCERPT_ACCESSED",
             acquisition_method=str(tr["acquisition_method"]),
@@ -8090,37 +8263,27 @@ class KnowledgeStore:
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise KeyError(f"Unknown transcript_id: {transcript_id!r}")
-        if (
-            tr["ingestion_state"] not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW")
-            or not int(tr["permits_transcript_storage"])
-        ):
-            raise TranscriptPolicyViolationError(
-                f"Transcript {transcript_id} is not stored or has been withdrawn; redistribution is blocked."
-            )
-        if not int(tr.get("permits_redistribution", 0)):
-            raise TranscriptPolicyViolationError(
-                f"Transcript {transcript_id} does not permit redistribution (permits_redistribution=0)."
-            )
-        att_id = tr.get("authorization_attestation_id")
-        if not att_id:
-            raise TranscriptPolicyViolationError(
-                f"Transcript {transcript_id} has no authorization_attestation_id; redistribution is blocked."
-            )
-        att = self.get_transcript_attestation(str(att_id))
-        if att is None:
-            raise TranscriptPolicyViolationError(
-                f"Attestation {att_id!r} for transcript {transcript_id} was not found."
-            )
-        if not self._is_transcript_authorized_for_read(
+        ok, att, reason = self._is_transcript_authorized_for_read(
             tr,
             require_storage=True,
             require_redistribution=True,
-        ):
-            raise TranscriptPolicyViolationError(
-                f"Attestation {att_id!r} does not permit redistribution (status={att.get('verification_status')!r}, "
-                f"permits_redistribution={att.get('permits_redistribution')!r})."
+        )
+        if not ok or att is None:
+            block_msg = (
+                reason
+                or f"Transcript {transcript_id} does not permit redistribution."
             )
-        segments = self.get_transcript_segments(transcript_id)
+            self._record_blocked_transcript_operation(
+                tr=tr,
+                transcript_id=transcript_id,
+                event_type="TRANSCRIPT_REDISTRIBUTION_BLOCKED",
+                actor=actor,
+                required_permission="permits_redistribution",
+                reason=block_msg,
+            )
+            raise TranscriptPolicyViolationError(block_msg)
+        att_id = str(tr["authorization_attestation_id"])
+        segments = self.get_transcript_segments(transcript_id, include_text=True, actor=actor)
         self.record_provenance(
             event_type="TRANSCRIPT_REDISTRIBUTION_EXPORTED",
             acquisition_method=str(tr["acquisition_method"]),
@@ -8160,24 +8323,25 @@ class KnowledgeStore:
         tr = self.get_transcript(transcript_id)
         if tr is None:
             raise ValueError(f"Unknown transcript_id: {transcript_id!r}")
-        if (
-            not int(tr["permits_ai_synthesis"])
-            or tr["ingestion_state"] not in ("READY_FOR_INGESTION", "INGESTED", "NEEDS_REVIEW", "METADATA_ONLY_LINKED")
-        ):
-            raise TranscriptPolicyViolationError(f"Transcript {transcript_id} does not permit synthesis storage")
-        att_id = tr.get("authorization_attestation_id")
-        if int(tr["permits_transcript_storage"]) and not att_id:
-            raise TranscriptPolicyViolationError(
-                f"Transcript {transcript_id} is missing a required authorization_attestation_id for synthesis storage."
-            )
-        if not self._is_transcript_authorized_for_read(
+        ok, _, reason = self._is_transcript_authorized_for_read(
             tr,
             require_storage=False,
             require_synthesis=True,
-        ):
-            raise TranscriptPolicyViolationError(
-                f"Linked attestation {att_id!r} for transcript {transcript_id} is missing, withdrawn, expired, scope-mismatched, or disallows AI synthesis."
+        )
+        if not ok:
+            block_msg = (
+                reason
+                or f"Transcript {transcript_id} does not permit AI synthesis storage."
             )
+            self._record_blocked_transcript_operation(
+                tr=tr,
+                transcript_id=transcript_id,
+                event_type="TRANSCRIPT_SYNTHESIS_BLOCKED",
+                actor=str(generator_type or "synthesis_recorder"),
+                required_permission="permits_ai_synthesis",
+                reason=block_msg,
+            )
+            raise TranscriptPolicyViolationError(block_msg)
         if synthesis_type not in VALID_TRANSCRIPT_SYNTHESIS_TYPES:
             raise ValueError(f"Invalid synthesis_type: {synthesis_type!r}")
         if generator_type not in VALID_TRANSCRIPT_SYNTHESIS_GENERATORS:
@@ -8240,11 +8404,12 @@ class KnowledgeStore:
         """Return all `transcript_syntheses` for `transcript_id` ordered by `created_at`."""
         self.expire_due_transcript_attestations()
         tr = self.get_transcript(transcript_id)
-        if tr is None or not self._is_transcript_authorized_for_read(
+        ok, _, _ = self._is_transcript_authorized_for_read(
             tr,
             require_storage=False,
             require_synthesis=True,
-        ):
+        )
+        if tr is None or not ok:
             return []
         rows = self.conn.execute(
             "SELECT * FROM transcript_syntheses WHERE transcript_id = ? ORDER BY created_at, synthesis_id",
@@ -8288,13 +8453,25 @@ class KnowledgeStore:
                 f"Cannot link segment {segment_id!r}: segment does not exist or has been purged due to expiry/withdrawal."
             )
         tr = self.get_transcript(str(seg_row["transcript_id"]))
-        if tr is None or not self._is_transcript_authorized_for_read(
+        ok, _, reason = self._is_transcript_authorized_for_read(
             tr,
             require_storage=True,
-        ):
-            raise TranscriptPolicyViolationError(
-                f"Cannot link segment {segment_id!r}: parent transcript is not authorized for storage."
+        )
+        if tr is None or not ok:
+            block_msg = (
+                reason
+                or f"Cannot link segment {segment_id!r}: parent transcript is not authorized for storage."
             )
+            self._record_blocked_transcript_operation(
+                tr=tr,
+                transcript_id=str(seg_row["transcript_id"]),
+                event_type="TRANSCRIPT_SEGMENT_LINK_BLOCKED",
+                actor=created_by,
+                required_permission="permits_transcript_storage",
+                reason=block_msg,
+                segment_id=segment_id,
+            )
+            raise TranscriptPolicyViolationError(block_msg)
         link_id = compute_transcript_segment_link_id(
             segment_id=segment_id,
             target_type=target_type,
@@ -8340,10 +8517,11 @@ class KnowledgeStore:
         if seg_row is None:
             return []
         tr = self.get_transcript(str(seg_row["transcript_id"]))
-        if tr is None or not self._is_transcript_authorized_for_read(
+        ok, _, _ = self._is_transcript_authorized_for_read(
             tr,
             require_storage=True,
-        ):
+        )
+        if tr is None or not ok:
             return []
         rows = self.conn.execute(
             "SELECT * FROM transcript_segment_links WHERE segment_id = ? ORDER BY created_at, link_id",
@@ -8404,6 +8582,7 @@ def format_transcript_import_result(result: TranscriptImportResult) -> str:
         f"  Storage status:            {result.transcript_storage_status}",
         f"  Permits text storage:      {int(result.permits_transcript_storage)}",
         f"  Permits verbatim excerpts: {int(result.permits_verbatim_excerpts)}",
+        f"  Permits AI synthesis:      {int(result.permits_ai_synthesis)}",
         f"  Permits redistribution:    {int(result.permits_redistribution)}",
         f"  Transcript version ID:     {result.transcript_version_id or 'none'}",
         f"  Version number:            {result.version_number if result.version_number is not None else 'none'}",
@@ -8608,6 +8787,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Request verbatim transcript excerpts (must be backed by --attestation-id scope)",
     )
     tr_import_parser.add_argument(
+        "--permit-ai-synthesis",
+        action="store_true",
+        help="Explicitly request AI synthesis permission (must be backed by --attestation-id scope)",
+    )
+    tr_import_parser.add_argument(
+        "--disallow-ai-synthesis",
+        action="store_true",
+        help="Explicitly disallow AI synthesis on the imported transcript",
+    )
+    tr_import_parser.add_argument(
         "--permit-redistribution",
         action="store_true",
         help="Request external transcript redistribution (must be backed by --attestation-id scope)",
@@ -8744,6 +8933,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if cmd == "import-transcript":
+        requested_ai_synth: bool | None = None
+        if getattr(args, "disallow_ai_synthesis", False):
+            requested_ai_synth = False
+        elif getattr(args, "permit_ai_synthesis", False):
+            requested_ai_synth = True
         with KnowledgeStore(db_path=args.db, auto_initialize=True) as store:
             result = store.import_local_transcript_file(
                 resource_id=args.resource_id,
@@ -8760,6 +8954,7 @@ def main(argv: list[str] | None = None) -> int:
                 attribution_text=args.attribution,
                 permits_transcript_storage=bool(args.permit_storage),
                 permits_verbatim_excerpts=bool(args.permit_verbatim_excerpts),
+                permits_ai_synthesis=requested_ai_synth,
                 permits_redistribution=bool(args.permit_redistribution),
                 attestation_id=args.attestation_id,
                 duration_ms=args.duration_ms,

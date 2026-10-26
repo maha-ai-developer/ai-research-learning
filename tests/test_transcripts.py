@@ -353,16 +353,25 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 segments = store.get_transcript_segments(vtt_res.transcript_id)
                 self.assertEqual(len(segments), 3)
                 self.assertEqual(segments[0]["speaker_label"], "Instructor")
-                self.assertIn("<v Instructor>", segments[0]["original_segment_text"])
+                self.assertIsNone(segments[0]["original_segment_text"])
+                self.assertIsNone(segments[0]["normalized_segment_text"])
+                self.assertTrue(segments[2]["deep_link_url"].endswith("#t=9s"))
+
+                # Verbatim excerpt retrieval returns text for bounded segments when permits_verbatim_excerpts=True
+                seg0_excerpt = store.get_verbatim_transcript_excerpt(segments[0]["segment_id"])
+                seg2_excerpt = store.get_verbatim_transcript_excerpt(segments[2]["segment_id"])
+                self.assertIn("<v Instructor>", seg0_excerpt["original_segment_text"])
                 self.assertEqual(
-                    segments[0]["normalized_segment_text"],
+                    seg0_excerpt["normalized_segment_text"],
                     "Welcome to this synthetic test lecture on backpropagation & chain rule derivatives.",
                 )
                 self.assertEqual(
-                    segments[2]["normalized_segment_text"],
+                    seg2_excerpt["normalized_segment_text"],
                     "How does gradient clipping affect exploding gradients when ||g||_2 > tau?",
                 )
-                self.assertTrue(segments[2]["deep_link_url"].endswith("#t=9s"))
+                # Full-transcript segment text requires permits_redistribution=True
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_transcript_segments(vtt_res.transcript_id, include_text=True)
 
                 # 2. SRT import (TRANSLATION, fr)
                 srt_res = store.import_local_transcript_file(
@@ -424,6 +433,9 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(txt_res.transcript_storage_status, "STORED_PLAIN_TEXT")
                 self.assertTrue(txt_res.permits_redistribution)
                 self.assertEqual(txt_res.stored_segments, 2)
+                txt_segments_full = store.get_transcript_segments(txt_res.transcript_id, include_text=True)
+                self.assertEqual(len(txt_segments_full), 2)
+                self.assertIsNotNone(txt_segments_full[0]["normalized_segment_text"])
 
                 # Verify synthesis and segment link persistence
                 syn = store.record_transcript_synthesis(
@@ -1717,7 +1729,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
         """Verify natural attestation expiration (clock advancing past expires_at without a manual DB UPDATE) across all read/write/maintenance paths."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test_natural_expiry.db"
-            current_time = ["2026-10-25T12:00:00+00:00"]
+            current_time = ["2099-10-25T12:00:00+00:00"]
 
             with KnowledgeStore(db_path, clock=lambda: current_time[0]) as store:
                 res_id = self._seed_sample_resource(
@@ -1725,7 +1737,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                     canonical_url="https://www.3blue1brown.com/lessons/natural-expiry-lecture",
                     title="Natural Expiry Verification Lecture",
                 )
-                future_expiry = "2026-10-26T00:00:00+00:00"
+                future_expiry = "2099-10-26T00:00:00+00:00"
 
                 # 1. Create a valid, verified attestation with a future expires_at
                 att = self._create_open_license_attestation(
@@ -1799,7 +1811,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(store.get_transcript_versions(tr_id)[0]["status"], "ACTIVE")
 
                 # 3. Advance the controllable test clock beyond expires_at WITHOUT updating the attestation row
-                current_time[0] = "2026-10-26T00:00:05+00:00"
+                current_time[0] = "2099-10-26T00:00:05+00:00"
 
                 # Confirm raw SQLite state before any application call is still VERIFIED / INGESTED
                 raw_att_before_call = store.conn.execute(
@@ -1932,7 +1944,7 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
         """Verify natural expiry when first triggered by get_transcript_segments, store re-initialization, or CLI expire-transcripts."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test_natural_expiry_paths.db"
-            current_time = ["2026-10-25T12:00:00+00:00"]
+            current_time = ["2099-10-25T12:00:00+00:00"]
 
             with KnowledgeStore(db_path, clock=lambda: current_time[0]) as store:
                 res_1 = self._seed_sample_resource(
@@ -1948,12 +1960,12 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 att_1 = self._create_open_license_attestation(
                     store,
                     res_1,
-                    expires_at="2026-10-26T00:00:00+00:00",
+                    expires_at="2099-10-26T00:00:00+00:00",
                 )
                 att_2 = self._create_open_license_attestation(
                     store,
                     res_2,
-                    expires_at="2026-10-27T00:00:00+00:00",
+                    expires_at="2099-10-27T00:00:00+00:00",
                 )
                 imp_1 = store.import_local_transcript_file(
                     resource_id=res_1,
@@ -1980,17 +1992,17 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(store.get_transcript_segments(imp_2.transcript_id)), 2)
 
                 # Advance clock past att_1's expires_at (but before att_2's expires_at)
-                current_time[0] = "2026-10-26T01:00:00+00:00"
+                current_time[0] = "2099-10-26T01:00:00+00:00"
 
                 # Calling get_transcript_segments directly as the first read after expiry:
                 self.assertEqual(store.get_transcript_segments(imp_1.transcript_id), [])
                 self.assertEqual(store.get_transcript(imp_1.transcript_id)["ingestion_state"], "WITHDRAWN_OR_TOMBSTONED")
-                # Meanwhile imp_2 (whose expires_at is 2026-10-27) remains active and accessible!
+                # Meanwhile imp_2 (whose expires_at is 2099-10-27) remains active and accessible!
                 self.assertEqual(len(store.get_transcript_segments(imp_2.transcript_id)), 2)
                 self.assertEqual(store.get_transcript(imp_2.transcript_id)["ingestion_state"], "INGESTED")
 
             # Re-open/initialize the store with clock advanced past att_2's expires_at
-            with KnowledgeStore(db_path, clock=lambda: "2026-10-27T01:00:00+00:00") as store2:
+            with KnowledgeStore(db_path, clock=lambda: "2099-10-27T01:00:00+00:00") as store2:
                 # KnowledgeStore.__init__(auto_initialize=True) -> initialize() -> expire_due_transcript_attestations()
                 raw_seg_2 = store2.conn.execute(
                     "SELECT COUNT(*) FROM transcript_segments WHERE transcript_id = ?",
@@ -2009,11 +2021,334 @@ class TranscriptDataModelAndWorkflowTests(unittest.TestCase):
                         "--db",
                         str(db_path),
                         "--now",
-                        "2026-10-28T00:00:00+00:00",
+                        "2099-10-28T00:00:00+00:00",
                     ]
                 )
             self.assertEqual(rc, 0)
             self.assertIn("Expired transcript attestations processed (0):", buf.getvalue())
+
+    def test_16_operation_specific_permission_matrix_and_disclosure_boundaries(self) -> None:
+        """Verify operation-specific permissions (Combinations A, B, C), full-transcript segment disclosure boundaries, metadata-only reads, scope mismatches, and blocked provenance logging."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test_operation_permissions.db"
+            with KnowledgeStore(db_path) as store:
+                # ==========================================================
+                # Combination A: storage=True, verbatim=False, synthesis=True, redistribution=True
+                # ==========================================================
+                res_a = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/combo-a-no-verbatim",
+                    title="Combo A Lecture (No Verbatim Excerpts)",
+                )
+                att_a = self._create_open_license_attestation(
+                    store,
+                    res_a,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=False,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=True,
+                )
+                imp_a = store.import_local_transcript_file(
+                    resource_id=res_a,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Combo A CC-BY-4.0",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=False,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=True,
+                    attestation_id=att_a["attestation_id"],
+                )
+                self.assertEqual(imp_a.status, "imported")
+                self.assertTrue(imp_a.permits_transcript_storage)
+                self.assertFalse(imp_a.permits_verbatim_excerpts)
+                self.assertTrue(imp_a.permits_ai_synthesis)
+                self.assertTrue(imp_a.permits_redistribution)
+
+                segs_a_meta = store.get_transcript_segments(imp_a.transcript_id)
+                self.assertEqual(len(segs_a_meta), 3)
+                self.assertIsNone(segs_a_meta[0]["original_segment_text"])
+                self.assertIsNone(segs_a_meta[0]["normalized_segment_text"])
+                seg_a0_id = str(segs_a_meta[0]["segment_id"])
+
+                # Verbatim excerpt must fail closed (both by transcript_id and by segment_id)
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(imp_a.transcript_id, start_ms=0, end_ms=5000, actor="combo_a_tester")
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(seg_a0_id, actor="combo_a_tester")
+
+                # Synthesis write and read succeed under permits_ai_synthesis=True
+                syn_a = store.record_transcript_synthesis(
+                    transcript_id=imp_a.transcript_id,
+                    synthesis_type="STRUCTURED_SUMMARY",
+                    generator_type="HUMAN_CURATED",
+                    content_markdown="## Summary\nAllowed synthesis on Combo A.",
+                )
+                self.assertEqual(len(store.get_transcript_syntheses(imp_a.transcript_id)), 1)
+                self.assertEqual(store.get_transcript_syntheses(imp_a.transcript_id)[0]["synthesis_id"], syn_a["synthesis_id"])
+
+                # Redistribution export and full-segment text read succeed under permits_redistribution=True
+                exp_a = store.export_transcript_for_redistribution(imp_a.transcript_id, actor="combo_a_tester")
+                self.assertEqual(len(exp_a["segments"]), 3)
+                self.assertIsNotNone(exp_a["segments"][0]["normalized_segment_text"])
+                segs_a_full = store.get_transcript_segments(imp_a.transcript_id, include_text=True)
+                self.assertEqual(len(segs_a_full), 3)
+                self.assertIsNotNone(segs_a_full[0]["normalized_segment_text"])
+
+                # ==========================================================
+                # Combination B: storage=True, verbatim=True, synthesis=False, redistribution=True
+                # ==========================================================
+                res_b = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/combo-b-no-synthesis",
+                    title="Combo B Lecture (No AI Synthesis)",
+                )
+                att_b = self._create_open_license_attestation(
+                    store,
+                    res_b,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_ai_synthesis=False,
+                    permits_redistribution=True,
+                )
+                # Verify caller requesting permits_ai_synthesis=True when attestation has permits_ai_synthesis=False fails closed
+                blocked_b_req = store.import_local_transcript_file(
+                    resource_id=res_b,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Combo B Over-requested Synthesis",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=True,
+                    attestation_id=att_b["attestation_id"],
+                )
+                self.assertEqual(blocked_b_req.status, "blocked")
+                self.assertEqual(blocked_b_req.ingestion_state, "BLOCKED_BY_POLICY")
+                self.assertFalse(blocked_b_req.permits_ai_synthesis)
+                self.assertEqual(blocked_b_req.stored_segments, 0)
+
+                # Now import Combo B matching attestation scope (permits_ai_synthesis=False)
+                imp_b = store.import_local_transcript_file(
+                    resource_id=res_b,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Combo B CC-BY-4.0",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_ai_synthesis=False,
+                    permits_redistribution=True,
+                    attestation_id=att_b["attestation_id"],
+                )
+                self.assertEqual(imp_b.status, "imported")
+                self.assertTrue(imp_b.permits_transcript_storage)
+                self.assertTrue(imp_b.permits_verbatim_excerpts)
+                self.assertFalse(imp_b.permits_ai_synthesis)
+                self.assertTrue(imp_b.permits_redistribution)
+
+                # Synthesis write must fail closed when permits_ai_synthesis=False
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.record_transcript_synthesis(
+                        transcript_id=imp_b.transcript_id,
+                        synthesis_type="STRUCTURED_SUMMARY",
+                        generator_type="HUMAN_CURATED",
+                        content_markdown="## Summary\nMust be blocked on Combo B.",
+                    )
+                self.assertEqual(store.get_transcript_syntheses(imp_b.transcript_id), [])
+
+                # Verbatim excerpt and redistribution export succeed on Combo B
+                segs_b_meta = store.get_transcript_segments(imp_b.transcript_id)
+                exc_b = store.get_verbatim_transcript_excerpt(segs_b_meta[0]["segment_id"], actor="combo_b_tester")
+                self.assertIn("Welcome to this synthetic test lecture", exc_b["normalized_segment_text"])
+                exp_b = store.export_transcript_for_redistribution(imp_b.transcript_id, actor="combo_b_tester")
+                self.assertEqual(len(exp_b["segments"]), 3)
+
+                # Also verify that if a synthesis was created while permits_ai_synthesis=1 and attestation later updates permits_ai_synthesis=0,
+                # get_transcript_syntheses returns [] (fails closed on read)
+                store.conn.execute(
+                    "UPDATE transcript_authorization_attestations SET permits_ai_synthesis = 0 WHERE attestation_id = ?",
+                    (att_a["attestation_id"],),
+                )
+                store.conn.execute(
+                    "UPDATE transcripts SET permits_ai_synthesis = 0 WHERE transcript_id = ?",
+                    (imp_a.transcript_id,),
+                )
+                self.assertEqual(store.get_transcript_syntheses(imp_a.transcript_id), [])
+
+                # ==========================================================
+                # Combination C: storage=True, verbatim=True, synthesis=True, redistribution=False
+                # ==========================================================
+                res_c = self._seed_sample_resource(
+                    store,
+                    canonical_url="https://www.3blue1brown.com/lessons/combo-c-no-redistribution",
+                    title="Combo C Lecture (No Redistribution)",
+                )
+                att_c = self._create_open_license_attestation(
+                    store,
+                    res_c,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=False,
+                )
+                imp_c = store.import_local_transcript_file(
+                    resource_id=res_c,
+                    transcript_path=VTT_FIXTURE,
+                    language_bcp47="en",
+                    track_kind="PRIMARY",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Combo C CC-BY-4.0",
+                    permits_transcript_storage=True,
+                    permits_verbatim_excerpts=True,
+                    permits_ai_synthesis=True,
+                    permits_redistribution=False,
+                    attestation_id=att_c["attestation_id"],
+                )
+                self.assertEqual(imp_c.status, "imported")
+                self.assertTrue(imp_c.permits_transcript_storage)
+                self.assertTrue(imp_c.permits_verbatim_excerpts)
+                self.assertTrue(imp_c.permits_ai_synthesis)
+                self.assertFalse(imp_c.permits_redistribution)
+
+                # Redistribution export must fail closed
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.export_transcript_for_redistribution(imp_c.transcript_id, actor="combo_c_tester")
+
+                # Full-transcript segment text via get_transcript_segments(..., include_text=True) must fail closed
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_transcript_segments(imp_c.transcript_id, include_text=True, actor="combo_c_tester")
+
+                # Unbounded get_verbatim_transcript_excerpt(transcript_id) without start_ms/end_ms or spanning >=120s must fail closed when permits_redistribution=False
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(imp_c.transcript_id, actor="combo_c_tester")
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(imp_c.transcript_id, start_ms=0, end_ms=150000, actor="combo_c_tester")
+
+                # Bounded verbatim excerpt (by segment_id or bounded time window <= 120s) and AI synthesis succeed on Combo C
+                segs_c_meta = store.get_transcript_segments(imp_c.transcript_id)
+                self.assertEqual(len(segs_c_meta), 3)
+                self.assertIsNone(segs_c_meta[0]["original_segment_text"])
+                self.assertIsNone(segs_c_meta[0]["normalized_segment_text"])
+                bounded_exc_c = store.get_verbatim_transcript_excerpt(
+                    imp_c.transcript_id, start_ms=0, end_ms=5000, actor="combo_c_tester"
+                )
+                self.assertEqual(len(bounded_exc_c), 2)
+                self.assertIn("Welcome to this synthetic test lecture", bounded_exc_c[0]["normalized_segment_text"])
+                single_exc_c = store.get_verbatim_transcript_excerpt(segs_c_meta[1]["segment_id"], actor="combo_c_tester")
+                self.assertIn("We define the scalar loss", single_exc_c["normalized_segment_text"])
+
+                syn_c = store.record_transcript_synthesis(
+                    transcript_id=imp_c.transcript_id,
+                    synthesis_type="STRUCTURED_SUMMARY",
+                    generator_type="HUMAN_CURATED",
+                    content_markdown="- Scalar loss formulation.",
+                )
+                self.assertEqual(len(store.get_transcript_syntheses(imp_c.transcript_id)), 1)
+
+                # ==========================================================
+                # Metadata-only reads never expose transcript text, excerpts, or syntheses
+                # ==========================================================
+                tr_meta = store.get_transcript(imp_c.transcript_id)
+                self.assertIsNotNone(tr_meta)
+                for forbidden_key in ("original_segment_text", "normalized_segment_text", "content_markdown", "segments", "syntheses"):
+                    self.assertNotIn(forbidden_key, tr_meta)
+                for row in store.list_transcripts():
+                    for forbidden_key in ("original_segment_text", "normalized_segment_text", "content_markdown", "segments", "syntheses"):
+                        self.assertNotIn(forbidden_key, row)
+                for ver in store.get_transcript_versions(imp_c.transcript_id):
+                    for forbidden_key in ("original_segment_text", "normalized_segment_text", "content_markdown", "segments"):
+                        self.assertNotIn(forbidden_key, ver)
+                att_meta = store.get_transcript_attestation(att_c["attestation_id"])
+                self.assertIsNotNone(att_meta)
+                for forbidden_key in ("original_segment_text", "normalized_segment_text", "content_markdown"):
+                    self.assertNotIn(forbidden_key, att_meta)
+                for att_row in store.list_transcript_attestations():
+                    for forbidden_key in ("original_segment_text", "normalized_segment_text", "content_markdown"):
+                        self.assertNotIn(forbidden_key, att_row)
+
+                # ==========================================================
+                # Scope mismatch (resource_id, transcript_id, language_bcp47, track_kind) fails closed
+                # ==========================================================
+                # 1. Write-time scope mismatch: attestation for en/PRIMARY cannot authorize fr/TRANSLATION or another resource
+                mismatch_lang_imp = store.import_local_transcript_file(
+                    resource_id=res_c,
+                    transcript_path=SRT_FIXTURE,
+                    language_bcp47="fr",
+                    track_kind="TRANSLATION",
+                    caption_format="SRT",
+                    license_status="VERIFIED_PERMISSIVE",
+                    license_spdx="CC-BY-4.0",
+                    authorization_basis="OPEN_LICENSE_VERIFIED",
+                    attribution_text="Mismatched Language/Track Import",
+                    permits_transcript_storage=True,
+                    attestation_id=att_c["attestation_id"],
+                )
+                self.assertEqual(mismatch_lang_imp.status, "blocked")
+                self.assertEqual(mismatch_lang_imp.ingestion_state, "BLOCKED_BY_POLICY")
+                self.assertEqual(mismatch_lang_imp.stored_segments, 0)
+
+                # transition_transcript_state cannot force a BLOCKED_BY_POLICY or RIGHTS_PENDING transcript to READY_FOR_INGESTION or INGESTED without active storage authorization
+                with self.assertRaises((ValueError, TranscriptPolicyViolationError)):
+                    store.transition_transcript_state(mismatch_lang_imp.transcript_id, "READY_FOR_INGESTION")
+                store.transition_transcript_state(mismatch_lang_imp.transcript_id, "RIGHTS_PENDING")
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.transition_transcript_state(mismatch_lang_imp.transcript_id, "READY_FOR_INGESTION")
+                with self.assertRaises((ValueError, TranscriptPolicyViolationError)):
+                    store.transition_transcript_state(mismatch_lang_imp.transcript_id, "INGESTED")
+
+                # 2. Read-time scope mismatch: if an attestation's scope is narrowed to a different transcript_id,
+                # read/write operations on imp_c must fail closed immediately
+                store.conn.execute(
+                    "UPDATE transcript_authorization_attestations SET transcript_id = ? WHERE attestation_id = ?",
+                    (mismatch_lang_imp.transcript_id, att_c["attestation_id"]),
+                )
+                self.assertEqual(store.get_transcript_segments(imp_c.transcript_id), [])
+                self.assertEqual(store.get_transcript_syntheses(imp_c.transcript_id), [])
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.get_verbatim_transcript_excerpt(segs_c_meta[0]["segment_id"], actor="scope_mismatch_tester")
+                with self.assertRaises(TranscriptPolicyViolationError):
+                    store.record_transcript_synthesis(
+                        transcript_id=imp_c.transcript_id,
+                        synthesis_type="STRUCTURED_SUMMARY",
+                        generator_type="HUMAN_CURATED",
+                        content_markdown="Blocked by transcript_id scope mismatch",
+                    )
+
+                # ==========================================================
+                # Verify blocked operations recorded status='blocked' provenance events without leaking text
+                # ==========================================================
+                blocked_events = store.conn.execute(
+                    "SELECT event_type, status, details_json FROM provenance_events WHERE status = 'blocked'"
+                ).fetchall()
+                blocked_types = {row["event_type"] for row in blocked_events}
+                self.assertIn("TRANSCRIPT_VERBATIM_EXCERPT_BLOCKED", blocked_types)
+                self.assertIn("TRANSCRIPT_SYNTHESIS_BLOCKED", blocked_types)
+                self.assertIn("TRANSCRIPT_REDISTRIBUTION_BLOCKED", blocked_types)
+                self.assertIn("TRANSCRIPT_SEGMENTS_TEXT_BLOCKED", blocked_types)
+                for row in blocked_events:
+                    detail_str = str(row["details_json"] or "")
+                    self.assertNotIn("Welcome to this synthetic test lecture", detail_str)
+                    self.assertNotIn("We define the scalar loss", detail_str)
 
 
 if __name__ == "__main__":
