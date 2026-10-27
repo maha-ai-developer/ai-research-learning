@@ -121,23 +121,25 @@ Embedding and generation capabilities are decoupled into two minimal Python prot
 
 - **`EmbeddingProvider` Protocol:**
   - Properties: `provider_name: str`, `model_name: str`, `dimensions: int`
-  - Methods: `is_configured() -> bool`, `embed_documents(texts: list[str]) -> list[list[float]]`, `embed_query(text: str) -> list[float]`
-- **`GenerationProvider` (`LanguageModelProvider`) Protocol:**
-  - Properties: `provider_name: str`, `model_name: str`, `supports_structured_output: bool`, `supports_tool_calling: bool`
-  - Methods: `is_configured() -> bool`, `generate_grounded_answer(request: GroundedGenerationRequest) -> GroundedGenerationResult`
+  - Methods: `embed_texts(texts: Sequence[str]) -> list[list[float]]`, `embed_query(query: str) -> list[float]`
+- **`GenerationProvider` Protocol:**
+  - Properties: `provider_name: str`, `model_name: str`
+  - Methods: `is_configured() -> bool`, `generate_grounded_answer(prompt_input: RAGPromptInput) -> GeneratedAnswerPayload`
 
-#### Supported Provider Matrix & Explicit Configuration
+#### Supported Provider Matrix & Explicit Configuration (`ProviderConfig.from_env`)
 
-| Provider Family | Role | Provider Key | Default Model | Required Environment Variable(s) | Notes |
+| Provider Family | Role | Provider Key | Default Model & Dimensions | Environment Variable(s) Expected by `ProviderConfig.from_env` | Authentication & Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Local Deterministic** | Embedding (Offline Proof / Default Fallback) | `local_deterministic` | `token-hash-bow-v1` (`128` dims) | None (`AI_EMBEDDING_PROVIDER=local_deterministic`) | Deterministic L2-normalized token/stem/concept hash embeddings; zero network I/O or API cost. |
-| **Retrieval-Only Fallback** | Generation Fallback | `retrieval_only` | `deterministic-extractive-fallback` | None (`AI_GENERATION_PROVIDER=retrieval_only`) | Explicit fallback when no LLM API key is configured; returns retrieved evidence without calling an external LLM. |
-| **OpenAI API** | Embedding & Generation | `openai` | Embed: `text-embedding-3-small` (`1536`d)<br>Gen: `gpt-4o-mini` | `OPENAI_API_KEY`<br>(Optional: `AI_EMBEDDING_MODEL`, `AI_GENERATION_MODEL`, `OPENAI_BASE_URL`) | Supports structured JSON outputs and tool calling. Compatible with local OpenAI-compatible servers (`Ollama`, `vLLM`, `llama.cpp`) via `OPENAI_BASE_URL`. |
-| **Anthropic API** | Generation | `anthropic` | Gen: `claude-3-5-haiku-latest` | `ANTHROPIC_API_KEY`<br>(Optional: `AI_GENERATION_MODEL`) | Anthropic does not expose a native first-party text embedding endpoint; pair `AI_GENERATION_PROVIDER=anthropic` with `AI_EMBEDDING_PROVIDER=local_deterministic`, `openai`, or `gemini`. |
-| **Google Gemini API** | Embedding & Generation | `gemini` | Embed: `text-embedding-004` (`768`d)<br>Gen: `gemini-2.5-flash` | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)<br>(Optional: `AI_EMBEDDING_MODEL`, `AI_GENERATION_MODEL`) | Uses Google AI Studio REST API (`generativelanguage.googleapis.com/v1beta`) with no GCP/Vertex cloud project provisioning required. |
+| **Local Deterministic** | Embedding (Offline Proof / Default) | `local_deterministic` | `token-hash-bow-v1` (`128` dims) | `AI_LEARNING_EMBEDDING_PROVIDER=local_deterministic`<br>`AI_LEARNING_EMBEDDING_MODEL=token-hash-bow-v1`<br>`AI_LEARNING_EMBEDDING_DIMENSIONS=128` | Deterministic L2-normalized token/stem/concept hash embeddings; zero network I/O or API cost. |
+| **Retrieval-Only Fallback** | Generation Fallback (Default) | `retrieval_only` | `none` | `AI_LEARNING_GENERATION_PROVIDER=retrieval_only`<br>`AI_LEARNING_GENERATION_MODEL=none` | Explicit default when no LLM API key is configured; returns retrieved source chunks and citations without calling an external LLM. |
+| **OpenAI API** | Embedding & Generation | `openai` | Embed: `text-embedding-3-small` (default `128` dims via `AI_LEARNING_EMBEDDING_DIMENSIONS`)<br>Gen: `gpt-4o-mini` | `OPENAI_API_KEY`<br>(Optional: `AI_LEARNING_EMBEDDING_PROVIDER=openai`, `AI_LEARNING_EMBEDDING_MODEL`, `AI_LEARNING_EMBEDDING_DIMENSIONS`, `AI_LEARNING_GENERATION_PROVIDER=openai`, `AI_LEARNING_GENERATION_MODEL`) | Authenticates via `Authorization: Bearer <OPENAI_API_KEY>`. |
+| **Anthropic API** | Generation | `anthropic` | Gen: `claude-3-5-haiku-latest` | `ANTHROPIC_API_KEY`<br>(Optional: `AI_LEARNING_GENERATION_PROVIDER=anthropic`, `AI_LEARNING_GENERATION_MODEL`) | Authenticates via `x-api-key` header. Pair `AI_LEARNING_GENERATION_PROVIDER=anthropic` with `AI_LEARNING_EMBEDDING_PROVIDER=local_deterministic`, `openai`, or `gemini`. |
+| **Google Gemini Developer API** | Embedding & Generation | `gemini` | Embed: `text-embedding-004` (default `128` dims via `AI_LEARNING_EMBEDDING_DIMENSIONS`)<br>Gen: `gemini-2.5-flash` | `GEMINI_API_KEY`<br>(Optional: `AI_LEARNING_EMBEDDING_PROVIDER=gemini`, `AI_LEARNING_EMBEDDING_MODEL`, `AI_LEARNING_EMBEDDING_DIMENSIONS`, `AI_LEARNING_GENERATION_PROVIDER=gemini`, `AI_LEARNING_GENERATION_MODEL`) | Uses the Gemini Developer API (`generativelanguage.googleapis.com/v1beta`) with `x-goog-api-key: <GEMINI_API_KEY>`. Requires only `GEMINI_API_KEY` (does not use `GOOGLE_API_KEY`, a Google Cloud project ID, or Vertex AI credentials). |
+
+- **Collection Configuration:** `AI_LEARNING_CHROMA_COLLECTION` sets the Chroma collection name (default: `ai_research_knowledge_chunks_v1`).
 
 **Security & Credential Rules:**
-- API keys are read solely from environment variables via `ProviderConfig.from_env()`, never hardcoded in source files, never written to SQLite or Chroma metadata, and masked as `"***REDACTED***"` in configuration summaries and logs.
+- API keys are read solely from environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) via `ProviderConfig.from_env()`, never hardcoded in source files, never written to SQLite or Chroma metadata, and redacted from `ProviderConfig.to_safe_dict()` and `repr(config)` (which expose only boolean `has_*_api_key` flags).
 - No live paid API request is ever made during automated tests or default CLI dry runs without explicit configuration and opt-in.
 
 ---
@@ -204,4 +206,4 @@ We evaluate `https://www.deeplearning.ai/the-batch` (`SRC-THE-BATCH`, DeepLearni
 ### Positive
 - **Local-First Verification:** The complete `Approved source → collect → normalize → chunk → embed → index → retrieve → grounded RAG` pipeline runs locally on the Raspberry Pi using SQLite + persistent Chroma with zero cloud dependencies.
 - **Zero Duplicate Vectors & Strict Takedown Hygiene:** Deterministic `chunk_id`s, `content_hash` comparison, stale-version pruning, and read-time SQLite joins guarantee idempotent re-indexing and immediate takedown enforcement.
-- **Provider Independence:** Switching between `local_deterministic`, `openai`, `anthropic`, and `gemini` requires only environment variable changes (`AI_EMBEDDING_PROVIDER`, `AI_GENERATION_PROVIDER`, model names, and API keys).
+- **Provider Independence:** Switching between `local_deterministic`, `openai`, `anthropic`, and `gemini` requires only environment variable changes (`AI_LEARNING_EMBEDDING_PROVIDER`, `AI_LEARNING_EMBEDDING_MODEL`, `AI_LEARNING_EMBEDDING_DIMENSIONS`, `AI_LEARNING_GENERATION_PROVIDER`, `AI_LEARNING_GENERATION_MODEL`, `AI_LEARNING_CHROMA_COLLECTION`, and provider API keys `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`).
