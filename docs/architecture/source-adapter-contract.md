@@ -2,9 +2,9 @@
 
 **Document ID:** `ARCH-ADAPTER-003`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-25  
+**Last Updated:** 2026-10-27  
 **Baseline Implementation Reference:** `collect.py` (`ConservativeCollector`), `src/ai_research_learning/sources/`  
-**Related Decisions:** [ADR-0005 (`0005-arxiv-api-access-policy.md`)](decisions/0005-arxiv-api-access-policy.md), [ADR-0006 (`0006-transcript-acquisition-and-storage.md`)](decisions/0006-transcript-acquisition-and-storage.md)  
+**Related Decisions:** [ADR-0005 (`0005-arxiv-api-access-policy.md`)](decisions/0005-arxiv-api-access-policy.md), [ADR-0006 (`0006-transcript-acquisition-and-storage.md`)](decisions/0006-transcript-acquisition-and-storage.md), [ADR-0007 (`0007-local-first-rag-chroma-and-multi-provider-architecture.md`)](decisions/0007-local-first-rag-chroma-and-multi-provider-architecture.md)  
 **Companion Docs:** [`transcript-ingestion.md`](./transcript-ingestion.md) (`ARCH-TRANSCRIPT-007`)
 
 ---
@@ -18,6 +18,7 @@ The **Source Adapter Contract** defines a uniform programmatic interface and com
 3. **3Blue1Brown (`SRC-3B1B`)** — Educational mathematics & AI website (`https://www.3blue1brown.com/`)
 4. **arXiv (`SRC-ARXIV`)** — Open-access research archive API (`https://export.arxiv.org/api/query`)
 5. **Wikipedia (`SRC-WIKIPEDIA`)** — Wikimedia REST & Action APIs (`https://en.wikipedia.org/w/rest.php/v1/`)
+6. **DeepLearning.AI — The Batch (`SRC-THE-BATCH`) [Candidate Source — Pending Policy Approval]** — AI research newsletter (`https://www.deeplearning.ai/the-batch`; registered as `CANDIDATE_PENDING_REVIEW`, `ALL_RIGHTS_RESERVED_METADATA_ONLY`, `permits_full_text_storage = 0` per [`ADR-0007`](decisions/0007-local-first-rag-chroma-and-multi-provider-architecture.md))
 
 > [!IMPORTANT]
 > **Public Visibility != Redistribution License (And No Automated "Fair Use" Assumption):**  
