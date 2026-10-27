@@ -4,9 +4,9 @@
 | :--- | :--- |
 | **Document ID** | `ARCH-ROADMAP-006` |
 | **Version** | `1.2.0` |
-| **Last Updated** | `2026-10-25` |
+| **Last Updated** | `2026-10-27` |
 | **Status** | `Proposed (For Architectural Review)` |
-| **Companion Docs** | [`system-overview.md`](./system-overview.md), [`transcript-ingestion.md`](./transcript-ingestion.md), [`cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md), [`0001-cloud-architecture.md`](./decisions/0001-cloud-architecture.md), [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0004-notebook-isolation.md`](./decisions/0004-notebook-isolation.md), [`0005-arxiv-api-access-policy.md`](./decisions/0005-arxiv-api-access-policy.md), [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md) |
+| **Companion Docs** | [`system-overview.md`](./system-overview.md), [`transcript-ingestion.md`](./transcript-ingestion.md), [`cloud-provisioning-plan.md`](../operations/cloud-provisioning-plan.md), [`0001-cloud-architecture.md`](./decisions/0001-cloud-architecture.md), [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0004-notebook-isolation.md`](./decisions/0004-notebook-isolation.md), [`0005-arxiv-api-access-policy.md`](./decisions/0005-arxiv-api-access-policy.md), [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md), [`0007-local-first-rag-chroma-and-multi-provider-architecture.md`](./decisions/0007-local-first-rag-chroma-and-multi-provider-architecture.md) |
 
 ---
 

@@ -2,8 +2,8 @@
 
 **Document ID:** `ARCH-DATA-002`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-25  
-**Related ADRs:** [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md)  
+**Last Updated:** 2026-10-27  
+**Related ADRs:** [`0002-knowledge-data-model.md`](./decisions/0002-knowledge-data-model.md), [`0006-transcript-acquisition-and-storage.md`](./decisions/0006-transcript-acquisition-and-storage.md), [`0007-local-first-rag-chroma-and-multi-provider-architecture.md`](./decisions/0007-local-first-rag-chroma-and-multi-provider-architecture.md)  
 **Companion Docs:** [`transcript-ingestion.md`](./transcript-ingestion.md)
 
 ---

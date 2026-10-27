@@ -2,8 +2,8 @@
 
 **Document ID:** `ARCH-AGENT-004`  
 **Status:** Proposed for Architectural Review  
-**Last Updated:** 2026-10-22  
-**Related ADR:** `docs/architecture/decisions/0003-agent-execution-boundaries.md`
+**Last Updated:** 2026-10-27  
+**Related ADRs:** [`0003-agent-execution-boundaries.md`](./decisions/0003-agent-execution-boundaries.md), [`0007-local-first-rag-chroma-and-multi-provider-architecture.md`](./decisions/0007-local-first-rag-chroma-and-multi-provider-architecture.md)
 
 ---
 
