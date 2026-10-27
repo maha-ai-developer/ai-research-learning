@@ -19,7 +19,10 @@ from ai_research_learning import (  # noqa: E402
     AnthropicGenerationProvider,
     CANDIDATE_SOURCE_THE_BATCH,
     ChromaPersistentVectorStore,
+    DEFAULT_VERTEX_LOCATION,
+    DEFAULT_VERTEX_PROJECT,
     DeterministicHashEmbeddingProvider,
+    EmbeddingIncompatibilityError,
     GeminiEmbeddingProvider,
     GeminiGenerationProvider,
     LocalRAGPipeline,
@@ -29,13 +32,17 @@ from ai_research_learning import (  # noqa: E402
     ProviderConfig,
     ProviderNotConfiguredError,
     RetrievalOnlyFallbackGenerationProvider,
+    build_vertex_ai_model_endpoint,
     chunk_text,
     compute_chunk_id,
     create_embedding_provider,
     create_generation_provider,
     evaluate_the_batch_candidate_policy,
     extract_indexable_document_from_resource,
+    load_dotenv_file,
     normalize_text_for_chunking,
+    parse_dotenv_content,
+    redact_secrets,
     register_candidate_source_the_batch,
     run_end_to_end_rag_proof,
 )
@@ -616,9 +623,308 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
                 # resources alongside restricted metadata-only resources
                 self.assertGreater(indexed_count, 0)
                 self.assertGreater(blocked_count, 0)
-                self.assertEqual(pilot_chroma.count(), indexed_count)
+                active_chunks = pilot_pipeline.list_indexed_chunks(only_active=True)
+                self.assertEqual(pilot_chroma.count(), len(active_chunks))
+                self.assertGreaterEqual(pilot_chroma.count(), indexed_count)
             finally:
                 pilot_store.close()
+
+    # ------------------------------------------------------------------
+    # 7. Task 030 Phase 1 & 2: .env Loading Boundary, Precedence, & Redaction
+    # ------------------------------------------------------------------
+
+    def test_dotenv_loading_precedence_and_secret_redaction(self) -> None:
+        dotenv_file = self.tmp_path / ".env.test"
+        dotenv_file.write_text(
+            "# Local test .env\n"
+            "GEMINI_API_KEY=gm-dotenv-secret-111\n"
+            "export ANTHROPIC_API_KEY='ant-dotenv-secret-222'\n"
+            'OPENAI_API_KEY="oa-dotenv-secret-333" # inline comment\n'
+            "AI_LEARNING_EMBEDDING_PROVIDER=gemini\n"
+            "AI_LEARNING_EMBEDDING_MODEL=gemini-embedding-2\n"
+            "AI_LEARNING_EMBEDDING_DIMENSIONS=768\n"
+            "AI_LEARNING_GENERATION_PROVIDER=gemini\n"
+            "AI_LEARNING_GENERATION_MODEL=gemini-3.8-flash\n",
+            encoding="utf-8",
+        )
+        parsed = load_dotenv_file(dotenv_file)
+        self.assertEqual(parsed["GEMINI_API_KEY"], "gm-dotenv-secret-111")
+        self.assertEqual(parsed["ANTHROPIC_API_KEY"], "ant-dotenv-secret-222")
+        self.assertEqual(parsed["OPENAI_API_KEY"], "oa-dotenv-secret-333")
+
+        # 1. Load from .env with empty explicit environ override
+        cfg = ProviderConfig.from_env({}, dotenv_path=dotenv_file, load_dotenv=True)
+        self.assertEqual(cfg.embedding_provider, "gemini")
+        self.assertEqual(cfg.embedding_model, "gemini-embedding-2")
+        self.assertEqual(cfg.embedding_dimensions, 768)
+        self.assertEqual(cfg.generation_provider, "gemini")
+        self.assertEqual(cfg.generation_model, "gemini-3.8-flash")
+        self.assertEqual(
+            cfg.credential_status(),
+            {
+                "GEMINI_API_KEY": "CONFIGURED",
+                "ANTHROPIC_API_KEY": "CONFIGURED",
+                "OPENAI_API_KEY": "CONFIGURED",
+            },
+        )
+        safe = cfg.to_safe_dict()
+        self.assertEqual(safe["credential_status"]["GEMINI_API_KEY"], "CONFIGURED")
+        for secret in ("gm-dotenv-secret-111", "ant-dotenv-secret-222", "oa-dotenv-secret-333"):
+            self.assertNotIn(secret, str(safe))
+            self.assertNotIn(secret, repr(cfg))
+
+        # 2. Explicit environment variables override .env values
+        cfg_override = ProviderConfig.from_env(
+            {
+                "AI_LEARNING_GENERATION_PROVIDER": "anthropic",
+                "AI_LEARNING_GENERATION_MODEL": "claude-3-5-haiku-latest",
+                "GEMINI_API_KEY": "gm-env-override-999",
+                "OPENAI_API_KEY": "",
+            },
+            dotenv_path=dotenv_file,
+            load_dotenv=True,
+        )
+        self.assertEqual(cfg_override.generation_provider, "anthropic")
+        self.assertEqual(cfg_override.generation_model, "claude-3-5-haiku-latest")
+        self.assertEqual(cfg_override.gemini_api_key, "gm-env-override-999")
+        self.assertIsNone(cfg_override.openai_api_key)
+        self.assertEqual(
+            cfg_override.credential_status(),
+            {
+                "GEMINI_API_KEY": "CONFIGURED",
+                "ANTHROPIC_API_KEY": "CONFIGURED",
+                "OPENAI_API_KEY": "MISSING",
+            },
+        )
+
+        # 3. Secret redaction helper and HTTP error redaction
+        redacted_msg = redact_secrets(
+            "Request failed with key gm-dotenv-secret-111 and Bearer oa-dotenv-secret-333",
+            ["gm-dotenv-secret-111", "oa-dotenv-secret-333"],
+        )
+        self.assertNotIn("gm-dotenv-secret-111", redacted_msg)
+        self.assertNotIn("oa-dotenv-secret-333", redacted_msg)
+        self.assertIn("[REDACTED]", redacted_msg)
+
+        # 4. Dimension mismatch check in GeminiEmbeddingProvider & OpenAIEmbeddingProvider
+        bad_gemini = GeminiEmbeddingProvider(
+            api_key="gm-test-key",
+            model_name="gemini-embedding-2",
+            dimensions=8,
+            http_post_json=lambda url, headers, payload: {
+                "embeddings": [{"values": [0.1, 0.2, 0.3, 0.4]}]
+            },
+        )
+        with self.assertRaises(RuntimeError):
+            bad_gemini.embed_query("dimension mismatch check")
+
+        bad_openai = OpenAIEmbeddingProvider(
+            api_key="oa-test-key",
+            model_name="text-embedding-3-small",
+            dimensions=8,
+            http_post_json=lambda url, headers, payload: {
+                "data": [{"index": 0, "embedding": [0.1, 0.2]}]
+            },
+        )
+        with self.assertRaises(RuntimeError):
+            bad_openai.embed_query("dimension mismatch check")
+
+        # 5. ArxivSourceAdapter-normalized scope (METADATA_AND_ABSTRACT + ARXIV_METADATA_AND_ABSTRACT_PERMITTED)
+        arxiv_adapter_res = self.store.upsert_resource(
+            source_id="SRC-ARXIV",
+            canonical_url="https://arxiv.org/abs/1706.03762",
+            title="Attention Is All You Need",
+            authors="Ashish Vaswani et al.",
+            published_at="2017-06-12",
+            resource_type="Preprint paper",
+            abstract_or_description=(
+                "The dominant sequence transduction models are based on complex recurrent or "
+                "convolutional neural networks. We propose a new simple network architecture, "
+                "the Transformer, based solely on attention mechanisms."
+            ),
+            collection_decision="COLLECTED",
+            verification_status="HTTP_200_VERIFIED",
+            license_status="ARXIV_METADATA_AND_ABSTRACT_PERMITTED",
+            permitted_storage_scope="METADATA_AND_ABSTRACT",
+            permits_full_text_storage=0,
+            permits_verbatim_excerpts=0,
+            legal_uncertainty_status="CLEARED_PERMITTED_SCOPE",
+        )
+        doc = extract_indexable_document_from_resource(
+            self.store, arxiv_adapter_res["resource_id"]
+        )
+        self.assertEqual(doc.content_origin, "RESOURCE_ABSTRACT_METADATA")
+        self.assertEqual(doc.epistemic_layer, "AUTHORIZED_ABSTRACT_OR_DESCRIPTION")
+        self.assertIn("Transformer", doc.text)
+
+    # ------------------------------------------------------------------
+    # 8. Task 030 Vertex AI + ADC Configuration (Without GEMINI_API_KEY)
+    # ------------------------------------------------------------------
+
+    def test_vertex_ai_adc_embedding_and_generation_without_gemini_api_key(self) -> None:
+        # Configure Gemini embedding + generation with NO GEMINI_API_KEY
+        cfg = ProviderConfig.from_env(
+            {
+                "AI_LEARNING_EMBEDDING_PROVIDER": "gemini",
+                "AI_LEARNING_EMBEDDING_MODEL": "gemini-embedding-2",
+                "AI_LEARNING_EMBEDDING_DIMENSIONS": "4",
+                "AI_LEARNING_GENERATION_PROVIDER": "gemini",
+                "AI_LEARNING_GENERATION_MODEL": "gemini-3.8-flash",
+                "GEMINI_API_KEY": "",
+            }
+        )
+        self.assertTrue(cfg.use_vertex_ai)
+        self.assertEqual(cfg.vertex_project, "kerala-lottery-intel-dev")
+        self.assertEqual(cfg.vertex_location, DEFAULT_VERTEX_LOCATION)
+        self.assertIsNone(cfg.gemini_api_key)
+        self.assertEqual(cfg.vertex_status()["vertex_project"], "kerala-lottery-intel-dev")
+        self.assertFalse(cfg.vertex_status()["requires_gemini_api_key"])
+
+        captured_emb_requests: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+        def fake_vertex_emb_post(
+            url: str, headers: dict[str, str], payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            captured_emb_requests.append((url, headers, payload))
+            return {"embedding": {"values": [0.5, 0.5, 0.5, 0.5]}}
+
+        emb_provider = create_embedding_provider(
+            cfg,
+            adc_token_provider=lambda: "ya29.fake-adc-token-do-not-expose",
+            http_post_json=fake_vertex_emb_post,
+        )
+        vec = emb_provider.embed_query("backpropagation chain rule")
+        self.assertEqual(vec, [0.5, 0.5, 0.5, 0.5])
+        self.assertEqual(len(captured_emb_requests), 1)
+        emb_url, emb_headers, emb_payload = captured_emb_requests[0]
+        self.assertEqual(
+            emb_url,
+            "https://aiplatform.googleapis.com/v1/projects/kerala-lottery-intel-dev"
+            "/locations/global/publishers/google/models/gemini-embedding-2:embedContent",
+        )
+        self.assertEqual(
+            emb_headers["Authorization"], "Bearer ya29.fake-adc-token-do-not-expose"
+        )
+        self.assertEqual(emb_headers["x-goog-user-project"], "kerala-lottery-intel-dev")
+        self.assertNotIn("x-goog-api-key", emb_headers)
+        self.assertEqual(emb_payload["outputDimensionality"], 4)
+
+        # Also test Vertex AI :predict format for gemini-embedding-001
+        emb_001 = GeminiEmbeddingProvider(
+            api_key=None,
+            model_name="gemini-embedding-001",
+            dimensions=4,
+            vertex_project="kerala-lottery-intel-dev",
+            vertex_location="us-central1",
+            use_vertex_ai=True,
+            adc_token_provider=lambda: "ya29.fake-adc-token",
+            http_post_json=lambda url, headers, payload: {
+                "predictions": [{"embeddings": {"values": [0.1, 0.2, 0.3, 0.4]}}]
+            },
+        )
+        self.assertEqual(emb_001.embed_query("test"), [0.1, 0.2, 0.3, 0.4])
+
+        # Test Vertex AI generation with gemini-3.8-flash and no GEMINI_API_KEY
+        seeded = self._seed_sample_resources()
+        det_emb = DeterministicHashEmbeddingProvider(dimensions=128)
+        vector_store = ChromaPersistentVectorStore(self.chroma_dir / "vertex_test")
+        captured_gen_requests: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+
+        def fake_vertex_gen_post(
+            url: str, headers: dict[str, str], payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            captured_gen_requests.append((url, headers, payload))
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {"thought": True, "text": "Internal reasoning step."},
+                                {
+                                    "text": f"Backpropagation computes gradients via the chain rule [{bp_chunk_id}]."
+                                },
+                            ]
+                        }
+                    }
+                ]
+            }
+
+        gen_provider = create_generation_provider(
+            cfg,
+            adc_token_provider=lambda: "ya29.fake-adc-token-do-not-expose",
+            http_post_json=fake_vertex_gen_post,
+        )
+        pipeline = LocalRAGPipeline(
+            store=self.store,
+            vector_store=vector_store,
+            embedding_provider=det_emb,
+            generation_provider=gen_provider,
+            config=cfg,
+        )
+        bp_idx = pipeline.index_resource(seeded["backprop"]["resource_id"])
+        bp_chunk_id = bp_idx["chunk_ids"][0]
+        resp = pipeline.answer_question("How does backpropagation compute gradients?")
+        self.assertEqual(resp.status, "answered")
+        assert resp.generated_answer is not None
+        self.assertEqual(resp.generated_answer.provider_name, "gemini")
+        self.assertEqual(resp.generated_answer.model_name, "gemini-3.8-flash")
+        self.assertEqual(resp.generated_answer.cited_chunk_ids, [bp_chunk_id])
+        self.assertNotIn("Internal reasoning step", resp.generated_answer.answer_text)
+        gen_url, gen_headers, gen_payload = captured_gen_requests[0]
+        self.assertEqual(
+            gen_url,
+            "https://aiplatform.googleapis.com/v1/projects/kerala-lottery-intel-dev"
+            "/locations/global/publishers/google/models/gemini-3.8-flash:generateContent",
+        )
+        self.assertEqual(
+            gen_headers["Authorization"], "Bearer ya29.fake-adc-token-do-not-expose"
+        )
+        self.assertEqual(gen_headers["x-goog-user-project"], "kerala-lottery-intel-dev")
+        self.assertNotIn("x-goog-api-key", gen_headers)
+        self.assertNotIn("generationConfig", gen_payload)
+
+        # Missing ADC token in Vertex AI mode raises ProviderNotConfiguredError
+        missing_adc_emb = GeminiEmbeddingProvider(
+            api_key=None,
+            model_name="gemini-embedding-2",
+            dimensions=4,
+            vertex_project="kerala-lottery-intel-dev",
+            use_vertex_ai=True,
+            adc_token_provider=lambda: "",
+        )
+        with self.assertRaises(ProviderNotConfiguredError):
+            missing_adc_emb.embed_query("test")
+
+        # Even if GEMINI_API_KEY is present in .env / passed, Vertex AI mode ignores it completely
+        vertex_emb_128 = GeminiEmbeddingProvider(
+            api_key="gm-ignored-key-in-vertex-mode",
+            model_name="gemini-embedding-2",
+            dimensions=128,
+            vertex_project="kerala-lottery-intel-dev",
+            use_vertex_ai=True,
+            adc_token_provider=lambda: "ya29.fake-adc-token",
+            http_post_json=lambda url, headers, payload: {
+                "embedding": {"values": [1.0 / (128**0.5)] * 128}
+            },
+        )
+        self.assertIsNone(vertex_emb_128._api_key)
+
+        # Attempting to index or retrieve against the existing local_deterministic collection
+        # with an incompatible embedding model (gemini-embedding-2, even with matching 128d)
+        # raises EmbeddingIncompatibilityError instead of silently mixing vectors
+        mismatched_pipeline = LocalRAGPipeline(
+            store=self.store,
+            vector_store=vector_store,
+            embedding_provider=vertex_emb_128,
+            generation_provider=gen_provider,
+            config=cfg,
+        )
+        with self.assertRaises(EmbeddingIncompatibilityError):
+            mismatched_pipeline.index_resource(seeded["boltzmann"]["resource_id"])
+        with self.assertRaises(EmbeddingIncompatibilityError):
+            mismatched_pipeline.retrieve("How does backpropagation compute gradients?")
+        # Original collection count remains unchanged at 1
+        self.assertEqual(vector_store.count(), 1)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,10 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import chromadb
@@ -38,6 +40,12 @@ from knowledge_store import (  # noqa: E402
     utc_now,
 )
 
+DEFAULT_DOTENV_PATH = REPO_ROOT / ".env"
+DEFAULT_VERTEX_PROJECT = "kerala-lottery-intel-dev"
+DEFAULT_VERTEX_LOCATION = "global"
+DEFAULT_ADC_CREDENTIALS_PATH = (
+    Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+)
 DEFAULT_CHROMA_COLLECTION = "ai_research_knowledge_chunks_v1"
 DEFAULT_CHUNK_SIZE_CHARS = 600
 DEFAULT_CHUNK_OVERLAP_CHARS = 100
@@ -46,6 +54,209 @@ DEFAULT_TOP_K = 4
 
 VALID_EMBEDDING_PROVIDERS = ("local_deterministic", "openai", "gemini")
 VALID_GENERATION_PROVIDERS = ("retrieval_only", "openai", "anthropic", "gemini")
+
+
+def parse_dotenv_content(content: str) -> dict[str, str]:
+    """Parse `.env` file content into a dictionary without mutating `os.environ`."""
+    parsed: dict[str, str] = {}
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, raw_val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = raw_val.strip()
+        if val and val[0] in ("'", '"'):
+            quote_char = val[0]
+            end_quote_idx = val.find(quote_char, 1)
+            if end_quote_idx != -1:
+                val = val[1:end_quote_idx]
+        else:
+            # Strip inline unquoted comments preceded by whitespace
+            comment_idx = val.find(" #")
+            if comment_idx != -1:
+                val = val[:comment_idx].rstrip()
+        parsed[key] = val
+    return parsed
+
+
+def load_dotenv_file(dotenv_path: Path | str | None = DEFAULT_DOTENV_PATH) -> dict[str, str]:
+    """Read key-value pairs from a local `.env` file if present without mutating `os.environ`."""
+    if dotenv_path is None:
+        return {}
+    path = Path(dotenv_path)
+    if not path.is_file():
+        return {}
+    return parse_dotenv_content(path.read_text(encoding="utf-8"))
+
+
+def redact_secrets(text: str, secrets: Sequence[str | None]) -> str:
+    """Replace any non-empty secret values appearing in `text` with `[REDACTED]`."""
+    redacted = text
+    for secret in secrets:
+        if not secret:
+            continue
+        candidate = secret.strip()
+        if candidate and candidate in redacted:
+            redacted = redacted.replace(candidate, "[REDACTED]")
+    return redacted
+
+
+AdcTokenProviderFn = Callable[[], str]
+_ADC_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
+
+
+def resolve_adc_credentials_path(
+    adc_path: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve the Google Cloud Application Default Credentials (ADC) JSON path."""
+    if adc_path is not None:
+        return Path(adc_path)
+    env = environ if environ is not None else os.environ
+    env_override = (env.get("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+    if env_override:
+        return Path(env_override)
+    return DEFAULT_ADC_CREDENTIALS_PATH
+
+
+def has_vertex_adc_credentials(
+    adc_path: Path | str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True if a readable Google Cloud ADC credentials file is present."""
+    path = resolve_adc_credentials_path(adc_path=adc_path, environ=environ)
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return isinstance(data, dict) and bool(data.get("type"))
+    except Exception:
+        return False
+
+
+def get_vertex_adc_access_token(
+    adc_path: Path | str | None = None,
+    *,
+    force_refresh: bool = False,
+) -> str:
+    """Obtain an OAuth2 access token from Google Cloud Application Default Credentials (ADC).
+
+    Does not use or require `GEMINI_API_KEY`. Redacts all credential/token material on error.
+    """
+    path = resolve_adc_credentials_path(adc_path=adc_path)
+    cache_key = str(path)
+    now = time.monotonic()
+    if not force_refresh and cache_key in _ADC_TOKEN_CACHE:
+        cached_token, expires_at = _ADC_TOKEN_CACHE[cache_key]
+        if cached_token and now < expires_at:
+            return cached_token
+
+    secret_values: list[str] = []
+    if path.is_file():
+        try:
+            creds = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(creds, dict) and creds.get("type") == "authorized_user":
+                client_id = str(creds.get("client_id") or "").strip()
+                client_secret = str(creds.get("client_secret") or "").strip()
+                refresh_token = str(creds.get("refresh_token") or "").strip()
+                token_uri = str(
+                    creds.get("token_uri") or "https://oauth2.googleapis.com/token"
+                ).strip()
+                secret_values.extend([s for s in (client_secret, refresh_token) if s])
+                if client_id and client_secret and refresh_token:
+                    import requests
+
+                    resp = requests.post(
+                        token_uri,
+                        data={
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "refresh_token": refresh_token,
+                            "grant_type": "refresh_token",
+                        },
+                        timeout=15,
+                    )
+                    resp.raise_for_status()
+                    token_data = resp.json()
+                    access_token = str(token_data.get("access_token") or "").strip()
+                    expires_in = float(token_data.get("expires_in") or 3600.0)
+                    if access_token:
+                        _ADC_TOKEN_CACHE[cache_key] = (
+                            access_token,
+                            now + max(60.0, expires_in - 120.0),
+                        )
+                        return access_token
+        except Exception:
+            # Fall back to gcloud ADC CLI below if direct token exchange fails
+            pass
+
+    try:
+        sub_env = dict(os.environ)
+        existing_metrics = sub_env.get("CLOUDSDK_METRICS_ENVIRONMENT", "").strip()
+        sub_env["CLOUDSDK_METRICS_ENVIRONMENT"] = (
+            f"{existing_metrics} datacloud.antigravity".strip()
+        )
+        proc = subprocess.run(
+            ["gcloud", "auth", "application-default", "print-access-token"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+            env=sub_env,
+        )
+        if proc.returncode == 0:
+            token = (proc.stdout or "").strip()
+            if token:
+                _ADC_TOKEN_CACHE[cache_key] = (token, now + 1800.0)
+                return token
+        stderr_msg = redact_secrets((proc.stderr or "").strip(), secret_values)
+        raise ProviderNotConfiguredError(
+            "Vertex AI ADC authentication failed: unable to obtain an access token "
+            f"from Application Default Credentials ({stderr_msg or 'no ADC credentials found'})."
+        )
+    except ProviderNotConfiguredError:
+        raise
+    except Exception as exc:
+        raise ProviderNotConfiguredError(
+            redact_secrets(
+                f"Vertex AI ADC authentication failed: {exc}",
+                secret_values,
+            )
+        ) from None
+
+
+def build_vertex_ai_model_endpoint(
+    *,
+    project_id: str,
+    location: str,
+    model_name: str,
+    method: str,
+) -> str:
+    """Build the official Vertex AI REST endpoint URL for a Google publisher model."""
+    clean_project = project_id.strip()
+    clean_location = (location or DEFAULT_VERTEX_LOCATION).strip()
+    clean_model = (
+        model_name[len("models/") :]
+        if model_name.startswith("models/")
+        else model_name.strip()
+    )
+    if clean_location == "global":
+        host = "https://aiplatform.googleapis.com"
+    elif clean_location in ("us", "eu"):
+        host = f"https://aiplatform.{clean_location}.rep.googleapis.com"
+    else:
+        host = f"https://{clean_location}-aiplatform.googleapis.com"
+    return (
+        f"{host}/v1/projects/{clean_project}/locations/{clean_location}"
+        f"/publishers/google/models/{clean_model}:{method}"
+    )
 
 # Candidate Source #6 (ADR-0007 Section G): DeepLearning.AI The Batch
 CANDIDATE_SOURCE_THE_BATCH: dict[str, Any] = {
@@ -130,6 +341,10 @@ class ProviderNotConfiguredError(RuntimeError):
     """Raised when a model provider is invoked without required credentials or configuration."""
 
 
+class EmbeddingIncompatibilityError(RuntimeError):
+    """Raised when a Chroma collection contains vectors from an incompatible embedding provider, model, or dimension."""
+
+
 @dataclass(frozen=True)
 class TextSpan:
     """Normalized text chunk with deterministic character offsets and SHA-256 content hash."""
@@ -171,12 +386,45 @@ class ProviderConfig:
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     gemini_api_key: str | None = None
+    vertex_project: str | None = DEFAULT_VERTEX_PROJECT
+    vertex_location: str = DEFAULT_VERTEX_LOCATION
+    use_vertex_ai: bool = True
     chroma_collection: str = DEFAULT_CHROMA_COLLECTION
 
     @classmethod
-    def from_env(cls, environ: Mapping[str, str] | None = None) -> "ProviderConfig":
-        """Load provider configuration from an environment mapping (defaults to `os.environ`)."""
-        env = environ if environ is not None else os.environ
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        *,
+        dotenv_path: Path | str | None = None,
+        load_dotenv: bool | None = None,
+    ) -> "ProviderConfig":
+        """Load provider configuration from `.env` and an environment mapping.
+
+        Precedence rules:
+        - Explicit variables in `environ` (or `os.environ` when `environ is None`)
+          always override values loaded from `.env`.
+        - When `environ is None`, `.env` is loaded by default (unless `load_dotenv=False`)
+          from `dotenv_path` or `DEFAULT_DOTENV_PATH` without mutating `os.environ`.
+        - When an explicit `environ` mapping is passed (e.g. in isolated unit tests),
+          `.env` is only loaded if `dotenv_path is not None` or `load_dotenv=True`.
+        """
+        if environ is None:
+            should_load_dotenv = True if load_dotenv is None else bool(load_dotenv)
+            base_env: Mapping[str, str] = os.environ
+        else:
+            should_load_dotenv = (
+                bool(load_dotenv) if load_dotenv is not None else (dotenv_path is not None)
+            )
+            base_env = environ
+
+        dotenv_values = (
+            load_dotenv_file(DEFAULT_DOTENV_PATH if dotenv_path is None else dotenv_path)
+            if should_load_dotenv
+            else {}
+        )
+        env: dict[str, str] = {**dotenv_values, **dict(base_env)}
+
         emb_provider = (
             env.get("AI_LEARNING_EMBEDDING_PROVIDER", "local_deterministic").strip().lower()
             or "local_deterministic"
@@ -190,7 +438,7 @@ class ProviderConfig:
         default_emb_model = {
             "local_deterministic": "token-hash-bow-v1",
             "openai": "text-embedding-3-small",
-            "gemini": "text-embedding-004",
+            "gemini": "gemini-embedding-2",
         }[emb_provider]
         emb_model = env.get("AI_LEARNING_EMBEDDING_MODEL", "").strip() or default_emb_model
 
@@ -212,8 +460,8 @@ class ProviderConfig:
         default_gen_model = {
             "retrieval_only": "none",
             "openai": "gpt-4o-mini",
-            "anthropic": "claude-3-5-haiku-latest",
-            "gemini": "gemini-2.5-flash",
+            "anthropic": "claude-haiku-4-5-20251001",
+            "gemini": "gemini-3.8-flash",
         }[gen_provider]
         gen_model = env.get("AI_LEARNING_GENERATION_MODEL", "").strip() or default_gen_model
 
@@ -229,6 +477,25 @@ class ProviderConfig:
             stripped = val.strip()
             return stripped if stripped else None
 
+        vertex_project = (
+            _clean_key("AI_LEARNING_VERTEX_PROJECT")
+            or _clean_key("GOOGLE_CLOUD_PROJECT")
+            or _clean_key("GCLOUD_PROJECT")
+            or DEFAULT_VERTEX_PROJECT
+        )
+        vertex_location = (
+            _clean_key("AI_LEARNING_VERTEX_LOCATION")
+            or _clean_key("GOOGLE_CLOUD_LOCATION")
+            or DEFAULT_VERTEX_LOCATION
+        )
+        raw_use_vertex = (env.get("AI_LEARNING_GEMINI_USE_VERTEX_AI") or "").strip().lower()
+        if raw_use_vertex in ("0", "false", "no", "off"):
+            use_vertex_ai = False
+        elif raw_use_vertex in ("1", "true", "yes", "on"):
+            use_vertex_ai = True
+        else:
+            use_vertex_ai = True
+
         return cls(
             embedding_provider=emb_provider,
             embedding_model=emb_model,
@@ -238,8 +505,30 @@ class ProviderConfig:
             openai_api_key=_clean_key("OPENAI_API_KEY"),
             anthropic_api_key=_clean_key("ANTHROPIC_API_KEY"),
             gemini_api_key=_clean_key("GEMINI_API_KEY"),
+            vertex_project=vertex_project,
+            vertex_location=vertex_location,
+            use_vertex_ai=use_vertex_ai,
             chroma_collection=collection,
         )
+
+    def credential_status(self) -> dict[str, str]:
+        """Return safe `CONFIGURED` / `MISSING` status for each supported provider key."""
+        return {
+            "GEMINI_API_KEY": "CONFIGURED" if self.gemini_api_key else "MISSING",
+            "ANTHROPIC_API_KEY": "CONFIGURED" if self.anthropic_api_key else "MISSING",
+            "OPENAI_API_KEY": "CONFIGURED" if self.openai_api_key else "MISSING",
+        }
+
+    def vertex_status(self) -> dict[str, Any]:
+        """Return safe Vertex AI + ADC status without exposing any credential material."""
+        adc_available = has_vertex_adc_credentials()
+        return {
+            "use_vertex_ai": self.use_vertex_ai,
+            "vertex_project": self.vertex_project,
+            "vertex_location": self.vertex_location,
+            "adc_credentials": "CONFIGURED" if adc_available else "MISSING",
+            "requires_gemini_api_key": not self.use_vertex_ai,
+        }
 
     def has_embedding_credentials(self) -> bool:
         """Return True if the selected `embedding_provider` has required credentials."""
@@ -248,6 +537,8 @@ class ProviderConfig:
         if self.embedding_provider == "openai":
             return bool(self.openai_api_key)
         if self.embedding_provider == "gemini":
+            if self.use_vertex_ai:
+                return bool(self.vertex_project) and has_vertex_adc_credentials()
             return bool(self.gemini_api_key)
         return False
 
@@ -258,6 +549,8 @@ class ProviderConfig:
         if self.generation_provider == "anthropic":
             return bool(self.anthropic_api_key)
         if self.generation_provider == "gemini":
+            if self.use_vertex_ai:
+                return bool(self.vertex_project) and has_vertex_adc_credentials()
             return bool(self.gemini_api_key)
         return False
 
@@ -273,6 +566,8 @@ class ProviderConfig:
             "has_openai_api_key": bool(self.openai_api_key),
             "has_anthropic_api_key": bool(self.anthropic_api_key),
             "has_gemini_api_key": bool(self.gemini_api_key),
+            "credential_status": self.credential_status(),
+            "vertex_ai": self.vertex_status(),
             "embedding_ready": self.has_embedding_credentials(),
             "generation_ready": self.has_generation_credentials(),
         }
@@ -679,6 +974,7 @@ def extract_indexable_document_from_resource(
         (res_permits_full and src_permits_full)
         or permitted_scope
         in (
+            "METADATA_AND_ABSTRACT",
             "ARXIV_METADATA_AND_ABSTRACT_PERMITTED",
             "WIKIPEDIA_OPEN_LICENSE_TEXT_PERMITTED",
             "OPEN_LICENSE_FULL_TEXT",
@@ -690,6 +986,7 @@ def extract_indexable_document_from_resource(
             "CC0_1_0",
             "OPEN_LICENSE_VERIFIED",
             "PUBLIC_DOMAIN_VERIFIED",
+            "ARXIV_METADATA_AND_ABSTRACT_PERMITTED",
             "ARXIV_NON_EXCLUSIVE_DISTRIB",
             "ARXIV_AUTHOR_SELECTED_LICENSE",
         )
@@ -1015,12 +1312,41 @@ def _default_http_post_json(
     headers: dict[str, str],
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    """Perform an HTTPS JSON POST using `requests` when explicitly configured."""
+    """Perform an HTTPS JSON POST using `requests` with strict secret redaction on error."""
     import requests
 
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-    response.raise_for_status()
-    return response.json()
+    secret_values: list[str] = []
+    for k, v in (headers or {}).items():
+        if not v:
+            continue
+        if k.lower() in ("authorization", "x-api-key", "x-goog-api-key") or "key" in k.lower() or "token" in k.lower():
+            secret_values.append(str(v))
+            if str(v).lower().startswith("bearer "):
+                secret_values.append(str(v)[7:].strip())
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        body_excerpt = ""
+        resp_obj = getattr(exc, "response", None)
+        if resp_obj is not None:
+            try:
+                err_json = resp_obj.json()
+                if isinstance(err_json, dict) and isinstance(err_json.get("error"), dict):
+                    body_excerpt = str(err_json["error"].get("message") or err_json["error"])
+                else:
+                    body_excerpt = str(err_json)
+            except Exception:
+                body_excerpt = (resp_obj.text or "")[:300]
+        raw_message = (
+            f"Provider HTTP request to {url} failed"
+            + (f" (status={status_code})" if status_code is not None else "")
+            + (f": {body_excerpt}" if body_excerpt else f": {exc}")
+        )
+        raise RuntimeError(redact_secrets(raw_message, secret_values)) from None
 
 
 class OpenAIEmbeddingProvider:
@@ -1080,6 +1406,11 @@ class OpenAIEmbeddingProvider:
             raise RuntimeError(
                 f"OpenAI embedding response returned {len(vectors)} vectors for {len(texts)} inputs."
             )
+        for idx, vec in enumerate(vectors):
+            if len(vec) != self._dimensions:
+                raise RuntimeError(
+                    f"OpenAI embedding vector {idx} has dimension {len(vec)}, expected {self._dimensions}."
+                )
         return vectors
 
     def embed_query(self, query: str) -> list[float]:
@@ -1088,20 +1419,55 @@ class OpenAIEmbeddingProvider:
         return self.embed_texts([query])[0]
 
 
+def _extract_vertex_embedding_values(data: dict[str, Any]) -> list[list[float]]:
+    """Extract embedding float vectors from Vertex AI (`:embedContent` / `:predict`) or Gemini API responses."""
+    if "embedding" in data and isinstance(data["embedding"], dict):
+        return [[float(x) for x in data["embedding"].get("values", [])]]
+    if "embeddings" in data and isinstance(data["embeddings"], list):
+        return [[float(x) for x in item.get("values", [])] for item in data["embeddings"]]
+    if "predictions" in data and isinstance(data["predictions"], list):
+        vectors: list[list[float]] = []
+        for pred in data["predictions"]:
+            if isinstance(pred, dict) and isinstance(pred.get("embeddings"), dict):
+                vectors.append([float(x) for x in pred["embeddings"].get("values", [])])
+        return vectors
+    return []
+
+
 class GeminiEmbeddingProvider:
-    """Interchangeable Google Gemini embedding provider (`batchEmbedContents`)."""
+    """Interchangeable Google Gemini embedding provider supporting Vertex AI (ADC) and Developer API."""
 
     def __init__(
         self,
         *,
-        api_key: str | None,
-        model_name: str = "text-embedding-004",
+        api_key: str | None = None,
+        model_name: str = "gemini-embedding-2",
         dimensions: int = 128,
+        vertex_project: str | None = None,
+        vertex_location: str = DEFAULT_VERTEX_LOCATION,
+        use_vertex_ai: bool | None = None,
+        adc_token_provider: AdcTokenProviderFn | None = None,
         http_post_json: HttpPostJsonFn | None = None,
     ) -> None:
-        self._api_key = api_key.strip() if api_key and api_key.strip() else None
+        self._use_vertex_ai = (
+            bool(use_vertex_ai)
+            if use_vertex_ai is not None
+            else bool(vertex_project and vertex_project.strip())
+        )
+        self._api_key = (
+            None
+            if self._use_vertex_ai
+            else (api_key.strip() if api_key and api_key.strip() else None)
+        )
         self._model_name = model_name
         self._dimensions = int(dimensions)
+        self._vertex_project = (
+            (vertex_project or DEFAULT_VERTEX_PROJECT).strip()
+            if self._use_vertex_ai
+            else None
+        )
+        self._vertex_location = (vertex_location or DEFAULT_VERTEX_LOCATION).strip()
+        self._adc_token_provider = adc_token_provider or get_vertex_adc_access_token
         self._http_post = http_post_json or _default_http_post_json
 
     @property
@@ -1116,42 +1482,116 @@ class GeminiEmbeddingProvider:
     def dimensions(self) -> int:
         return self._dimensions
 
+    @property
+    def use_vertex_ai(self) -> bool:
+        return self._use_vertex_ai
+
+    @property
+    def vertex_project(self) -> str | None:
+        return self._vertex_project
+
+    @property
+    def vertex_location(self) -> str:
+        return self._vertex_location
+
     def _require_key(self) -> str:
         if not self._api_key:
             raise ProviderNotConfiguredError(
-                "GeminiEmbeddingProvider requires GEMINI_API_KEY to be set."
+                "GeminiEmbeddingProvider requires Vertex AI ADC configuration or GEMINI_API_KEY."
             )
         return self._api_key
 
+    def _require_vertex_token(self) -> str:
+        if not self._vertex_project:
+            raise ProviderNotConfiguredError(
+                "GeminiEmbeddingProvider in Vertex AI mode requires vertex_project to be set."
+            )
+        token = (self._adc_token_provider() or "").strip()
+        if not token:
+            raise ProviderNotConfiguredError(
+                "GeminiEmbeddingProvider in Vertex AI mode requires a valid ADC access token."
+            )
+        return token
+
     def embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
-        api_key = self._require_key()
         if not texts:
             return []
-        model_path = (
-            self._model_name
-            if self._model_name.startswith("models/")
-            else f"models/{self._model_name}"
-        )
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:batchEmbedContents"
-        headers = {
-            "x-goog-api-key": api_key,
-            "Content-Type": "application/json",
-        }
-        requests_list = [
-            {
-                "model": model_path,
-                "content": {"parts": [{"text": t}]},
-                "outputDimensionality": self._dimensions,
+
+        if self._use_vertex_ai:
+            access_token = self._require_vertex_token()
+            assert self._vertex_project is not None
+            clean_model = (
+                self._model_name[len("models/") :]
+                if self._model_name.startswith("models/")
+                else self._model_name.strip()
+            )
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "x-goog-user-project": self._vertex_project,
+                "Content-Type": "application/json",
             }
-            for t in texts
-        ]
-        data = self._http_post(url, headers, {"requests": requests_list})
-        embeddings = data.get("embeddings", [])
-        vectors = [[float(x) for x in item["values"]] for item in embeddings]
+            vectors: list[list[float]] = []
+            use_embed_content = clean_model.startswith("gemini-embedding-2")
+            method = "embedContent" if use_embed_content else "predict"
+            url = build_vertex_ai_model_endpoint(
+                project_id=self._vertex_project,
+                location=self._vertex_location,
+                model_name=clean_model,
+                method=method,
+            )
+            for t in texts:
+                if use_embed_content:
+                    payload: dict[str, Any] = {
+                        "content": {"role": "user", "parts": [{"text": t}]},
+                        "outputDimensionality": self._dimensions,
+                    }
+                else:
+                    payload = {
+                        "instances": [{"content": t}],
+                        "parameters": {
+                            "autoTruncate": True,
+                            "outputDimensionality": self._dimensions,
+                        },
+                    }
+                data = self._http_post(url, headers, payload)
+                extracted = _extract_vertex_embedding_values(data)
+                if not extracted:
+                    raise RuntimeError(
+                        f"Vertex AI Gemini embedding response for {clean_model!r} returned no vector values."
+                    )
+                vectors.append(extracted[0])
+        else:
+            api_key = self._require_key()
+            model_path = (
+                self._model_name
+                if self._model_name.startswith("models/")
+                else f"models/{self._model_name}"
+            )
+            url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:batchEmbedContents"
+            headers = {
+                "x-goog-api-key": api_key,
+                "Content-Type": "application/json",
+            }
+            requests_list = [
+                {
+                    "model": model_path,
+                    "content": {"parts": [{"text": t}]},
+                    "outputDimensionality": self._dimensions,
+                }
+                for t in texts
+            ]
+            data = self._http_post(url, headers, {"requests": requests_list})
+            vectors = _extract_vertex_embedding_values(data)
+
         if len(vectors) != len(texts):
             raise RuntimeError(
                 f"Gemini embedding response returned {len(vectors)} vectors for {len(texts)} inputs."
             )
+        for idx, vec in enumerate(vectors):
+            if len(vec) != self._dimensions:
+                raise RuntimeError(
+                    f"Gemini embedding vector {idx} has dimension {len(vec)}, expected {self._dimensions}."
+                )
         return vectors
 
     def embed_query(self, query: str) -> list[float]:
@@ -1163,6 +1603,7 @@ class GeminiEmbeddingProvider:
 def create_embedding_provider(
     config: ProviderConfig,
     *,
+    adc_token_provider: AdcTokenProviderFn | None = None,
     http_post_json: HttpPostJsonFn | None = None,
 ) -> EmbeddingProvider:
     """Instantiate the configured `EmbeddingProvider`."""
@@ -1179,10 +1620,22 @@ def create_embedding_provider(
             http_post_json=http_post_json,
         )
     if config.embedding_provider == "gemini":
+        if config.use_vertex_ai:
+            return GeminiEmbeddingProvider(
+                api_key=None,
+                model_name=config.embedding_model,
+                dimensions=config.embedding_dimensions,
+                vertex_project=config.vertex_project,
+                vertex_location=config.vertex_location,
+                use_vertex_ai=True,
+                adc_token_provider=adc_token_provider,
+                http_post_json=http_post_json,
+            )
         return GeminiEmbeddingProvider(
             api_key=config.gemini_api_key,
             model_name=config.embedding_model,
             dimensions=config.embedding_dimensions,
+            use_vertex_ai=False,
             http_post_json=http_post_json,
         )
     raise ValueError(f"Unsupported embedding_provider: {config.embedding_provider!r}")
@@ -1360,7 +1813,7 @@ class AnthropicGenerationProvider:
         self,
         *,
         api_key: str | None,
-        model_name: str = "claude-3-5-haiku-latest",
+        model_name: str = "claude-haiku-4-5-20251001",
         base_url: str = "https://api.anthropic.com/v1/messages",
         http_post_json: HttpPostJsonFn | None = None,
     ) -> None:
@@ -1413,17 +1866,37 @@ class AnthropicGenerationProvider:
 
 
 class GeminiGenerationProvider:
-    """Interchangeable Google Gemini `generateContent` provider for source-grounded RAG."""
+    """Interchangeable Google Gemini `generateContent` provider supporting Vertex AI (ADC) and Developer API."""
 
     def __init__(
         self,
         *,
-        api_key: str | None,
-        model_name: str = "gemini-2.5-flash",
+        api_key: str | None = None,
+        model_name: str = "gemini-3.8-flash",
+        vertex_project: str | None = None,
+        vertex_location: str = DEFAULT_VERTEX_LOCATION,
+        use_vertex_ai: bool | None = None,
+        adc_token_provider: AdcTokenProviderFn | None = None,
         http_post_json: HttpPostJsonFn | None = None,
     ) -> None:
-        self._api_key = api_key.strip() if api_key and api_key.strip() else None
+        self._use_vertex_ai = (
+            bool(use_vertex_ai)
+            if use_vertex_ai is not None
+            else bool(vertex_project and vertex_project.strip())
+        )
+        self._api_key = (
+            None
+            if self._use_vertex_ai
+            else (api_key.strip() if api_key and api_key.strip() else None)
+        )
         self._model_name = model_name
+        self._vertex_project = (
+            (vertex_project or DEFAULT_VERTEX_PROJECT).strip()
+            if self._use_vertex_ai
+            else None
+        )
+        self._vertex_location = (vertex_location or DEFAULT_VERTEX_LOCATION).strip()
+        self._adc_token_provider = adc_token_provider or get_vertex_adc_access_token
         self._http_post = http_post_json or _default_http_post_json
 
     @property
@@ -1434,36 +1907,97 @@ class GeminiGenerationProvider:
     def model_name(self) -> str:
         return self._model_name
 
+    @property
+    def use_vertex_ai(self) -> bool:
+        return self._use_vertex_ai
+
+    @property
+    def vertex_project(self) -> str | None:
+        return self._vertex_project
+
+    @property
+    def vertex_location(self) -> str:
+        return self._vertex_location
+
     def is_configured(self) -> bool:
+        if self._use_vertex_ai:
+            if not self._vertex_project:
+                return False
+            if self._adc_token_provider is not get_vertex_adc_access_token:
+                return True
+            return has_vertex_adc_credentials()
         return bool(self._api_key)
 
-    def generate_grounded_answer(self, prompt_input: RAGPromptInput) -> GeneratedAnswerPayload:
-        if not self._api_key:
+    def _require_vertex_token(self) -> str:
+        if not self._vertex_project:
             raise ProviderNotConfiguredError(
-                "GeminiGenerationProvider requires GEMINI_API_KEY to be set."
+                "GeminiGenerationProvider in Vertex AI mode requires vertex_project to be set."
             )
+        token = (self._adc_token_provider() or "").strip()
+        if not token:
+            raise ProviderNotConfiguredError(
+                "GeminiGenerationProvider in Vertex AI mode requires a valid ADC access token."
+            )
+        return token
+
+    def generate_grounded_answer(self, prompt_input: RAGPromptInput) -> GeneratedAnswerPayload:
         system_prompt, user_prompt = build_grounded_rag_prompt(prompt_input)
-        model_path = (
-            self._model_name
+        clean_model = (
+            self._model_name[len("models/") :]
             if self._model_name.startswith("models/")
-            else f"models/{self._model_name}"
+            else self._model_name.strip()
         )
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent"
-        headers = {
-            "x-goog-api-key": self._api_key,
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-            "generationConfig": {"temperature": 0.0},
-        }
+        if self._use_vertex_ai:
+            access_token = self._require_vertex_token()
+            assert self._vertex_project is not None
+            url = build_vertex_ai_model_endpoint(
+                project_id=self._vertex_project,
+                location=self._vertex_location,
+                model_name=clean_model,
+                method="generateContent",
+            )
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "x-goog-user-project": self._vertex_project,
+                "Content-Type": "application/json",
+            }
+            payload: dict[str, Any] = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+            }
+            if not clean_model.startswith("gemini-3.8"):
+                payload["generationConfig"] = {"temperature": 0.0}
+        else:
+            if not self._api_key:
+                raise ProviderNotConfiguredError(
+                    "GeminiGenerationProvider requires Vertex AI ADC configuration or GEMINI_API_KEY."
+                )
+            model_path = f"models/{clean_model}"
+            url = f"https://generativelanguage.googleapis.com/v1beta/{model_path}:generateContent"
+            headers = {
+                "x-goog-api-key": self._api_key,
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                "generationConfig": {"temperature": 0.0},
+            }
+
         data = self._http_post(url, headers, payload)
         candidates = data.get("candidates", [])
         if not candidates:
             raise RuntimeError("Gemini generateContent returned no candidates.")
         parts = candidates[0].get("content", {}).get("parts", [])
-        content = "\n".join(str(p.get("text", "")) for p in parts).strip()
+        non_thought_parts = [
+            str(p.get("text", ""))
+            for p in parts
+            if isinstance(p, dict) and not p.get("thought") and "text" in p
+        ]
+        if non_thought_parts:
+            content = "\n".join(non_thought_parts).strip()
+        else:
+            content = "\n".join(str(p.get("text", "")) for p in parts if isinstance(p, dict)).strip()
         valid_ids = [c.chunk_id for c in prompt_input.retrieved_chunks]
         cited_ids = _extract_cited_chunk_ids_from_text(content, valid_ids)
         return GeneratedAnswerPayload(
@@ -1477,6 +2011,7 @@ class GeminiGenerationProvider:
 def create_generation_provider(
     config: ProviderConfig,
     *,
+    adc_token_provider: AdcTokenProviderFn | None = None,
     http_post_json: HttpPostJsonFn | None = None,
 ) -> GenerationProvider:
     """Instantiate the configured `GenerationProvider`."""
@@ -1495,9 +2030,20 @@ def create_generation_provider(
             http_post_json=http_post_json,
         )
     if config.generation_provider == "gemini":
+        if config.use_vertex_ai:
+            return GeminiGenerationProvider(
+                api_key=None,
+                model_name=config.generation_model,
+                vertex_project=config.vertex_project,
+                vertex_location=config.vertex_location,
+                use_vertex_ai=True,
+                adc_token_provider=adc_token_provider,
+                http_post_json=http_post_json,
+            )
         return GeminiGenerationProvider(
             api_key=config.gemini_api_key,
             model_name=config.generation_model,
+            use_vertex_ai=False,
             http_post_json=http_post_json,
         )
     raise ValueError(f"Unsupported generation_provider: {config.generation_provider!r}")
@@ -1609,6 +2155,26 @@ class ChromaPersistentVectorStore:
         """Return the total number of vectors stored in the Chroma collection."""
         return int(self._collection.count())
 
+    def peek_sample_record(self) -> dict[str, Any] | None:
+        """Return metadata and vector dimensionality of one stored item in the collection, if non-empty."""
+        if self.count() == 0:
+            return None
+        res = self._collection.get(limit=1, include=["metadatas", "embeddings"])
+        ids = res.get("ids") or []
+        if not ids:
+            return None
+        metas = res.get("metadatas") or []
+        embs = res.get("embeddings")
+        meta = dict(metas[0] or {}) if metas else {}
+        emb_dim: int | None = None
+        if embs is not None and len(embs) > 0 and embs[0] is not None:
+            emb_dim = len(embs[0])
+        return {
+            "chunk_id": str(ids[0]),
+            "metadata": meta,
+            "embedding_dimensions": emb_dim,
+        }
+
 
 class LocalRAGPipeline:
     """End-to-end local-first RAG pipeline bridging SQLite and persistent Chroma."""
@@ -1636,6 +2202,64 @@ class LocalRAGPipeline:
         )
         ensure_knowledge_chunks_schema(self.store.conn)
 
+    def verify_collection_embedding_compatibility(self) -> None:
+        """Ensure `self.vector_store.collection_name` never mixes incompatible embedding models or dimensions."""
+        ensure_knowledge_chunks_schema(self.store.conn)
+        expected_provider = self.embedding_provider.provider_name
+        expected_model = self.embedding_provider.model_name
+        expected_dims = int(self.embedding_provider.dimensions)
+        collection_name = self.vector_store.collection_name
+
+        rows = self.store.conn.execute(
+            """
+            SELECT DISTINCT embedding_provider, embedding_model, embedding_dimensions
+              FROM knowledge_chunks
+             WHERE vector_collection = ? AND lifecycle_state = 'ACTIVE'
+            """,
+            (collection_name,),
+        ).fetchall()
+        for row in rows:
+            actual_provider = str(row["embedding_provider"])
+            actual_model = str(row["embedding_model"])
+            actual_dims = int(row["embedding_dimensions"])
+            if (actual_provider, actual_model, actual_dims) != (
+                expected_provider,
+                expected_model,
+                expected_dims,
+            ):
+                raise EmbeddingIncompatibilityError(
+                    f"Chroma collection {collection_name!r} already contains active vectors "
+                    f"indexed with ({actual_provider}/{actual_model}@{actual_dims}d), "
+                    f"which is incompatible with the configured embedding provider "
+                    f"({expected_provider}/{expected_model}@{expected_dims}d). "
+                    f"Use a separate AI_LEARNING_CHROMA_COLLECTION or explicitly rebuild the collection "
+                    f"to prevent silently mixing incompatible vector spaces."
+                )
+
+        sample = self.vector_store.peek_sample_record()
+        if sample is not None:
+            sample_dims = sample.get("embedding_dimensions")
+            if sample_dims is not None and int(sample_dims) != expected_dims:
+                raise EmbeddingIncompatibilityError(
+                    f"Chroma collection {collection_name!r} contains {sample_dims}-dimensional vectors, "
+                    f"which is incompatible with configured dimension {expected_dims} for "
+                    f"({expected_provider}/{expected_model})."
+                )
+            meta = sample.get("metadata") or {}
+            meta_provider = meta.get("embedding_provider")
+            meta_model = meta.get("embedding_model")
+            meta_dims = meta.get("embedding_dimensions")
+            if (
+                (meta_provider is not None and str(meta_provider) != expected_provider)
+                or (meta_model is not None and str(meta_model) != expected_model)
+                or (meta_dims is not None and int(meta_dims) != expected_dims)
+            ):
+                raise EmbeddingIncompatibilityError(
+                    f"Chroma collection {collection_name!r} metadata records embedding signature "
+                    f"({meta_provider}/{meta_model}@{meta_dims}d), which is incompatible with "
+                    f"({expected_provider}/{expected_model}@{expected_dims}d)."
+                )
+
     def index_resource(
         self,
         resource_id: str,
@@ -1653,6 +2277,7 @@ class LocalRAGPipeline:
           removes their stale vectors from Chroma.
         """
         ensure_knowledge_chunks_schema(self.store.conn)
+        self.verify_collection_embedding_compatibility()
         doc = extract_indexable_document_from_resource(
             self.store,
             resource_id,
@@ -1740,6 +2365,9 @@ class LocalRAGPipeline:
                     "canonical_url": doc.canonical_url,
                     "title": doc.title,
                     "content_hash": span.content_hash,
+                    "embedding_provider": self.embedding_provider.provider_name,
+                    "embedding_model": self.embedding_provider.model_name,
+                    "embedding_dimensions": int(self.embedding_provider.dimensions),
                 }
             )
 
@@ -1946,6 +2574,7 @@ class LocalRAGPipeline:
             raise ValueError("question must be a non-empty string")
 
         ensure_knowledge_chunks_schema(self.store.conn)
+        self.verify_collection_embedding_compatibility()
         query_vec = self.embedding_provider.embed_query(question)
         where_filter: dict[str, Any] | None = None
         if source_ids:
@@ -2013,8 +2642,11 @@ class LocalRAGPipeline:
             )
             cosine_sim = float(hit["cosine_similarity"])
 
-            # If using local_deterministic hashing, penalize pure hash-collision hits that have 0 stem overlap
-            if self.embedding_provider.provider_name == "local_deterministic" and overlap_count == 0:
+            # Penalize hits with zero stem/concept overlap unless neural cosine similarity is very high
+            if overlap_count == 0 and (
+                self.embedding_provider.provider_name == "local_deterministic"
+                or cosine_sim < 0.72
+            ):
                 effective_score = cosine_sim * 0.25
             else:
                 effective_score = min(1.0, (0.75 * cosine_sim) + (0.25 * overlap_ratio))
