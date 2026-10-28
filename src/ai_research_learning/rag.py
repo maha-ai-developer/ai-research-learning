@@ -14,6 +14,7 @@ Implements the Phase 2 & Phase 3 vertical slice defined in ADR-0007:
 from __future__ import annotations
 
 import argparse
+import contextlib
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -41,6 +42,8 @@ from knowledge_store import (  # noqa: E402
 )
 
 DEFAULT_DOTENV_PATH = REPO_ROOT / ".env"
+DEFAULT_RUNTIME_DB_PATH = REPO_ROOT / "data" / "runtime" / "task012_pilot.sqlite"
+DEFAULT_CHROMA_DIR = REPO_ROOT / "data" / "runtime" / "chroma"
 DEFAULT_VERTEX_PROJECT = "kerala-lottery-intel-dev"
 DEFAULT_VERTEX_LOCATION = "global"
 DEFAULT_ADC_CREDENTIALS_PATH = (
@@ -54,6 +57,7 @@ DEFAULT_TOP_K = 4
 
 VALID_EMBEDDING_PROVIDERS = ("local_deterministic", "openai", "gemini")
 VALID_GENERATION_PROVIDERS = ("retrieval_only", "openai", "anthropic", "gemini")
+VALID_CLI_OUTPUT_FORMATS = ("markdown", "text", "json")
 
 
 def parse_dotenv_content(content: str) -> dict[str, str]:
@@ -2056,7 +2060,47 @@ def create_generation_provider(
 
 def ensure_knowledge_chunks_schema(conn: sqlite3.Connection) -> None:
     """Idempotently create the `knowledge_chunks` table and indexes in SQLite."""
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks'"
+    ).fetchone()
+    if row is not None:
+        return
     conn.executescript(KNOWLEDGE_CHUNKS_SCHEMA_SQL)
+
+
+class ReadOnlySQLiteStore:
+    """Read-only SQLite connection wrapper enforcing `mode=ro` and `PRAGMA query_only = ON`."""
+
+    def __init__(self, db_path: Path | str) -> None:
+        self.db_path = Path(db_path)
+        if not self.db_path.is_file():
+            raise FileNotFoundError(
+                f"SQLite knowledge store database not found at {self.db_path}"
+            )
+        uri = f"file:{self.db_path.resolve()}?mode=ro"
+        self.conn = sqlite3.connect(uri, uri=True)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA query_only = ON;")
+        required_tables = {"sources", "resources", "knowledge_chunks"}
+        rows = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+        present_tables = {str(r["name"]) for r in rows}
+        missing = sorted(required_tables - present_tables)
+        if missing:
+            self.conn.close()
+            raise RuntimeError(
+                f"SQLite database {self.db_path} is missing required RAG tables: {', '.join(missing)}"
+            )
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self) -> ReadOnlySQLiteStore:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
 
 
 class ChromaPersistentVectorStore:
@@ -2067,15 +2111,29 @@ class ChromaPersistentVectorStore:
         persist_directory: Path | str,
         *,
         collection_name: str = DEFAULT_CHROMA_COLLECTION,
+        create_if_missing: bool = True,
     ) -> None:
         self.persist_directory = Path(persist_directory)
-        self.persist_directory.mkdir(parents=True, exist_ok=True)
         self.collection_name = collection_name
-        self._client = chromadb.PersistentClient(path=str(self.persist_directory))
-        self._collection = self._client.get_or_create_collection(
-            name=self.collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
+        if not create_if_missing:
+            if not self.persist_directory.is_dir():
+                raise FileNotFoundError(
+                    f"Chroma persistence directory not found at {self.persist_directory}"
+                )
+            self._client = chromadb.PersistentClient(path=str(self.persist_directory))
+            try:
+                self._collection = self._client.get_collection(name=self.collection_name)
+            except Exception as exc:
+                raise FileNotFoundError(
+                    f"Chroma collection {self.collection_name!r} not found in {self.persist_directory}"
+                ) from exc
+        else:
+            self.persist_directory.mkdir(parents=True, exist_ok=True)
+            self._client = chromadb.PersistentClient(path=str(self.persist_directory))
+            self._collection = self._client.get_or_create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"},
+            )
 
     def upsert_chunks(
         self,
@@ -2688,6 +2746,7 @@ class LocalRAGPipeline:
         top_k: int = DEFAULT_TOP_K,
         min_similarity_score: float = DEFAULT_MIN_SIMILARITY_SCORE,
         source_ids: Sequence[str] | None = None,
+        strict_generation: bool = False,
     ) -> RAGResponse:
         """Execute the source-grounded RAG workflow for `question`.
 
@@ -2698,8 +2757,20 @@ class LocalRAGPipeline:
            a grounded answer, verify cited `chunk_id`s against retrieved chunks, and return
            `status="answered"` with `generated_answer` separated from `retrieved_chunks`.
         4. If credentials are not configured (`retrieval_only` or missing API key), return
-           `status="retrieval_only_fallback"` with the retrieved chunks and citations.
+           `status="retrieval_only_fallback"` with the retrieved chunks and citations
+           (unless `strict_generation=True` and a non-`retrieval_only` provider was selected,
+           in which case `ProviderNotConfiguredError` is raised).
         """
+        if (
+            strict_generation
+            and self.generation_provider.provider_name != "retrieval_only"
+            and not self.generation_provider.is_configured()
+        ):
+            raise ProviderNotConfiguredError(
+                f"Generation provider {self.generation_provider.provider_name!r} "
+                f"(model {self.generation_provider.model_name!r}) has no configured credentials."
+            )
+
         retrieved = self.retrieve(
             question,
             top_k=top_k,
@@ -2776,6 +2847,8 @@ class LocalRAGPipeline:
                 RAGPromptInput(question=question, retrieved_chunks=retrieved)
             )
         except ProviderNotConfiguredError as exc:
+            if strict_generation and self.generation_provider.provider_name != "retrieval_only":
+                raise
             all_citations = _build_citations([c.chunk_id for c in retrieved])
             return RAGResponse(
                 question=question,
@@ -3010,23 +3083,651 @@ def run_end_to_end_rag_proof(work_dir: Path | str | None = None) -> dict[str, An
             temp_ctx.cleanup()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entrypoint to run the local RAG pipeline proof."""
+# ---------------------------------------------------------------------------
+# Research Question CLI & Evidence-First Learning Workflow (Task 032)
+# ---------------------------------------------------------------------------
+
+
+def resolve_cli_provider_config(
+    *,
+    embedding_provider: str | None = None,
+    embedding_model: str | None = None,
+    embedding_dimensions: int | None = None,
+    generation_provider: str | None = None,
+    generation_model: str | None = None,
+    chroma_collection: str | None = None,
+    vertex_project: str | None = None,
+    vertex_location: str | None = None,
+    environ: Mapping[str, str] | None = None,
+    dotenv_path: Path | str | None = None,
+    load_dotenv: bool | None = None,
+) -> ProviderConfig:
+    """Resolve `ProviderConfig` from `.env` + environment with optional CLI flag overrides."""
+    base_env = os.environ if environ is None else environ
+    should_load_dotenv = (environ is None) if load_dotenv is None else bool(load_dotenv)
+    dotenv_values = (
+        load_dotenv_file(DEFAULT_DOTENV_PATH if dotenv_path is None else dotenv_path)
+        if should_load_dotenv
+        else {}
+    )
+    merged: dict[str, str] = {**dotenv_values, **dict(base_env)}
+
+    if embedding_provider is not None:
+        merged["AI_LEARNING_EMBEDDING_PROVIDER"] = embedding_provider
+        if embedding_model is None:
+            merged.pop("AI_LEARNING_EMBEDDING_MODEL", None)
+    if embedding_model is not None:
+        merged["AI_LEARNING_EMBEDDING_MODEL"] = embedding_model
+    if embedding_dimensions is not None:
+        merged["AI_LEARNING_EMBEDDING_DIMENSIONS"] = str(embedding_dimensions)
+
+    if generation_provider is not None:
+        merged["AI_LEARNING_GENERATION_PROVIDER"] = generation_provider
+        if generation_model is None:
+            merged.pop("AI_LEARNING_GENERATION_MODEL", None)
+    if generation_model is not None:
+        merged["AI_LEARNING_GENERATION_MODEL"] = generation_model
+
+    if chroma_collection is not None:
+        merged["AI_LEARNING_CHROMA_COLLECTION"] = chroma_collection
+    if vertex_project is not None:
+        merged["AI_LEARNING_VERTEX_PROJECT"] = vertex_project
+    if vertex_location is not None:
+        merged["AI_LEARNING_VERTEX_LOCATION"] = vertex_location
+
+    return ProviderConfig.from_env(merged, load_dotenv=False)
+
+
+def ask_research_question(
+    question: str,
+    *,
+    db_path: Path | str = DEFAULT_RUNTIME_DB_PATH,
+    chroma_dir: Path | str = DEFAULT_CHROMA_DIR,
+    config: ProviderConfig | None = None,
+    top_k: int = DEFAULT_TOP_K,
+    min_similarity_score: float = DEFAULT_MIN_SIMILARITY_SCORE,
+    source_ids: Sequence[str] | None = None,
+    strict_generation: bool = True,
+    adc_token_provider: AdcTokenProviderFn | None = None,
+    http_post_json: HttpPostJsonFn | None = None,
+) -> RAGResponse:
+    """Execute a read-only, evidence-grounded research query against SQLite and Chroma.
+
+    Opens the SQLite knowledge store in strict read-only mode (`mode=ro`, `PRAGMA query_only = ON`)
+    and opens the existing Chroma collection without creating or mutating any files or vectors.
+    """
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Research question must be a non-empty string.")
+    if int(top_k) <= 0:
+        raise ValueError("top_k must be a positive integer.")
+    if not (0.0 <= float(min_similarity_score) <= 1.0):
+        raise ValueError("min_similarity_score must be between 0.0 and 1.0.")
+
+    resolved_config = config or ProviderConfig.from_env()
+    emb_provider = create_embedding_provider(
+        resolved_config,
+        adc_token_provider=adc_token_provider,
+        http_post_json=http_post_json,
+    )
+    gen_provider = create_generation_provider(
+        resolved_config,
+        adc_token_provider=adc_token_provider,
+        http_post_json=http_post_json,
+    )
+    if (
+        strict_generation
+        and resolved_config.generation_provider != "retrieval_only"
+        and not gen_provider.is_configured()
+    ):
+        raise ProviderNotConfiguredError(
+            f"Generation provider {resolved_config.generation_provider!r} "
+            f"(model {resolved_config.generation_model!r}) is not configured with required credentials."
+        )
+
+    with ReadOnlySQLiteStore(db_path) as ro_store:
+        vector_store = ChromaPersistentVectorStore(
+            chroma_dir,
+            collection_name=resolved_config.chroma_collection,
+            create_if_missing=False,
+        )
+        pipeline = LocalRAGPipeline(
+            store=ro_store,  # type: ignore[arg-type]
+            vector_store=vector_store,
+            embedding_provider=emb_provider,
+            generation_provider=gen_provider,
+            config=resolved_config,
+        )
+        return pipeline.answer_question(
+            question.strip(),
+            top_k=int(top_k),
+            min_similarity_score=float(min_similarity_score),
+            source_ids=source_ids,
+            strict_generation=strict_generation,
+        )
+
+
+def format_rag_response(
+    response: RAGResponse,
+    *,
+    output_format: str = "markdown",
+) -> str:
+    """Format a `RAGResponse` as readable Markdown, plain text, or JSON.
+
+    Explicitly separates:
+    1. Model-generated interpretation (`GENERATED_INTERPRETATION`) or abstention notice
+    2. Verified source citations (`SourceCitation` with resource/version/chunk IDs)
+    3. Retrieved source material (`PRIMARY_SOURCE_TEXT` / `AUTHORIZED_ABSTRACT_OR_DESCRIPTION`)
+    """
+    fmt = output_format.strip().lower()
+    if fmt not in VALID_CLI_OUTPUT_FORMATS:
+        raise ValueError(
+            f"Unsupported output_format {output_format!r}; expected one of {VALID_CLI_OUTPUT_FORMATS}"
+        )
+
+    if fmt == "json":
+        return json.dumps(response.to_dict(), indent=2)
+
+    prov = response.provider_summary or {}
+    emb_info = (
+        f"{prov.get('embedding_provider', 'unknown')}/"
+        f"{prov.get('embedding_model', 'unknown')}@"
+        f"{prov.get('embedding_dimensions', '?')}d"
+    )
+    gen_info = (
+        f"{prov.get('generation_provider', 'unknown')}/"
+        f"{prov.get('generation_model', 'unknown')}"
+    )
+    collection_info = str(prov.get("chroma_collection", DEFAULT_CHROMA_COLLECTION))
+
+    if fmt == "markdown":
+        lines: list[str] = [
+            "# Research Question & Evidence-Grounded Response",
+            "",
+            f"- **Question:** {response.question}",
+            f"- **Pipeline Status:** `{response.status}`",
+            f"- **Sufficient Evidence:** `{response.sufficient_evidence}`",
+            f"- **Embedding Configuration:** `{emb_info}` (collection: `{collection_info}`)",
+            f"- **Generation Configuration:** `{gen_info}`",
+            "",
+            "## 1. Generated Interpretation (`GENERATED_INTERPRETATION`)",
+            "",
+        ]
+        if response.status == "insufficient_evidence":
+            lines.extend(
+                [
+                    "> **ABSTAINED — INSUFFICIENT EVIDENCE**",
+                    f"> {response.insufficient_evidence_reason or 'Insufficient evidence in local knowledge store.'}",
+                    "",
+                    "No answer was generated and no citations were fabricated.",
+                ]
+            )
+        elif response.generated_answer is not None:
+            ga = response.generated_answer
+            cited_str = ", ".join(f"`{cid}`" for cid in ga.cited_chunk_ids) or "none"
+            lines.extend(
+                [
+                    f"*Epistemic Layer: `{ga.epistemic_status}` | "
+                    f"Synthesized by `{ga.provider_name}/{ga.model_name}` | "
+                    f"Cited Chunks: {cited_str}*",
+                    "",
+                    ga.answer_text,
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "> **RETRIEVAL-ONLY MODE (No LLM Synthesis Generated)**",
+                    f"> {response.fallback_reason or 'Returning verified source chunks and citations only.'}",
+                ]
+            )
+
+        lines.extend(
+            [
+                "",
+                "## 2. Verified Source Citations (`SourceCitation`)",
+                "",
+            ]
+        )
+        if not response.citations:
+            lines.append("None (pipeline abstained due to insufficient evidence).")
+        else:
+            for idx, cit in enumerate(response.citations, start=1):
+                license_label = (
+                    f"{cit.license_status} ({cit.license_spdx})"
+                    if cit.license_spdx
+                    else cit.license_status
+                )
+                lines.append(f"{idx}. **`[{cit.chunk_id}]` {cit.title}**")
+                lines.append(f"   - **Canonical URL:** {cit.canonical_url}")
+                lines.append(
+                    f"   - **Identifiers:** `chunk_id={cit.chunk_id}` | "
+                    f"`resource_id={cit.resource_id}` | `version_id={cit.version_id}` | "
+                    f"`source_id={cit.source_id}`"
+                )
+                lines.append(
+                    f"   - **Provenance & Offsets:** `epistemic_layer={cit.epistemic_layer}` | "
+                    f"`content_origin={cit.content_origin}` | `chars={cit.char_start}..{cit.char_end}`"
+                )
+                lines.append(f"   - **License:** `{license_label}`")
+                if cit.authors or cit.published_at:
+                    meta_parts: list[str] = []
+                    if cit.authors:
+                        meta_parts.append(f"Authors: {cit.authors}")
+                    if cit.published_at:
+                        meta_parts.append(f"Published: {cit.published_at}")
+                    lines.append(f"   - **Publication Metadata:** {' | '.join(meta_parts)}")
+
+        lines.extend(
+            [
+                "",
+                "## 3. Retrieved Source Material (`PRIMARY_SOURCE_TEXT` / `AUTHORIZED_ABSTRACT_OR_DESCRIPTION`)",
+                "",
+            ]
+        )
+        if not response.retrieved_chunks:
+            lines.append("None.")
+        else:
+            lines.append(
+                "*Verbatim/abstract source chunks retrieved from the local knowledge store "
+                "(kept strictly separate from model-generated interpretation):*"
+            )
+            lines.append("")
+            for idx, chunk in enumerate(response.retrieved_chunks, start=1):
+                lines.append(
+                    f"### Chunk {idx}: `[{chunk.chunk_id}]` — {chunk.title} "
+                    f"(similarity: `{chunk.similarity_score:.4f}`)"
+                )
+                lines.append(
+                    f"- **Source Provenance:** `epistemic_layer={chunk.epistemic_layer}` | "
+                    f"`content_origin={chunk.content_origin}` | "
+                    f"`resource_id={chunk.resource_id}` | `version_id={chunk.version_id}` | "
+                    f"`chars={chunk.char_start}..{chunk.char_end}` | "
+                    f"`sha256={chunk.content_hash[:16]}...`"
+                )
+                lines.append(f"- **Canonical URL:** {chunk.canonical_url}")
+                lines.append("")
+                for text_line in chunk.chunk_text.splitlines():
+                    lines.append(f"> {text_line}")
+                lines.append("")
+
+        return "\n".join(lines).rstrip() + "\n"
+
+    # Plain-text format ("text")
+    text_lines: list[str] = [
+        "========================================================================",
+        "RESEARCH QUESTION & EVIDENCE-GROUNDED RESPONSE",
+        "========================================================================",
+        f"Question:                {response.question}",
+        f"Pipeline Status:         {response.status}",
+        f"Sufficient Evidence:     {response.sufficient_evidence}",
+        f"Embedding Configuration: {emb_info} (collection: {collection_info})",
+        f"Generation Config:       {gen_info}",
+        "",
+        "------------------------------------------------------------------------",
+        "1. GENERATED INTERPRETATION (GENERATED_INTERPRETATION)",
+        "------------------------------------------------------------------------",
+    ]
+    if response.status == "insufficient_evidence":
+        text_lines.extend(
+            [
+                "ABSTAINED — INSUFFICIENT EVIDENCE",
+                f"Reason: {response.insufficient_evidence_reason or 'Insufficient evidence in local knowledge store.'}",
+                "No answer was generated and no citations were fabricated.",
+            ]
+        )
+    elif response.generated_answer is not None:
+        ga = response.generated_answer
+        cited_str = ", ".join(ga.cited_chunk_ids) or "none"
+        text_lines.extend(
+            [
+                f"Epistemic Layer: {ga.epistemic_status}",
+                f"Provider/Model:  {ga.provider_name}/{ga.model_name}",
+                f"Cited Chunks:    {cited_str}",
+                "",
+                ga.answer_text,
+            ]
+        )
+    else:
+        text_lines.extend(
+            [
+                "RETRIEVAL-ONLY MODE (No LLM Synthesis Generated)",
+                f"Reason: {response.fallback_reason or 'Returning verified source chunks and citations only.'}",
+            ]
+        )
+
+    text_lines.extend(
+        [
+            "",
+            "------------------------------------------------------------------------",
+            "2. VERIFIED SOURCE CITATIONS (SourceCitation)",
+            "------------------------------------------------------------------------",
+        ]
+    )
+    if not response.citations:
+        text_lines.append("None (pipeline abstained due to insufficient evidence).")
+    else:
+        for idx, cit in enumerate(response.citations, start=1):
+            text_lines.append(f"[{idx}] [{cit.chunk_id}] {cit.title}")
+            text_lines.append(f"    Canonical URL: {cit.canonical_url}")
+            text_lines.append(
+                f"    Identifiers:   chunk_id={cit.chunk_id} | resource_id={cit.resource_id} | "
+                f"version_id={cit.version_id} | source_id={cit.source_id}"
+            )
+            text_lines.append(
+                f"    Provenance:    epistemic_layer={cit.epistemic_layer} | "
+                f"content_origin={cit.content_origin} | chars={cit.char_start}..{cit.char_end} | "
+                f"license={cit.license_status}"
+            )
+
+    text_lines.extend(
+        [
+            "",
+            "------------------------------------------------------------------------",
+            "3. RETRIEVED SOURCE MATERIAL (PRIMARY_SOURCE_TEXT / AUTHORIZED_ABSTRACT)",
+            "------------------------------------------------------------------------",
+        ]
+    )
+    if not response.retrieved_chunks:
+        text_lines.append("None.")
+    else:
+        for idx, chunk in enumerate(response.retrieved_chunks, start=1):
+            text_lines.append(
+                f"[{idx}] [{chunk.chunk_id}] {chunk.title} "
+                f"(similarity={chunk.similarity_score:.4f}, layer={chunk.epistemic_layer}, "
+                f"chars={chunk.char_start}..{chunk.char_end})"
+            )
+            text_lines.append(f"    URL:  {chunk.canonical_url}")
+            text_lines.append(f"    Text: {chunk.chunk_text}")
+            text_lines.append("")
+
+    return "\n".join(text_lines).rstrip() + "\n"
+
+
+def build_cli_parser() -> argparse.ArgumentParser:
+    """Build the command-line argument parser for the research question CLI."""
+    epilog = (
+        "Examples:\n"
+        "  # Ask a research question using Vertex AI Gemini (ADC on kerala-lottery-intel-dev):\n"
+        "  python3 -m src.ai_research_learning.rag \\\n"
+        '    "How does backpropagation compute gradients in a neural network?" \\\n'
+        "    --generation-provider gemini\n\n"
+        "  # Run in offline retrieval-only mode (returns verified chunks & citations without LLM call):\n"
+        "  python3 -m src.ai_research_learning.rag \\\n"
+        '    "How does dropout prevent overfitting in neural networks?" \\\n'
+        "    --generation-provider retrieval_only\n\n"
+        "  # Emit structured JSON or plain text output:\n"
+        "  python3 -m src.ai_research_learning.rag \\\n"
+        '    --question "What is the Transformer architecture?" \\\n'
+        "    --generation-provider gemini --format json\n\n"
+        "  # Run the self-contained offline end-to-end RAG proof:\n"
+        "  python3 -m src.ai_research_learning.rag --proof\n"
+    )
     parser = argparse.ArgumentParser(
-        description="Local-first AI Research & Learning RAG pipeline proof."
+        prog="python3 -m src.ai_research_learning.rag",
+        description=(
+            "Evidence-first AI research question CLI over the local SQLite knowledge store "
+            "and persistent Chroma vector index. Returns source-grounded answers with "
+            "traceable chunk/resource citations or abstains when evidence is insufficient."
+        ),
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "question",
+        nargs="?",
+        default=None,
+        help="Research question to ask against the local SQLite + Chroma knowledge store.",
+    )
+    parser.add_argument(
+        "-q",
+        "--question",
+        dest="question_flag",
+        default=None,
+        help="Research question to ask (alternative to positional question argument).",
     )
     parser.add_argument(
         "--proof",
         action="store_true",
         help="Run the self-contained local end-to-end RAG proof and print JSON results.",
     )
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the SQLite knowledge store database "
+            "(default: AI_LEARNING_DB_PATH or data/runtime/task012_pilot.sqlite)."
+        ),
+    )
+    parser.add_argument(
+        "--chroma-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the persistent Chroma vector directory "
+            "(default: AI_LEARNING_CHROMA_DIR or data/runtime/chroma)."
+        ),
+    )
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help=(
+            "Chroma collection name override "
+            f"(default: AI_LEARNING_CHROMA_COLLECTION or {DEFAULT_CHROMA_COLLECTION})."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-provider",
+        choices=VALID_EMBEDDING_PROVIDERS,
+        default=None,
+        help="Embedding provider override (local_deterministic, gemini, openai).",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        default=None,
+        help="Embedding model override.",
+    )
+    parser.add_argument(
+        "--embedding-dimensions",
+        type=int,
+        default=None,
+        help="Embedding vector dimensionality override.",
+    )
+    parser.add_argument(
+        "--generation-provider",
+        choices=VALID_GENERATION_PROVIDERS,
+        default=None,
+        help="Generation provider override (retrieval_only, gemini, openai, anthropic).",
+    )
+    parser.add_argument(
+        "--generation-model",
+        default=None,
+        help="Generation model override.",
+    )
+    parser.add_argument(
+        "--vertex-project",
+        default=None,
+        help=f"Google Cloud Vertex AI project ID override (default: {DEFAULT_VERTEX_PROJECT}).",
+    )
+    parser.add_argument(
+        "--vertex-location",
+        default=None,
+        help=f"Google Cloud Vertex AI location override (default: {DEFAULT_VERTEX_LOCATION}).",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=DEFAULT_TOP_K,
+        help=f"Maximum number of retrieved chunks to consider (default: {DEFAULT_TOP_K}).",
+    )
+    parser.add_argument(
+        "--min-similarity",
+        type=float,
+        default=DEFAULT_MIN_SIMILARITY_SCORE,
+        help=(
+            "Minimum effective similarity score in [0.0, 1.0] required for retrieval "
+            f"(default: {DEFAULT_MIN_SIMILARITY_SCORE})."
+        ),
+    )
+    parser.add_argument(
+        "--source-id",
+        action="append",
+        dest="source_ids",
+        default=None,
+        help="Filter retrieval to specific canonical source_id(s) (e.g. SRC-WIKIPEDIA, SRC-ARXIV).",
+    )
+    parser.add_argument(
+        "--format",
+        choices=VALID_CLI_OUTPUT_FORMATS,
+        default="markdown",
+        dest="output_format",
+        help="Output display format: markdown (default), text, or json.",
+    )
+    parser.add_argument(
+        "--allow-retrieval-fallback",
+        action="store_true",
+        help=(
+            "Fall back to retrieval-only output instead of returning a non-zero exit code "
+            "when an LLM generation provider lacks configured credentials."
+        ),
+    )
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    dotenv_path: Path | str | None = None,
+    load_dotenv: bool | None = None,
+    adc_token_provider: AdcTokenProviderFn | None = None,
+    http_post_json: HttpPostJsonFn | None = None,
+    stdout: Any = None,
+    stderr: Any = None,
+) -> int:
+    """CLI entrypoint for asking evidence-grounded research questions or running `--proof`.
+
+    Exit codes:
+    - `0`: Successful answer, retrieval-only result, legitimate abstention (`insufficient_evidence`),
+           `--proof`, or `--help`.
+    - `1`: Operational/runtime error (missing database/collection, network/HTTP error, SQLite error).
+    - `2`: CLI usage error, invalid configuration, missing provider credentials, or
+           `EmbeddingIncompatibilityError`.
+    """
+    out_stream = stdout if stdout is not None else sys.stdout
+    err_stream = stderr if stderr is not None else sys.stderr
+    parser = build_cli_parser()
+
+    try:
+        with contextlib.redirect_stdout(out_stream), contextlib.redirect_stderr(err_stream):
+            args = parser.parse_args(list(argv) if argv is not None else None)
+    except SystemExit as exc:
+        code = exc.code
+        if code is None or code == 0:
+            return 0
+        return int(code) if isinstance(code, int) else 2
+
     if args.proof:
         summary = run_end_to_end_rag_proof()
-        print(json.dumps(summary, indent=2))
+        out_stream.write(json.dumps(summary, indent=2) + "\n")
         return 0
-    parser.print_help()
-    return 0
+
+    pos_q = args.question
+    flag_q = args.question_flag
+    if pos_q is not None and flag_q is not None and pos_q.strip() != flag_q.strip():
+        err_stream.write(
+            "ERROR [ValueError]: Specify the research question either as a positional "
+            "argument or via --question, not both.\n"
+        )
+        return 2
+
+    raw_question = flag_q if flag_q is not None else pos_q
+    if raw_question is None:
+        parser.print_help(file=err_stream)
+        err_stream.write(
+            "\nERROR: A research question (or --proof) is required.\n"
+        )
+        return 2
+
+    if not raw_question.strip():
+        err_stream.write("ERROR [ValueError]: Research question must be a non-empty string.\n")
+        return 2
+
+    known_secrets: list[str | None] = []
+    try:
+        base_env = os.environ if environ is None else environ
+        should_load_dotenv = (environ is None) if load_dotenv is None else bool(load_dotenv)
+        dotenv_values = (
+            load_dotenv_file(DEFAULT_DOTENV_PATH if dotenv_path is None else dotenv_path)
+            if should_load_dotenv
+            else {}
+        )
+        merged_env = {**dotenv_values, **dict(base_env)}
+        for secret_key in ("GEMINI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            if merged_env.get(secret_key):
+                known_secrets.append(merged_env[secret_key])
+
+        config = resolve_cli_provider_config(
+            embedding_provider=args.embedding_provider,
+            embedding_model=args.embedding_model,
+            embedding_dimensions=args.embedding_dimensions,
+            generation_provider=args.generation_provider,
+            generation_model=args.generation_model,
+            chroma_collection=args.collection,
+            vertex_project=args.vertex_project,
+            vertex_location=args.vertex_location,
+            environ=environ,
+            dotenv_path=dotenv_path,
+            load_dotenv=load_dotenv,
+        )
+        known_secrets.extend(
+            [config.gemini_api_key, config.anthropic_api_key, config.openai_api_key]
+        )
+
+        db_path = (
+            args.db
+            if args.db is not None
+            else Path(
+                merged_env.get("AI_LEARNING_DB_PATH", "").strip()
+                or str(DEFAULT_RUNTIME_DB_PATH)
+            )
+        )
+        chroma_dir = (
+            args.chroma_dir
+            if args.chroma_dir is not None
+            else Path(
+                merged_env.get("AI_LEARNING_CHROMA_DIR", "").strip()
+                or str(DEFAULT_CHROMA_DIR)
+            )
+        )
+
+        response = ask_research_question(
+            raw_question,
+            db_path=db_path,
+            chroma_dir=chroma_dir,
+            config=config,
+            top_k=args.top_k,
+            min_similarity_score=args.min_similarity,
+            source_ids=args.source_ids,
+            strict_generation=not bool(args.allow_retrieval_fallback),
+            adc_token_provider=adc_token_provider,
+            http_post_json=http_post_json,
+        )
+        rendered = format_rag_response(response, output_format=args.output_format)
+        out_stream.write(redact_secrets(rendered, known_secrets))
+        return 0
+    except (
+        ValueError,
+        ProviderNotConfiguredError,
+        EmbeddingIncompatibilityError,
+    ) as exc:
+        safe_msg = redact_secrets(str(exc), known_secrets)
+        err_stream.write(f"ERROR [{type(exc).__name__}]: {safe_msg}\n")
+        return 2
+    except (FileNotFoundError, sqlite3.Error, RuntimeError, Exception) as exc:
+        safe_msg = redact_secrets(str(exc), known_secrets)
+        err_stream.write(f"ERROR [{type(exc).__name__}]: {safe_msg}\n")
+        return 1
 
 
 if __name__ == "__main__":
