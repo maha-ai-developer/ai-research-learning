@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
+import json
 import shutil
+import sqlite3
 import sys
 import tempfile
 from typing import Any
@@ -31,7 +34,10 @@ from ai_research_learning import (  # noqa: E402
     PolicyBlockedIndexingError,
     ProviderConfig,
     ProviderNotConfiguredError,
+    ReadOnlySQLiteStore,
     RetrievalOnlyFallbackGenerationProvider,
+    ask_research_question,
+    build_cli_parser,
     build_vertex_ai_model_endpoint,
     chunk_text,
     compute_chunk_id,
@@ -39,13 +45,16 @@ from ai_research_learning import (  # noqa: E402
     create_generation_provider,
     evaluate_the_batch_candidate_policy,
     extract_indexable_document_from_resource,
+    format_rag_response,
     load_dotenv_file,
     normalize_text_for_chunking,
     parse_dotenv_content,
     redact_secrets,
     register_candidate_source_the_batch,
+    resolve_cli_provider_config,
     run_end_to_end_rag_proof,
 )
+from ai_research_learning import rag as rag_module  # noqa: E402
 from knowledge_store import KnowledgeStore  # noqa: E402
 
 
@@ -925,6 +934,437 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
             mismatched_pipeline.retrieve("How does backpropagation compute gradients?")
         # Original collection count remains unchanged at 1
         self.assertEqual(vector_store.count(), 1)
+
+    # ------------------------------------------------------------------
+    # 9. Task 032: Research Question CLI, Citations, Abstention, & Safety
+    # ------------------------------------------------------------------
+
+    def test_research_question_cli_answerable_and_citation_resolution(self) -> None:
+        seeded = self._seed_sample_resources()
+        det_emb = DeterministicHashEmbeddingProvider(dimensions=128)
+        vector_store = ChromaPersistentVectorStore(self.chroma_dir / "cli_test")
+        pipeline = LocalRAGPipeline(
+            store=self.store,
+            vector_store=vector_store,
+            embedding_provider=det_emb,
+            generation_provider=RetrievalOnlyFallbackGenerationProvider(),
+        )
+        bp_idx = pipeline.index_resource(seeded["backprop"]["resource_id"])
+        do_idx = pipeline.index_resource(seeded["dropout"]["resource_id"])
+        bp_chunk_id = bp_idx["chunk_ids"][0]
+        self.assertEqual(vector_store.count(), len(bp_idx["chunk_ids"]) + len(do_idx["chunk_ids"]))
+
+        def fake_vertex_gen(
+            url: str, headers: dict[str, str], payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            return {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": (
+                                        f"Backpropagation computes gradients of the loss function "
+                                        f"with respect to network weights by applying the chain rule "
+                                        f"backward from the output layer [{bp_chunk_id}]."
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+
+        # 1. Markdown output via CLI with Vertex AI Gemini (ADC)
+        out_md = io.StringIO()
+        err_md = io.StringIO()
+        rc_md = rag_module.main(
+            [
+                "How does backpropagation compute gradients in a neural network?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(self.chroma_dir / "cli_test"),
+                "--generation-provider",
+                "gemini",
+                "--format",
+                "markdown",
+            ],
+            environ={},
+            load_dotenv=False,
+            adc_token_provider=lambda: "ya29.fake-cli-adc-secret-token",
+            http_post_json=fake_vertex_gen,
+            stdout=out_md,
+            stderr=err_md,
+        )
+        self.assertEqual(rc_md, 0, msg=err_md.getvalue())
+        self.assertEqual(err_md.getvalue(), "")
+        md_text = out_md.getvalue()
+        self.assertIn("## 1. Generated Interpretation (`GENERATED_INTERPRETATION`)", md_text)
+        self.assertIn("## 2. Verified Source Citations (`SourceCitation`)", md_text)
+        self.assertIn(
+            "## 3. Retrieved Source Material (`PRIMARY_SOURCE_TEXT` / `AUTHORIZED_ABSTRACT_OR_DESCRIPTION`)",
+            md_text,
+        )
+        self.assertIn(bp_chunk_id, md_text)
+        self.assertIn("https://en.wikipedia.org/wiki/Backpropagation", md_text)
+        self.assertIn(seeded["backprop"]["resource_id"], md_text)
+        self.assertIn(seeded["backprop"]["current_version_id"], md_text)
+        self.assertNotIn("ya29.fake-cli-adc-secret-token", md_text)
+
+        # 2. Plain-text output via CLI (-q / --question flag)
+        out_txt = io.StringIO()
+        err_txt = io.StringIO()
+        rc_txt = rag_module.main(
+            [
+                "--question",
+                "How does backpropagation compute gradients in a neural network?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(self.chroma_dir / "cli_test"),
+                "--generation-provider",
+                "gemini",
+                "--format",
+                "text",
+            ],
+            environ={},
+            load_dotenv=False,
+            adc_token_provider=lambda: "ya29.fake-cli-adc-secret-token",
+            http_post_json=fake_vertex_gen,
+            stdout=out_txt,
+            stderr=err_txt,
+        )
+        self.assertEqual(rc_txt, 0, msg=err_txt.getvalue())
+        txt_output = out_txt.getvalue()
+        self.assertIn("1. GENERATED INTERPRETATION (GENERATED_INTERPRETATION)", txt_output)
+        self.assertIn("2. VERIFIED SOURCE CITATIONS (SourceCitation)", txt_output)
+        self.assertIn("3. RETRIEVED SOURCE MATERIAL", txt_output)
+        self.assertIn(bp_chunk_id, txt_output)
+
+        # 3. JSON output via CLI and verification that citation IDs resolve to SQLite rows
+        out_json = io.StringIO()
+        err_json = io.StringIO()
+        rc_json = rag_module.main(
+            [
+                "How does backpropagation compute gradients in a neural network?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(self.chroma_dir / "cli_test"),
+                "--generation-provider",
+                "gemini",
+                "--format",
+                "json",
+            ],
+            environ={},
+            load_dotenv=False,
+            adc_token_provider=lambda: "ya29.fake-cli-adc-secret-token",
+            http_post_json=fake_vertex_gen,
+            stdout=out_json,
+            stderr=err_json,
+        )
+        self.assertEqual(rc_json, 0, msg=err_json.getvalue())
+        payload = json.loads(out_json.getvalue())
+        self.assertEqual(payload["status"], "answered")
+        self.assertTrue(payload["sufficient_evidence"])
+        self.assertEqual(
+            payload["generated_answer"]["epistemic_status"],
+            "GENERATED_INTERPRETATION",
+        )
+        self.assertEqual(payload["generated_answer"]["cited_chunk_ids"], [bp_chunk_id])
+        self.assertGreaterEqual(len(payload["citations"]), 1)
+
+        # Resolve every returned citation against SQLite resources and knowledge_chunks
+        for cit in payload["citations"]:
+            db_row = self.store.conn.execute(
+                """
+                SELECT kc.chunk_id, kc.resource_id, kc.version_id, kc.source_id,
+                       kc.char_start, kc.char_end, kc.epistemic_layer, kc.content_origin,
+                       kc.chunk_text, r.title, r.canonical_url, r.license_status
+                  FROM knowledge_chunks kc
+                  JOIN resources r ON r.resource_id = kc.resource_id
+                 WHERE kc.chunk_id = ? AND kc.lifecycle_state = 'ACTIVE'
+                """,
+                (cit["chunk_id"],),
+            ).fetchone()
+            self.assertIsNotNone(db_row)
+            assert db_row is not None
+            self.assertEqual(cit["resource_id"], db_row["resource_id"])
+            self.assertEqual(cit["version_id"], db_row["version_id"])
+            self.assertEqual(cit["source_id"], db_row["source_id"])
+            self.assertEqual(cit["title"], db_row["title"])
+            self.assertEqual(cit["canonical_url"], db_row["canonical_url"])
+            self.assertEqual(cit["char_start"], int(db_row["char_start"]))
+            self.assertEqual(cit["char_end"], int(db_row["char_end"]))
+            self.assertEqual(cit["epistemic_layer"], db_row["epistemic_layer"])
+            self.assertEqual(cit["content_origin"], db_row["content_origin"])
+            self.assertEqual(cit["license_status"], db_row["license_status"])
+
+    def test_research_question_cli_abstention_on_unanswerable_question(self) -> None:
+        seeded = self._seed_sample_resources()
+        det_emb = DeterministicHashEmbeddingProvider(dimensions=128)
+        vector_store = ChromaPersistentVectorStore(self.chroma_dir / "cli_abstain")
+        pipeline = LocalRAGPipeline(
+            store=self.store,
+            vector_store=vector_store,
+            embedding_provider=det_emb,
+            generation_provider=RetrievalOnlyFallbackGenerationProvider(),
+        )
+        pipeline.index_resource(seeded["backprop"]["resource_id"])
+
+        llm_called = False
+
+        def should_not_be_called(
+            url: str, headers: dict[str, str], payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            nonlocal llm_called
+            llm_called = True
+            return {}
+
+        out_md = io.StringIO()
+        err_md = io.StringIO()
+        rc = rag_module.main(
+            [
+                "What fermentation temperature is best for sourdough rye bread starter?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(self.chroma_dir / "cli_abstain"),
+                "--generation-provider",
+                "gemini",
+                "--format",
+                "markdown",
+            ],
+            environ={},
+            load_dotenv=False,
+            adc_token_provider=lambda: "ya29.fake-adc-token",
+            http_post_json=should_not_be_called,
+            stdout=out_md,
+            stderr=err_md,
+        )
+        # Legitimate abstention must exit with code 0 and never call the generation LLM
+        self.assertEqual(rc, 0, msg=err_md.getvalue())
+        self.assertFalse(llm_called)
+        md_output = out_md.getvalue()
+        self.assertIn("ABSTAINED — INSUFFICIENT EVIDENCE", md_output)
+        self.assertIn("`insufficient_evidence`", md_output)
+        self.assertIn("No answer was generated and no citations were fabricated.", md_output)
+
+        # Verify JSON abstention structure as well
+        out_json = io.StringIO()
+        rc_json = rag_module.main(
+            [
+                "What fermentation temperature is best for sourdough rye bread starter?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(self.chroma_dir / "cli_abstain"),
+                "--format",
+                "json",
+            ],
+            environ={},
+            load_dotenv=False,
+            stdout=out_json,
+            stderr=io.StringIO(),
+        )
+        self.assertEqual(rc_json, 0)
+        abstain_data = json.loads(out_json.getvalue())
+        self.assertEqual(abstain_data["status"], "insufficient_evidence")
+        self.assertFalse(abstain_data["sufficient_evidence"])
+        self.assertIsNone(abstain_data["generated_answer"])
+        self.assertEqual(abstain_data["citations"], [])
+        self.assertEqual(abstain_data["retrieved_chunks"], [])
+
+    def test_research_question_cli_errors_secret_redaction_and_compatibility(self) -> None:
+        seeded = self._seed_sample_resources()
+        det_emb = DeterministicHashEmbeddingProvider(dimensions=128)
+        chroma_path = self.chroma_dir / "cli_errors"
+        vector_store = ChromaPersistentVectorStore(chroma_path)
+        pipeline = LocalRAGPipeline(
+            store=self.store,
+            vector_store=vector_store,
+            embedding_provider=det_emb,
+            generation_provider=RetrievalOnlyFallbackGenerationProvider(),
+        )
+        pipeline.index_resource(seeded["backprop"]["resource_id"])
+        self.assertEqual(vector_store.count(), 1)
+
+        # 1. ReadOnlySQLiteStore blocks write operations at the SQLite engine level
+        with ReadOnlySQLiteStore(self.db_path) as ro_store:
+            with self.assertRaises(sqlite3.OperationalError):
+                ro_store.conn.execute("DELETE FROM knowledge_chunks")
+
+        # 2. Provider/network error returns non-zero exit code (1) and redacts API keys
+        secret_openai_key = "sk-live-super-secret-openai-key-99999"
+
+        def failing_network_post(
+            url: str, headers: dict[str, str], payload: dict[str, Any]
+        ) -> dict[str, Any]:
+            raise RuntimeError(
+                f"HTTP 401 Unauthorized calling {url} with token {secret_openai_key}"
+            )
+
+        out_net = io.StringIO()
+        err_net = io.StringIO()
+        rc_net = rag_module.main(
+            [
+                "How does backpropagation compute gradients?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(chroma_path),
+                "--generation-provider",
+                "openai",
+            ],
+            environ={"OPENAI_API_KEY": secret_openai_key},
+            load_dotenv=False,
+            http_post_json=failing_network_post,
+            stdout=out_net,
+            stderr=err_net,
+        )
+        self.assertEqual(rc_net, 1)
+        self.assertNotIn(secret_openai_key, err_net.getvalue())
+        self.assertNotIn(secret_openai_key, out_net.getvalue())
+        self.assertIn("[REDACTED]", err_net.getvalue())
+        self.assertIn("ERROR [RuntimeError]", err_net.getvalue())
+
+        pattern_redacted = redact_secrets(
+            "Failed with ya29.a0AfH6SMB_secret_oauth_token and AIzaSyD1234567890abcdefghijklmnop and Bearer secret_bearer_xyz123",
+            [],
+        )
+        self.assertNotIn("ya29.a0AfH6SMB_secret_oauth_token", pattern_redacted)
+        self.assertNotIn("AIzaSyD1234567890abcdefghijklmnop", pattern_redacted)
+        self.assertNotIn("secret_bearer_xyz123", pattern_redacted)
+        self.assertIn("[REDACTED]", pattern_redacted)
+
+        # 3. Unconfigured explicit LLM generation provider returns exit code 2
+        err_unconf = io.StringIO()
+        rc_unconf = rag_module.main(
+            [
+                "How does backpropagation compute gradients?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(chroma_path),
+                "--generation-provider",
+                "openai",
+            ],
+            environ={"OPENAI_API_KEY": ""},
+            load_dotenv=False,
+            stdout=io.StringIO(),
+            stderr=err_unconf,
+        )
+        self.assertEqual(rc_unconf, 2)
+        self.assertIn("ERROR [ProviderNotConfiguredError]", err_unconf.getvalue())
+
+        # With --allow-retrieval-fallback, unconfigured LLM falls back cleanly with exit code 0
+        out_fb = io.StringIO()
+        rc_fb = rag_module.main(
+            [
+                "How does backpropagation compute gradients?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(chroma_path),
+                "--generation-provider",
+                "openai",
+                "--allow-retrieval-fallback",
+                "--format",
+                "json",
+            ],
+            environ={"OPENAI_API_KEY": ""},
+            load_dotenv=False,
+            stdout=out_fb,
+            stderr=io.StringIO(),
+        )
+        self.assertEqual(rc_fb, 0)
+        self.assertEqual(json.loads(out_fb.getvalue())["status"], "retrieval_only_fallback")
+
+        # 4. Embedding compatibility check enforced via CLI (returns exit code 2 without modifying collection)
+        err_compat = io.StringIO()
+        rc_compat = rag_module.main(
+            [
+                "How does backpropagation compute gradients?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(chroma_path),
+                "--embedding-provider",
+                "gemini",
+                "--embedding-dimensions",
+                "768",
+            ],
+            environ={},
+            load_dotenv=False,
+            adc_token_provider=lambda: "ya29.fake-token",
+            http_post_json=lambda u, h, p: {"embedding": {"values": [0.1] * 768}},
+            stdout=io.StringIO(),
+            stderr=err_compat,
+        )
+        self.assertEqual(rc_compat, 2)
+        self.assertIn("ERROR [EmbeddingIncompatibilityError]", err_compat.getvalue())
+        self.assertEqual(vector_store.count(), 1)
+
+        # 5. Missing database or missing Chroma collection returns exit code 1 without creating files
+        missing_db = self.tmp_path / "nonexistent_store.sqlite"
+        err_db = io.StringIO()
+        rc_missing_db = rag_module.main(
+            [
+                "How does backpropagation compute gradients?",
+                "--db",
+                str(missing_db),
+                "--chroma-dir",
+                str(chroma_path),
+            ],
+            environ={},
+            load_dotenv=False,
+            stdout=io.StringIO(),
+            stderr=err_db,
+        )
+        self.assertEqual(rc_missing_db, 1)
+        self.assertFalse(missing_db.exists())
+        self.assertIn("ERROR [FileNotFoundError]", err_db.getvalue())
+
+        err_coll = io.StringIO()
+        rc_missing_coll = rag_module.main(
+            [
+                "How does backpropagation compute gradients?",
+                "--db",
+                str(self.db_path),
+                "--chroma-dir",
+                str(chroma_path),
+                "--collection",
+                "nonexistent_collection_v999",
+            ],
+            environ={},
+            load_dotenv=False,
+            stdout=io.StringIO(),
+            stderr=err_coll,
+        )
+        self.assertEqual(rc_missing_coll, 1)
+        self.assertIn("ERROR [FileNotFoundError]", err_coll.getvalue())
+
+        # 6. CLI help, --proof, missing question, and conflicting question arguments
+        out_help = io.StringIO()
+        rc_help = rag_module.main(["--help"], stdout=out_help, stderr=io.StringIO())
+        self.assertEqual(rc_help, 0)
+        self.assertIn("--generation-provider", out_help.getvalue())
+        self.assertIn("Examples:", out_help.getvalue())
+
+        err_no_q = io.StringIO()
+        rc_no_q = rag_module.main([], stdout=io.StringIO(), stderr=err_no_q)
+        self.assertEqual(rc_no_q, 2)
+        self.assertIn("ERROR: A research question (or --proof) is required.", err_no_q.getvalue())
+
+        err_conflict = io.StringIO()
+        rc_conflict = rag_module.main(
+            ["Question one?", "--question", "Question two?"],
+            stdout=io.StringIO(),
+            stderr=err_conflict,
+        )
+        self.assertEqual(rc_conflict, 2)
+        self.assertIn("ERROR [ValueError]", err_conflict.getvalue())
 
 
 if __name__ == "__main__":

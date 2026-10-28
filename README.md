@@ -227,6 +227,135 @@ curl -s "http://127.0.0.1:8000/api/v1/transcripts?limit=10&offset=0" | python3 -
 curl -s "http://127.0.0.1:8000/api/v1/transcripts/tr_0123456789abcdef" | python3 -m json.tool
 ```
 
+## 2.3 Research Question CLI & Evidence-First Learning Workflow (Task 032)
+
+`src/ai_research_learning/rag.py` provides a read-only, evidence-first command-line research assistant over the local SQLite knowledge store (`data/runtime/task012_pilot.sqlite`) and persistent Chroma vector index (`data/runtime/chroma`, collection `ai_research_knowledge_chunks_v1`).
+
+### 1. Prerequisites and Setup
+
+1. Ensure the project virtual environment is created and has `chromadb` and `requests` installed:
+   ```bash
+   .venv/bin/python -m pip install -r requirements-notebooks.txt chromadb requests
+   ```
+2. Verify that the local runtime SQLite database (`data/runtime/task012_pilot.sqlite`) and Chroma vector store (`data/runtime/chroma`) exist.
+3. Optional `.env` configuration (at repository root with mode `600`, ignored by Git):
+   - The CLI automatically loads `.env` without overriding explicitly exported shell variables.
+   - See `.env.example` for all supported `AI_LEARNING_*` environment variables.
+
+### 2. Configuring Vertex AI (`kerala-lottery-intel-dev`) and ADC
+
+When `gemini` is used for embeddings or answer generation, the RAG pipeline connects to Google Cloud Vertex AI using Application Default Credentials (ADC) on project `kerala-lottery-intel-dev` (default location `global`). It never uses or sends `GEMINI_API_KEY` on the Vertex AI path:
+
+```bash
+gcloud config set project kerala-lottery-intel-dev
+gcloud auth application-default login
+gcloud auth application-default set-quota-project kerala-lottery-intel-dev
+```
+
+- Default Vertex AI generation model: `gemini-3.8-flash` (at `global` endpoint)
+- Default Vertex AI embedding model (for new `gemini` collections): `gemini-embedding-001` (`768` dimensions, `us-central1`)
+- The existing `ai_research_knowledge_chunks_v1` collection (`18` vectors) is locked to `local_deterministic/token-hash-bow-v1@128d` for embeddings and can be queried immediately with `--generation-provider gemini` or `--generation-provider retrieval_only`.
+
+### 3. Running the Research Question CLI
+
+```bash
+# Display CLI usage and examples:
+.venv/bin/python -m src.ai_research_learning.rag --help
+
+# Ask a research question using Vertex AI Gemini (ADC on kerala-lottery-intel-dev):
+.venv/bin/python -m src.ai_research_learning.rag \
+  "How does backpropagation compute gradients in a neural network?" \
+  --generation-provider gemini
+
+# Ask a research question in offline retrieval-only mode (no external LLM calls):
+.venv/bin/python -m src.ai_research_learning.rag \
+  "How does backpropagation compute gradients in a neural network?" \
+  --generation-provider retrieval_only
+
+# Filter by canonical source_id and emit plain text or structured JSON:
+.venv/bin/python -m src.ai_research_learning.rag \
+  --question "How does residual learning help train deeper neural networks?" \
+  --source-id SRC-ARXIV \
+  --generation-provider gemini \
+  --format text
+
+.venv/bin/python -m src.ai_research_learning.rag \
+  --question "What is a Boltzmann machine?" \
+  --generation-provider retrieval_only \
+  --format json
+```
+
+### 4. Example Grounded Answer and Abstention Outputs
+
+**Grounded Answer Example (`status: "answered"`, exit code `0`):**
+
+```markdown
+# Research Question & Evidence-Grounded Response
+
+- **Question:** How does backpropagation compute gradients in a neural network?
+- **Pipeline Status:** `answered`
+- **Sufficient Evidence:** `True`
+- **Embedding Configuration:** `local_deterministic/token-hash-bow-v1@128d` (collection: `ai_research_knowledge_chunks_v1`)
+- **Generation Configuration:** `gemini/gemini-3.8-flash`
+
+## 1. Generated Interpretation (`GENERATED_INTERPRETATION`)
+
+*Epistemic Layer: `GENERATED_INTERPRETATION` | Synthesized by `gemini/gemini-3.8-flash` | Cited Chunks: `chk_0a6023ab662bc6b4`, `chk_258896475e232c3d`*
+
+Based on the provided sources, backpropagation computes the gradient of the loss with respect to the network weights for a single input–output example through the following process:
+* **Application of the Chain Rule:** It serves as an efficient application of the chain rule to neural networks [chk_0a6023ab662bc6b4].
+* **Backward Layer-by-Layer Propagation:** It computes the gradients by propagating derivatives backward, one layer at a time, starting from the output layer and moving toward the input layer [chk_258896475e232c3d].
+
+## 2. Verified Source Citations (`SourceCitation`)
+
+1. **`[chk_0a6023ab662bc6b4]` Backpropagation**
+   - **Canonical URL:** https://en.wikipedia.org/wiki/Backpropagation
+   - **Identifiers:** `chunk_id=chk_0a6023ab662bc6b4` | `resource_id=res_24d64fe06f34c722` | `version_id=ver_20261024_842a8401_v1` | `source_id=SRC-WIKIPEDIA`
+   - **Provenance & Offsets:** `epistemic_layer=PRIMARY_SOURCE_TEXT` | `content_origin=RESOURCE_FULL_TEXT` | `chars=0..364`
+   - **License:** `CC_BY_SA_4_0 (CC-BY-SA-4.0)`
+```
+
+**Explicit Abstention Example (`status: "insufficient_evidence"`, exit code `0`):**
+
+```bash
+.venv/bin/python -m src.ai_research_learning.rag \
+  "What fermentation temperature is best for sourdough rye bread starter?" \
+  --generation-provider gemini
+```
+
+```markdown
+# Research Question & Evidence-Grounded Response
+
+- **Question:** What fermentation temperature is best for sourdough rye bread starter?
+- **Pipeline Status:** `insufficient_evidence`
+- **Sufficient Evidence:** `False`
+
+## 1. Generated Interpretation (`GENERATED_INTERPRETATION`)
+
+> **ABSTAINED — INSUFFICIENT EVIDENCE**
+> No indexed source chunks met the minimum relevance threshold (0.22) for this question.
+
+No answer was generated and no citations were fabricated.
+```
+
+### 5. Citation and Provenance Semantics
+
+- **Read-Only Query Execution:** The CLI opens SQLite via `ReadOnlySQLiteStore` (`mode=ro`, `PRAGMA query_only = ON`) and Chroma with `create_if_missing=False`. Querying cannot modify `data/runtime/task012_pilot.sqlite` or `data/runtime/chroma`.
+- **Epistemic Layer Separation:**
+  - Section 1 (`GENERATED_INTERPRETATION`) contains only the model-synthesized explanation (or explicit abstention/retrieval-only banner).
+  - Section 2 (`SourceCitation`) lists every cited chunk with `chunk_id`, `resource_id`, `version_id`, `source_id`, `canonical_url`, `char_start..char_end`, and license status.
+  - Section 3 (`PRIMARY_SOURCE_TEXT` / `AUTHORIZED_ABSTRACT_OR_DESCRIPTION`) displays the verbatim retrieved source chunks separately from generated interpretation.
+- **Exit Code Semantics:**
+  - `0`: Successful execution, **including legitimate abstentions (`insufficient_evidence`)**.
+  - `1`: Operational/runtime errors (`FileNotFoundError` for missing database/collection, `sqlite3.Error`, or upstream HTTP/provider `RuntimeError`).
+  - `2`: CLI usage, configuration, missing credential (`ProviderNotConfiguredError`), or embedding compatibility (`EmbeddingIncompatibilityError`) errors.
+
+### 6. Troubleshooting and Safe Credential Handling
+
+- **`EmbeddingIncompatibilityError` (Exit Code `2`):** Raised if `--embedding-provider`, `--embedding-model`, or `--embedding-dimensions` does not match the metadata stored in the target Chroma collection (`local_deterministic/token-hash-bow-v1@128d` on `ai_research_knowledge_chunks_v1`). Omit `--embedding-provider` when querying the default collection, or specify a separate `--collection` when testing a different embedding space.
+- **`ProviderNotConfiguredError` (Exit Code `2`):** Raised when an explicitly requested generation provider (`gemini`, `openai`, or `anthropic`) lacks valid ADC or API key credentials. Pass `--allow-retrieval-fallback` if you want the CLI to degrade gracefully to `retrieval_only_fallback` instead of exiting with code `2`.
+- **Credential Redaction:** All CLI error messages pass through `redact_secrets(...)`, which masks `AIza...`, `sk-...`, `ya29...`, `Bearer ...`, and any configured secret values as `[REDACTED]` before writing to `stderr`. Never pass raw API keys on the command line; store them in `.env` (`chmod 600 .env`) or use Vertex AI ADC.
+
 ## 3. Before enabling network collection
 
 First read `docs/DATA_AND_REUSE_POLICY.md` and `docs/JUPYTER_LAB_INTEGRATION.md`.
