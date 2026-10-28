@@ -1229,6 +1229,15 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
         self.assertIn("[REDACTED]", err_net.getvalue())
         self.assertIn("ERROR [RuntimeError]", err_net.getvalue())
 
+        pattern_redacted = redact_secrets(
+            "Failed with ya29.a0AfH6SMB_secret_oauth_token and AIzaSyD1234567890abcdefghijklmnop and Bearer secret_bearer_xyz123",
+            [],
+        )
+        self.assertNotIn("ya29.a0AfH6SMB_secret_oauth_token", pattern_redacted)
+        self.assertNotIn("AIzaSyD1234567890abcdefghijklmnop", pattern_redacted)
+        self.assertNotIn("secret_bearer_xyz123", pattern_redacted)
+        self.assertIn("[REDACTED]", pattern_redacted)
+
         # 3. Unconfigured explicit LLM generation provider returns exit code 2
         err_unconf = io.StringIO()
         rc_unconf = rag_module.main(

@@ -287,13 +287,13 @@ gcloud auth application-default set-quota-project kerala-lottery-intel-dev
 
 ### 4. Example Grounded Answer and Abstention Outputs
 
-**Grounded Answer Example (`status: "answered_with_citations"`, exit code `0`):**
+**Grounded Answer Example (`status: "answered"`, exit code `0`):**
 
 ```markdown
 # Research Question & Evidence-Grounded Response
 
 - **Question:** How does backpropagation compute gradients in a neural network?
-- **Pipeline Status:** `answered_with_citations`
+- **Pipeline Status:** `answered`
 - **Sufficient Evidence:** `True`
 - **Embedding Configuration:** `local_deterministic/token-hash-bow-v1@128d` (collection: `ai_research_knowledge_chunks_v1`)
 - **Generation Configuration:** `gemini/gemini-3.8-flash`
@@ -347,13 +347,14 @@ No answer was generated and no citations were fabricated.
   - Section 3 (`PRIMARY_SOURCE_TEXT` / `AUTHORIZED_ABSTRACT_OR_DESCRIPTION`) displays the verbatim retrieved source chunks separately from generated interpretation.
 - **Exit Code Semantics:**
   - `0`: Successful execution, **including legitimate abstentions (`insufficient_evidence`)**.
-  - `2`: Operational, configuration, credential, or embedding compatibility errors (`EmbeddingIncompatibilityError`, `ProviderConfigurationError`, missing database/collection).
+  - `1`: Operational/runtime errors (`FileNotFoundError` for missing database/collection, `sqlite3.Error`, or upstream HTTP/provider `RuntimeError`).
+  - `2`: CLI usage, configuration, missing credential (`ProviderNotConfiguredError`), or embedding compatibility (`EmbeddingIncompatibilityError`) errors.
 
 ### 6. Troubleshooting and Safe Credential Handling
 
 - **`EmbeddingIncompatibilityError` (Exit Code `2`):** Raised if `--embedding-provider`, `--embedding-model`, or `--embedding-dimensions` does not match the metadata stored in the target Chroma collection (`local_deterministic/token-hash-bow-v1@128d` on `ai_research_knowledge_chunks_v1`). Omit `--embedding-provider` when querying the default collection, or specify a separate `--collection` when testing a different embedding space.
-- **`ProviderConfigurationError` (Exit Code `2`):** Raised when an explicitly requested generation provider (`gemini`, `openai`, or `anthropic`) lacks valid ADC or API key credentials, or encounters an upstream API error. Pass `--allow-retrieval-fallback` if you want the CLI to degrade gracefully to `retrieval_only_fallback` instead of exiting with code `2`.
-- **Credential Redaction:** All CLI error messages pass through `_redact_secrets(...)`, which masks `AIza...`, `sk-...`, `ya29...`, `Bearer ...`, and any configured secret values as `[REDACTED]` before writing to `stderr`. Never pass raw API keys on the command line; store them in `.env` (`chmod 600 .env`) or use Vertex AI ADC.
+- **`ProviderNotConfiguredError` (Exit Code `2`):** Raised when an explicitly requested generation provider (`gemini`, `openai`, or `anthropic`) lacks valid ADC or API key credentials. Pass `--allow-retrieval-fallback` if you want the CLI to degrade gracefully to `retrieval_only_fallback` instead of exiting with code `2`.
+- **Credential Redaction:** All CLI error messages pass through `redact_secrets(...)`, which masks `AIza...`, `sk-...`, `ya29...`, `Bearer ...`, and any configured secret values as `[REDACTED]` before writing to `stderr`. Never pass raw API keys on the command line; store them in `.env` (`chmod 600 .env`) or use Vertex AI ADC.
 
 ## 3. Before enabling network collection
 

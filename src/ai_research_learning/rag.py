@@ -100,8 +100,16 @@ def load_dotenv_file(dotenv_path: Path | str | None = DEFAULT_DOTENV_PATH) -> di
     return parse_dotenv_content(path.read_text(encoding="utf-8"))
 
 
+_SECRET_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Bearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"ya29\.[A-Za-z0-9._-]+"),
+    re.compile(r"AIza[A-Za-z0-9_-]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{12,}"),
+)
+
+
 def redact_secrets(text: str, secrets: Sequence[str | None]) -> str:
-    """Replace any non-empty secret values appearing in `text` with `[REDACTED]`."""
+    """Replace any non-empty secret values or common token patterns in `text` with `[REDACTED]`."""
     redacted = text
     for secret in secrets:
         if not secret:
@@ -109,6 +117,8 @@ def redact_secrets(text: str, secrets: Sequence[str | None]) -> str:
         candidate = secret.strip()
         if candidate and candidate in redacted:
             redacted = redacted.replace(candidate, "[REDACTED]")
+    for pattern in _SECRET_TOKEN_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
 
 
