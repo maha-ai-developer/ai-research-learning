@@ -21,6 +21,7 @@ _RAG_EXPORTS = frozenset(
         "DEFAULT_CHROMA_COLLECTION",
         "DEFAULT_CHROMA_DIR",
         "DEFAULT_DOTENV_PATH",
+        "DEFAULT_RAG_EVAL_DATASET_PATH",
         "DEFAULT_RUNTIME_DB_PATH",
         "DEFAULT_VERTEX_LOCATION",
         "DEFAULT_VERTEX_PROJECT",
@@ -39,6 +40,8 @@ _RAG_EXPORTS = frozenset(
         "PolicyBlockedIndexingError",
         "ProviderConfig",
         "ProviderNotConfiguredError",
+        "RAGEvalCaseResult",
+        "RAGEvalSummary",
         "RAGPromptInput",
         "RAGResponse",
         "ReadOnlySQLiteStore",
@@ -52,6 +55,7 @@ _RAG_EXPORTS = frozenset(
         "build_vertex_ai_model_endpoint",
         "chunk_text",
         "compute_chunk_id",
+        "compute_lexical_claim_groundedness_proxy",
         "create_embedding_provider",
         "create_generation_provider",
         "ensure_knowledge_chunks_schema",
@@ -68,6 +72,8 @@ _RAG_EXPORTS = frozenset(
         "resolve_adc_credentials_path",
         "resolve_cli_provider_config",
         "run_end_to_end_rag_proof",
+        "run_offline_rag_evaluation",
+        "seed_eval_corpus_from_fixture",
     }
 )
 
