@@ -1718,27 +1718,44 @@ def build_grounded_rag_prompt(prompt_input: RAGPromptInput) -> tuple[str, str]:
     return system_prompt, user_prompt
 
 
-_CHUNK_ID_RE = re.compile(r"chk_[0-9a-f]{16}")
+_CHUNK_ID_RE = re.compile(r"\bchk_[0-9a-f]{16}\b")
 
-_ABSTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+# Matches canonical chunk IDs (`chk_<16 lowercase hex>`) as well as malformed or
+# uppercase pseudo-citation tokens (`chk_DEADBEEF12345678`, `chk_123`) while ignoring
+# ordinary snake_case technical identifiers that have no digits (e.g. `chk_sum`, `chk_flag`).
+_PSEUDO_CHUNK_TOKEN_STR = (
+    r"\bchk_(?:[0-9a-fA-F]{8,32}|(?=[0-9a-zA-Z_-]*\d)[0-9a-zA-Z_-]{1,32})\b"
+)
+_PSEUDO_CHUNK_TOKEN_RE = re.compile(_PSEUDO_CHUNK_TOKEN_STR)
+
+# Pure citation groups where the entire bracketed or parenthesized expression consists
+# solely of chunk/pseudo-chunk citation tokens separated by commas, semicolons, whitespace, or "and".
+_BRACKET_CIT_GROUP_RE = re.compile(
+    rf"\[\s*(?:{_PSEUDO_CHUNK_TOKEN_STR})(?:\s*(?:,|;|\band\b|\s)\s*(?:{_PSEUDO_CHUNK_TOKEN_STR}))*\s*\]"
+)
+_PAREN_CIT_GROUP_RE = re.compile(
+    rf"\(\s*(?:{_PSEUDO_CHUNK_TOKEN_STR})(?:\s*(?:,|;|\band\b|\s)\s*(?:{_PSEUDO_CHUNK_TOKEN_STR}))*\s*\)"
+)
+
+# Unconditional abstention patterns: explicit statements that the retrieved evidence is
+# insufficient to answer the question or that the question cannot be answered from the sources.
+_UNCONDITIONAL_ABSTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"\b(?:the\s+)?(?:retrieved|indexed|provided)\s+"
-        r"(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?)\s+"
-        r"(?:do\s+not|don't|does\s+not|doesn't|cannot|can't)\s+"
-        r"(?:contain|provide|include|specify|mention|state|have|support)\b",
+        r"^\s*insufficient[\s_]+evidence\b",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:not\s+enough|insufficient|no\s+sufficient|lack(?:s|ing)?(?:\s+sufficient)?)\s+"
         r"(?:evidence|information|context|details?|data)\s+"
-        r"(?:in|from|within|across)\s+(?:the\s+)?(?:retrieved|indexed|provided)\b",
+        r"(?:to\s+(?:answer|determine|verify)|(?:in|from|within|across)\s+(?:the\s+)?(?:retrieved|indexed|provided))\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:there\s+is\s+no|there\s+are\s+no)\s+"
-        r"(?:sufficient\s+)?(?:evidence|information|mention)\s+"
-        r"(?:in|from|within)\s+(?:the\s+)?(?:retrieved|indexed|provided)\s+"
-        r"(?:sources?|chunks?|passages?|context|documents?|abstracts?)\b",
+        r"\b(?:the\s+)?(?:retrieved|indexed|provided)\s+"
+        r"(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?)\s+"
+        r"(?:do\s+not|don't|does\s+not|doesn't|cannot|can't)\s+"
+        r"(?:contain|provide|include|have)\s+(?:sufficient|enough)\s+"
+        r"(?:evidence|information|context|details?|data)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -1748,10 +1765,45 @@ _ABSTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?:sources?|chunks?|passages?|context|documents?|abstracts?)\b",
         re.IGNORECASE,
     ),
+)
+
+# Missing-detail / source-limitation patterns: statements that sources/abstracts/chunks do not
+# mention, specify, or contain a fact. These indicate abstention UNLESS the response also
+# contains an independent, validly cited substantive answer clause.
+_MISSING_DETAIL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"^\s*insufficient[\s_]+evidence\b",
+        r"\b(?:the\s+)?(?:(?:retrieved|indexed|provided)\s+)?"
+        r"(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?|papers?|texts?|articles?)\s+"
+        r"(?:do\s+not|don't|does\s+not|doesn't|cannot|can't|never)\s+"
+        r"(?:contain|provide|include|specify|mention|state|have|support|report|list|describe|give)\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\b(?:there\s+is\s+no|there\s+are\s+no|no)\s+"
+        r"(?:sufficient\s+)?(?:evidence|information|mention|details?|data|record)\s+"
+        r"(?:of|about|regarding|on|for|in|from|within)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:is|are)\s+not\s+(?:mentioned|specified|stated|provided|reported|included)\s+"
+        r"in\s+(?:the\s+)?(?:(?:retrieved|indexed|provided)\s+)?"
+        r"(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?|papers?|texts?)\b",
+        re.IGNORECASE,
+    ),
+)
+
+_CONCESSIVE_OR_META_CLAUSE_START_RE = re.compile(
+    r"^\s*(?:while|although|even\s+though|though|whereas|despite|"
+    r"based\s+on\s+(?:the\s+)?(?:retrieved|indexed|provided)|"
+    r"according\s+to\s+(?:the\s+)?(?:retrieved|indexed|provided)|"
+    r"in\s+(?:the\s+)?(?:retrieved|indexed|provided)|"
+    r"the\s+(?:retrieved|indexed|provided)\s+(?:sources?|chunks?|passages?|abstracts?|documents?|excerpts?))\b",
+    re.IGNORECASE,
+)
+
+_LEADING_SUBORDINATE_SPLIT_RE = re.compile(
+    r"^\s*(?:while|although|even\s+though|though|whereas|based\s+on|according\s+to|in\s+the\s+(?:retrieved|indexed|provided))\b",
+    re.IGNORECASE,
 )
 
 
@@ -1759,7 +1811,7 @@ def _extract_cited_chunk_ids_from_text(
     answer_text: str,
     valid_chunk_ids: Sequence[str],
 ) -> list[str]:
-    """Extract cited `chk_...` identifiers from `answer_text` and filter to valid retrieved IDs."""
+    """Extract cited `chk_<16-hex>` identifiers from `answer_text` and filter to valid retrieved IDs."""
     valid_set = set(valid_chunk_ids)
     mentioned = _CHUNK_ID_RE.findall(answer_text)
     verified: list[str] = []
@@ -1773,56 +1825,145 @@ def _sanitize_answer_citations(
     answer_text: str,
     valid_chunk_ids: Sequence[str],
 ) -> tuple[str, list[str]]:
-    """Strip fabricated `chk_<16-hex>` markers from `answer_text` and return `(cleaned_text, verified_ids)`.
+    """Strip fabricated or malformed `chk_...` markers from `answer_text` and return `(cleaned_text, verified_ids)`.
 
-    Only chunk IDs present in `valid_chunk_ids` (the retrieved chunks for the query)
-    are preserved in both the rendered answer text and the returned `cited_chunk_ids` list.
+    Rules enforced:
+    1. Only canonical `chk_<16 lowercase hex>` IDs present in `valid_chunk_ids` (the retrieved
+       chunks for the current query) are preserved in `cleaned_text` and `verified_ids`.
+    2. Pure citation groups (`[chk_...]` or `(chk_...)` with matched delimiters) are rewritten
+       to retain only valid retrieved IDs or removed cleanly when none are valid.
+    3. Citation tokens embedded inside explanatory parenthetical or bracketed prose
+       (e.g., `(also called reverse mode, chk_...)` or `(explanation [chk_...])`) have only
+       invalid citation tokens removed while preserving surrounding explanatory text and
+       balanced delimiters.
+    4. Malformed or uppercase `chk_...` pseudo-citation markers (e.g., `chk_123`,
+       `chk_DEADBEEF12345678`) are stripped without altering ordinary snake_case technical
+       identifiers such as `chk_sum` or `chk_flag`.
     """
     valid_set = set(valid_chunk_ids)
     verified_ids = _extract_cited_chunk_ids_from_text(answer_text, valid_chunk_ids)
 
-    def _replace_group(match: re.Match[str]) -> str:
-        open_ch = match.group(1)
-        inner = match.group(2)
-        close_ch = match.group(3)
-        cids = _CHUNK_ID_RE.findall(inner)
-        if not cids:
-            return match.group(0)
-        kept = [cid for cid in cids if cid in valid_set]
+    def _keep_valid_dedup(tokens: Sequence[str]) -> list[str]:
+        kept: list[str] = []
+        for tok in tokens:
+            if tok in valid_set and _CHUNK_ID_RE.fullmatch(tok) and tok not in kept:
+                kept.append(tok)
+        return kept
+
+    def _replace_bracket_group(match: re.Match[str]) -> str:
+        tokens = _PSEUDO_CHUNK_TOKEN_RE.findall(match.group(0))
+        kept = _keep_valid_dedup(tokens)
         if not kept:
             return ""
-        dedup_kept: list[str] = []
-        for cid in kept:
-            if cid not in dedup_kept:
-                dedup_kept.append(cid)
-        if open_ch == "[" and close_ch == "]":
-            return " ".join(f"[{cid}]" for cid in dedup_kept)
-        return f"{open_ch}{', '.join(dedup_kept)}{close_ch}"
+        return " ".join(f"[{cid}]" for cid in kept)
 
-    cleaned = re.sub(
-        r"(\[|\()([^\]\)\n]*chk_[0-9a-f]{16}[^\]\)\n]*)(\]|\))",
-        _replace_group,
-        answer_text,
-    )
+    def _replace_paren_group(match: re.Match[str]) -> str:
+        tokens = _PSEUDO_CHUNK_TOKEN_RE.findall(match.group(0))
+        kept = _keep_valid_dedup(tokens)
+        if not kept:
+            return ""
+        return f"({', '.join(kept)})"
 
-    def _replace_bare(match: re.Match[str]) -> str:
-        cid = match.group(0)
-        return cid if cid in valid_set else ""
+    # Step 1: Sanitize pure `[chk_...]` and `(chk_...)` citation groups first (innermost groups
+    # in nested constructs like `(explanation [chk_...])` are matched without touching outer parens).
+    cleaned = _BRACKET_CIT_GROUP_RE.sub(_replace_bracket_group, answer_text)
+    cleaned = _PAREN_CIT_GROUP_RE.sub(_replace_paren_group, cleaned)
 
-    cleaned = _CHUNK_ID_RE.sub(_replace_bare, cleaned)
+    # Step 2: Sanitize any remaining bare `chk_...` tokens (such as those inside mixed prose parens).
+    def _replace_bare_token(match: re.Match[str]) -> str:
+        tok = match.group(0)
+        return tok if (tok in valid_set and _CHUNK_ID_RE.fullmatch(tok)) else ""
+
+    cleaned = _PSEUDO_CHUNK_TOKEN_RE.sub(_replace_bare_token, cleaned)
+
+    # Step 3: Clean up orphaned punctuation or empty delimiters left behind by token removal.
+    cleaned = re.sub(r"(\(|\[)\s*[,;:]+\s*", r"\1", cleaned)
+    cleaned = re.sub(r"\s*[,;:]+\s*(\)|\])", r"\1", cleaned)
+    cleaned = re.sub(r",\s*,+", ",", cleaned)
+    cleaned = re.sub(r"\(\s*\)|\[\s*\]", "", cleaned)
     cleaned = re.sub(r"[ \t]+([.,;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"(\(|\[)[ \t]+", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]+(\)|\])", r"\1", cleaned)
     lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in cleaned.split("\n")]
     cleaned = "\n".join(lines).strip()
     return cleaned, verified_ids
 
 
+def _split_into_clauses(text: str) -> list[str]:
+    """Split `text` into sentence and conjunction clauses for deterministic abstention analysis."""
+    parts = re.split(
+        r"(?:[\n.!?;]+|,\s+(?=(?:but|however|while|although|though|whereas)\b)|\s+--\s+|\s+\u2014\s+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    clauses: list[str] = []
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        if _LEADING_SUBORDINATE_SPLIT_RE.search(p) and "," in p:
+            sub, rest = p.split(",", 1)
+            if sub.strip():
+                clauses.append(sub.strip())
+            if rest.strip():
+                clauses.append(rest.strip())
+        else:
+            clauses.append(p)
+    return clauses
+
+
+def _strip_citation_markers_for_analysis(text: str) -> str:
+    """Remove bracketed, parenthesized, and bare chunk/pseudo-chunk citation markers for clause analysis."""
+    cleaned = _BRACKET_CIT_GROUP_RE.sub(" ", text)
+    cleaned = _PAREN_CIT_GROUP_RE.sub(" ", cleaned)
+    cleaned = _PSEUDO_CHUNK_TOKEN_RE.sub(" ", cleaned)
+    return " ".join(cleaned.strip().split())
+
+
 def _is_generator_abstention(answer_text: str) -> bool:
-    """Return True when the generator explicitly states that retrieved sources lack sufficient evidence."""
+    """Classify whether `answer_text` is a post-retrieval abstention vs. a grounded answer.
+
+    Decision rule:
+    1. Empty or whitespace-only responses return `True` (abstain).
+    2. Responses matching `_UNCONDITIONAL_ABSTENTION_PATTERNS` (e.g., stating that retrieved
+       sources do not contain sufficient evidence to answer the question) return `True`.
+    3. Responses matching `_MISSING_DETAIL_PATTERNS` (e.g., noting that retrieved sources/abstracts
+       do not specify or mention a detail) are inspected at the clause level:
+       - If the response contains at least one independent, non-concessive clause with a valid
+         `chk_<16-hex>` citation that does NOT itself match any abstention/missing-detail pattern
+         (for example, a direct cited answer to the primary question followed by a secondary caveat),
+         return `False` so the valid cited answer is preserved.
+       - Otherwise (including when a retrieved chunk is cited only in a concessive or meta-source
+         clause to explain what the source contains before stating the requested fact is absent),
+         return `True` (abstain).
+
+    Note on limitations:
+    This classifier is a deterministic lexical/clause heuristic for offline and runtime safety.
+    It does not perform neural natural-language inference (NLI) or semantic entailment checking.
+    """
     if not answer_text or not answer_text.strip():
         return True
-    without_cids = re.sub(r"[\[\(]?\bchk_[0-9a-f]{16}\b[\]\)]?", " ", answer_text)
-    normalized = " ".join(without_cids.strip().split())
-    return any(pattern.search(normalized) for pattern in _ABSTENTION_PATTERNS)
+    normalized = _strip_citation_markers_for_analysis(answer_text)
+
+    if any(pattern.search(normalized) for pattern in _UNCONDITIONAL_ABSTENTION_PATTERNS):
+        return True
+
+    if not any(pattern.search(normalized) for pattern in _MISSING_DETAIL_PATTERNS):
+        return False
+
+    for clause in _split_into_clauses(answer_text):
+        if not _CHUNK_ID_RE.search(clause):
+            continue
+        clause_norm = _strip_citation_markers_for_analysis(clause)
+        if any(p.search(clause_norm) for p in _UNCONDITIONAL_ABSTENTION_PATTERNS):
+            continue
+        if any(p.search(clause_norm) for p in _MISSING_DETAIL_PATTERNS):
+            continue
+        if _CONCESSIVE_OR_META_CLAUSE_START_RE.search(clause_norm):
+            continue
+        return False
+
+    return True
 
 
 class RetrievalOnlyFallbackGenerationProvider:
@@ -3966,6 +4107,7 @@ class RAGEvalSummary:
     resource_hit_rate_at_k: float
     chunk_recall_at_k: float
     mrr_at_k: float
+    negative_control_empty_retrieval_rate: float
     citation_precision: float
     citation_recall: float
     fabricated_citation_rate: float
@@ -3989,6 +4131,9 @@ class RAGEvalSummary:
                 "resource_hit_rate_at_k": round(self.resource_hit_rate_at_k, 4),
                 "chunk_recall_at_k": round(self.chunk_recall_at_k, 4),
                 "mrr_at_k": round(self.mrr_at_k, 4),
+                "negative_control_empty_retrieval_rate": round(
+                    self.negative_control_empty_retrieval_rate, 4
+                ),
                 "citation_precision": round(self.citation_precision, 4),
                 "citation_recall": round(self.citation_recall, 4),
                 "fabricated_citation_rate": round(self.fabricated_citation_rate, 4),
@@ -4019,7 +4164,7 @@ def compute_lexical_claim_groundedness_proxy(
     """
     if not answer_text or not answer_text.strip() or not cited_chunks:
         return 0.0
-    stripped_answer = _CHUNK_ID_RE.sub("", answer_text)
+    stripped_answer = _PSEUDO_CHUNK_TOKEN_RE.sub("", answer_text)
     answer_stems = extract_stemmed_content_set(stripped_answer)
     if not answer_stems:
         return 0.0
@@ -4189,7 +4334,26 @@ def run_offline_rag_evaluation(
     *,
     work_dir: Path | str | None = None,
 ) -> RAGEvalSummary:
-    """Run the deterministic offline RAG evaluation benchmark in an isolated SQLite + Chroma store."""
+    """Run the deterministic offline RAG evaluation benchmark in an isolated SQLite + Chroma store.
+
+    Metric denominators and zero-denominator defaults:
+    - `resource_hit_rate_at_k`: mean over cases with non-empty `expected_resource_ids` (`0.0` if none).
+    - `chunk_recall_at_k` and `mrr_at_k`: mean over cases with non-empty `expected_chunk_ids` (`0.0` if none).
+    - `negative_control_empty_retrieval_rate`: fraction of cases with empty expected retrieval targets
+      (`not expected_resource_ids and not expected_chunk_ids`) that retrieve zero chunks (`1.0` if no
+      empty-target negative-control cases exist in the dataset).
+    - `citation_precision`: mean over answerable cases (`not expected_abstain`; `0.0` if none).
+    - `citation_recall`: mean over answerable cases with non-empty `expected_chunk_ids` (`0.0` if none).
+    - `fabricated_citation_rate`: `total_fabricated_citations / total_citations_emitted` across all
+      unique citation tokens emitted in `resp.citations`, `generated_answer.cited_chunk_ids`, and
+      `generated_answer.answer_text` (`0.0` when `total_citations_emitted == 0`).
+    - `citation_metadata_resolution_accuracy`: `total_resolved_citations / total_structured_citations`
+      across all `SourceCitation` records in `resp.citations` (`1.0` when `total_structured_citations == 0`).
+    - `required_concept_recall`: mean over answerable cases with non-empty `required_concepts` (`0.0` if none).
+    - `abstention_precision` / `abstention_recall`: `true_positive_abstentions` divided by
+      `predicted_abstain_true` / `expected_abstain_true` respectively (`0.0` when denominator is `0`).
+    - `lexical_claim_groundedness_proxy`: mean over answerable cases with a non-null `generated_answer` (`0.0` if none).
+    """
     resolved_dataset_path = Path(dataset_path)
     dataset = json.loads(resolved_dataset_path.read_text(encoding="utf-8"))
     top_k = int(dataset.get("default_top_k", DEFAULT_TOP_K))
@@ -4220,6 +4384,7 @@ def run_offline_rag_evaluation(
             resource_hits: list[float] = []
             chunk_recalls: list[float] = []
             reciprocal_ranks: list[float] = []
+            negative_control_empty_hits: list[float] = []
             citation_precisions: list[float] = []
             citation_recalls: list[float] = []
             concept_recalls: list[float] = []
@@ -4227,6 +4392,7 @@ def run_offline_rag_evaluation(
 
             total_citations_emitted = 0
             total_fabricated_citations = 0
+            total_structured_citations = 0
             total_resolved_citations = 0
 
             expected_abstain_true = 0
@@ -4300,10 +4466,15 @@ def run_offline_rag_evaluation(
                     mrr_val = rr
                     reciprocal_ranks.append(mrr_val)
 
-                # Fabricated citation check across citations, cited_chunk_ids, and answer_text
+                # Negative-control retrieval specificity for empty-target cases
+                if not expected_res_ids and not expected_chk_ids:
+                    negative_control_empty_hits.append(1.0 if not retrieved_chk_ids else 0.0)
+
+                # Fabricated citation check across generator output, citations, cited_chunk_ids, and answer_text
                 retrieved_set = set(retrieved_chk_ids)
+                raw_cids = _PSEUDO_CHUNK_TOKEN_RE.findall(mock_text)
                 text_cids = (
-                    _CHUNK_ID_RE.findall(resp.generated_answer.answer_text)
+                    _PSEUDO_CHUNK_TOKEN_RE.findall(resp.generated_answer.answer_text)
                     if resp.generated_answer is not None
                     else []
                 )
@@ -4312,13 +4483,20 @@ def run_offline_rag_evaluation(
                     if resp.generated_answer is not None
                     else []
                 )
-                all_emitted_cids = list(dict.fromkeys([*cited_chk_ids, *ans_cids, *text_cids]))
-                fab_count = sum(1 for cid in all_emitted_cids if cid not in retrieved_set)
+                all_emitted_cids = list(
+                    dict.fromkeys([*raw_cids, *cited_chk_ids, *ans_cids, *text_cids])
+                )
+                fab_count = sum(
+                    1
+                    for cid in all_emitted_cids
+                    if cid not in retrieved_set or not _CHUNK_ID_RE.fullmatch(cid)
+                )
                 total_citations_emitted += len(all_emitted_cids)
                 total_fabricated_citations += fab_count
 
-                # Metadata resolution check
+                # Metadata resolution check across structured SourceCitation records
                 case_meta_ok = True
+                total_structured_citations += len(resp.citations)
                 for cit in resp.citations:
                     if _verify_citation_metadata_against_sqlite(store, cit):
                         total_resolved_citations += 1
@@ -4333,11 +4511,14 @@ def run_offline_rag_evaluation(
 
                 if not expected_abstain:
                     expected_chk_set = set(expected_chk_ids)
-                    if cited_chk_ids:
+                    candidate_cids = list(dict.fromkeys([*cited_chk_ids, *raw_cids]))
+                    if candidate_cids and cited_chk_ids:
                         relevant_cited = [
-                            cid for cid in cited_chk_ids if cid in expected_chk_set
+                            cid
+                            for cid in candidate_cids
+                            if cid in expected_chk_set and cid in cited_chk_ids
                         ]
-                        cit_prec = len(relevant_cited) / len(cited_chk_ids)
+                        cit_prec = len(relevant_cited) / len(candidate_cids)
                     else:
                         cit_prec = 0.0
                     citation_precisions.append(cit_prec)
@@ -4402,6 +4583,11 @@ def run_offline_rag_evaluation(
             avg_res_hit = sum(resource_hits) / max(len(resource_hits), 1)
             avg_chk_recall = sum(chunk_recalls) / max(len(chunk_recalls), 1)
             avg_mrr = sum(reciprocal_ranks) / max(len(reciprocal_ranks), 1)
+            neg_empty_rate = (
+                sum(negative_control_empty_hits) / len(negative_control_empty_hits)
+                if negative_control_empty_hits
+                else 1.0
+            )
             avg_cit_prec = sum(citation_precisions) / max(len(citation_precisions), 1)
             avg_cit_rec = sum(citation_recalls) / max(len(citation_recalls), 1)
             fab_rate = (
@@ -4410,8 +4596,8 @@ def run_offline_rag_evaluation(
                 else 0.0
             )
             meta_acc = (
-                total_resolved_citations / total_citations_emitted
-                if total_citations_emitted > 0
+                total_resolved_citations / total_structured_citations
+                if total_structured_citations > 0
                 else 1.0
             )
             avg_concept_rec = sum(concept_recalls) / max(len(concept_recalls), 1)
@@ -4438,6 +4624,7 @@ def run_offline_rag_evaluation(
                 resource_hit_rate_at_k=avg_res_hit,
                 chunk_recall_at_k=avg_chk_recall,
                 mrr_at_k=avg_mrr,
+                negative_control_empty_retrieval_rate=neg_empty_rate,
                 citation_precision=avg_cit_prec,
                 citation_recall=avg_cit_rec,
                 fabricated_citation_rate=fab_rate,

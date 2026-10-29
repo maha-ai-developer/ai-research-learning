@@ -264,7 +264,7 @@
     {
       "case_id": "eval_11_wikipedia_filter_backprop_history",
       "category": "source_filtered_wikipedia_single_chunk",
-      "question": "What alternative names from automatic differentiation are used for backpropagation?",
+      "question": "What alternative names from automatic differentiation are used for backpropagation in deep learning?",
       "source_ids": ["SRC-WIKIPEDIA"],
       "expected_abstain": false,
       "expected_status": "answered",

@@ -1613,6 +1613,96 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
         self.assertEqual(cit.epistemic_layer, "PRIMARY_SOURCE_TEXT")
         self.assertTrue(rag_module._verify_citation_metadata_against_sqlite(self.store, cit))
 
+        # (6) Task 033D F-01 & F-05 regression checks: parenthetical explanatory text,
+        #     nested bracketed citations inside parentheses, malformed/uppercase pseudo-citations,
+        #     and preservation of ordinary technical identifiers (chk_sum, chk_flag).
+        san_text_1, san_ids_1 = rag_module._sanitize_answer_citations(
+            "Backpropagation (also called reverse mode, chk_deadbeef12345678) computes gradients.",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_1,
+            "Backpropagation (also called reverse mode) computes gradients.",
+        )
+        self.assertEqual(san_ids_1, [])
+
+        san_text_2, san_ids_2 = rag_module._sanitize_answer_citations(
+            f"Backpropagation (also called reverse mode, {valid_wiki_cid}) computes gradients.",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_2,
+            f"Backpropagation (also called reverse mode, {valid_wiki_cid}) computes gradients.",
+        )
+        self.assertEqual(san_ids_2, [valid_wiki_cid])
+
+        san_text_3, san_ids_3 = rag_module._sanitize_answer_citations(
+            f"Backpropagation (also called reverse mode [{valid_wiki_cid}]) computes gradients.",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_3,
+            f"Backpropagation (also called reverse mode [{valid_wiki_cid}]) computes gradients.",
+        )
+        self.assertEqual(san_ids_3, [valid_wiki_cid])
+
+        san_text_4, san_ids_4 = rag_module._sanitize_answer_citations(
+            "Backpropagation (also called reverse mode [chk_deadbeef12345678]) computes gradients.",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_4,
+            "Backpropagation (also called reverse mode) computes gradients.",
+        )
+        self.assertEqual(san_ids_4, [])
+
+        san_text_5, san_ids_5 = rag_module._sanitize_answer_citations(
+            f"Variables chk_sum and chk_flag remain intact (also called reverse mode [{valid_wiki_cid}, chk_123]) "
+            f"while [chk_123] and [chk_DEADBEEF12345678] and (chk_99999) are removed.",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_5,
+            f"Variables chk_sum and chk_flag remain intact (also called reverse mode [{valid_wiki_cid}]) "
+            f"while and and are removed.",
+        )
+        self.assertEqual(san_ids_5, [valid_wiki_cid])
+        self.assertNotIn("chk_123", san_text_5)
+        self.assertNotIn("chk_DEADBEEF12345678", san_text_5)
+        self.assertIn("chk_sum", san_text_5)
+        self.assertIn("chk_flag", san_text_5)
+
+        # Verify end-to-end through provider + pipeline on mixed parenthetical & malformed pseudo-citations
+        f01_f05_mixed_text = (
+            f"Backpropagation (also called reverse mode, {fabricated_cid_1}) computes gradients "
+            f"(using chain rule [{valid_wiki_cid}]) with chk_sum [chk_123] [chk_DEADBEEF12345678]."
+        )
+        f01_f05_provider = OpenAIGenerationProvider(
+            api_key="sk-test-openai",
+            http_post_json=lambda u, h, p: {
+                "choices": [{"message": {"content": f01_f05_mixed_text}}]
+            },
+        )
+        f01_f05_pipeline = LocalRAGPipeline(
+            store=self.store,
+            vector_store=vector_store,
+            embedding_provider=embedder,
+            generation_provider=f01_f05_provider,
+        )
+        f01_f05_resp = f01_f05_pipeline.answer_question(
+            "How does backpropagation compute gradients using the chain rule?",
+            source_ids=["SRC-WIKIPEDIA"],
+        )
+        self.assertEqual(f01_f05_resp.status, "answered")
+        assert f01_f05_resp.generated_answer is not None
+        self.assertEqual(
+            f01_f05_resp.generated_answer.answer_text,
+            f"Backpropagation (also called reverse mode) computes gradients "
+            f"(using chain rule [{valid_wiki_cid}]) with chk_sum.",
+        )
+        self.assertEqual(f01_f05_resp.generated_answer.cited_chunk_ids, [valid_wiki_cid])
+        self.assertEqual([c.chunk_id for c in f01_f05_resp.citations], [valid_wiki_cid])
+
     def test_16_task033_post_retrieval_and_pre_retrieval_abstention(self) -> None:
         """Verify Task 033 Phase 3 pre-retrieval and post-retrieval abstention and non-rejection of valid answers."""
         seeded = self._seed_sample_resources()
@@ -1674,12 +1764,16 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
         self.assertEqual(len(generator_calls), 0)
 
         # 2. Post-retrieval abstention: partial-evidence query where chunks are retrieved above threshold,
-        #    and generator explicitly reports insufficient evidence (even if referencing the chunk ID).
+        #    and generator explicitly reports insufficient evidence (even if referencing the chunk ID,
+        #    including Task 033D F-02 false-negative examples).
         for abstention_msg in (
             "The retrieved sources do not contain sufficient evidence to answer what exact learning rate or mini-batch size was used.",
             f"The retrieved chunks [{valid_arxiv_cid}] do not specify the exact GPU model or learning rate schedule.",
             "There is insufficient evidence in the retrieved sources to determine the exact weight decay hyperparameter.",
             "This question cannot be answered from the retrieved sources because only the high-level abstract is indexed.",
+            f"While [{valid_arxiv_cid}] describes dropout on feedforward networks, the abstract does not mention the exact learning rate or mini-batch size.",
+            f"Based on the retrieved chunks [{valid_arxiv_cid}], there is no mention of the Adam warmup schedule.",
+            f"The retrieved chunk [{valid_arxiv_cid}] describes dropout regularization, but the sources do not specify the weight decay.",
         ):
             abst_provider = OpenAIGenerationProvider(
                 api_key="sk-test-openai",
@@ -1694,7 +1788,7 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
             partial_resp = abst_pipeline.answer_question(
                 "In the dropout neural network training experiments, what exact learning rate and mini-batch size were used?"
             )
-            self.assertEqual(partial_resp.status, "insufficient_evidence")
+            self.assertEqual(partial_resp.status, "insufficient_evidence", msg=f"Failed to abstain on: {abstention_msg}")
             self.assertFalse(partial_resp.sufficient_evidence)
             self.assertEqual(partial_resp.citations, [])
             self.assertIsNone(partial_resp.generated_answer)
@@ -1705,11 +1799,14 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
             )
 
         # 3. Valid grounded answers containing words like "evidence", "insufficient", or "cannot"
-        #    in domain explanations must NOT be falsely rejected as abstentions.
+        #    in domain explanations OR including a secondary limitation caveat alongside a cited
+        #    primary answer (Task 033D F-02 false-positive examples) must NOT be falsely rejected.
         for valid_domain_msg in (
             f"Empirical evidence shows that random dropout prevents complex co-adaptations of feature detectors [{valid_arxiv_cid}].",
             f"Training without regularization is insufficient to prevent overfitting on small datasets, whereas dropout reduces overfitting [{valid_arxiv_cid}].",
             f"Co-adapted feature detectors cannot generalize well alone without dropout regularization [{valid_arxiv_cid}].",
+            f"Random dropout prevents complex co-adaptations of feature detectors [{valid_arxiv_cid}]. However, the retrieved sources do not specify the exact hardware used.",
+            f"Although the retrieved sources do not specify second-order Hessian approximations, random dropout reduces overfitting by omitting half of the feature detectors [{valid_arxiv_cid}].",
         ):
             valid_provider = OpenAIGenerationProvider(
                 api_key="sk-test-openai",
@@ -1724,10 +1821,31 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
             valid_resp = valid_pipeline.answer_question(
                 "How does dropout prevent co-adaptation and overfitting in neural networks?"
             )
-            self.assertEqual(valid_resp.status, "answered")
+            self.assertEqual(valid_resp.status, "answered", msg=f"Falsely abstained on: {valid_domain_msg}")
             self.assertTrue(valid_resp.sufficient_evidence)
             self.assertIsNotNone(valid_resp.generated_answer)
             self.assertEqual([c.chunk_id for c in valid_resp.citations], [valid_arxiv_cid])
+
+        # Also explicitly check the exact Task 033D F-02 backprop caveat example
+        backprop_caveat_msg = (
+            f"Backpropagation computes the gradient of the loss with respect to weights [{valid_wiki_cid}]. "
+            f"However, the retrieved sources do not specify the exact hardware used."
+        )
+        backprop_caveat_pipeline = LocalRAGPipeline(
+            store=self.store,
+            vector_store=vector_store,
+            embedding_provider=embedder,
+            generation_provider=OpenAIGenerationProvider(
+                api_key="sk-test-openai",
+                http_post_json=_counting_http_post(backprop_caveat_msg),
+            ),
+        )
+        backprop_caveat_resp = backprop_caveat_pipeline.answer_question(
+            "How does backpropagation compute gradients using the chain rule?"
+        )
+        self.assertEqual(backprop_caveat_resp.status, "answered")
+        self.assertTrue(backprop_caveat_resp.sufficient_evidence)
+        self.assertEqual([c.chunk_id for c in backprop_caveat_resp.citations], [valid_wiki_cid])
 
     def test_17_task033_offline_rag_evaluation_benchmark_harness(self) -> None:
         """Verify Task 033 Phase 4 offline evaluation dataset and deterministic metrics in an isolated fixture."""
@@ -1749,10 +1867,15 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
         self.assertEqual(summary.indexed_resource_count, 6)
         self.assertEqual(summary.indexed_chunk_count, 18)
 
-        # Retrieval metrics
+        # Retrieval metrics (including F-04 negative_control_empty_retrieval_rate)
         self.assertEqual(summary.resource_hit_rate_at_k, 1.0)
         self.assertEqual(summary.chunk_recall_at_k, 1.0)
         self.assertEqual(summary.mrr_at_k, 1.0)
+        self.assertEqual(summary.negative_control_empty_retrieval_rate, 1.0)
+        self.assertEqual(
+            summary.to_dict()["metrics"]["negative_control_empty_retrieval_rate"],
+            1.0,
+        )
 
         # Citation integrity metrics
         self.assertEqual(summary.citation_precision, 1.0)
@@ -1797,6 +1920,171 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
                 # Out-of-domain and unindexed in-domain abstained pre-retrieval
                 self.assertEqual(case_res.retrieved_chunk_ids, [])
                 self.assertEqual(case_res.cited_chunk_ids, [])
+
+        # Task 033D F-03 (1): Verify source_ids actively changes retrieval results on the evaluation corpus
+        eval_store = KnowledgeStore(eval_work_dir / "rag_eval_isolated.sqlite")
+        try:
+            eval_vs = ChromaPersistentVectorStore(
+                persist_directory=eval_work_dir / "chroma_eval_isolated",
+                collection_name="rag_eval_benchmark_v1",
+            )
+            eval_pipe = LocalRAGPipeline(
+                store=eval_store,
+                vector_store=eval_vs,
+                embedding_provider=DeterministicHashEmbeddingProvider(
+                    dimensions=int(dataset["embedding_dimensions"])
+                ),
+                generation_provider=RetrievalOnlyFallbackGenerationProvider(),
+            )
+            eval_top_k = int(dataset["default_top_k"])
+            eval_min_sim = float(dataset["default_min_similarity_score"])
+            eval_11_case = next(
+                c for c in dataset["cases"] if c["case_id"] == "eval_11_wikipedia_filter_backprop_history"
+            )
+            unfiltered_eval_11 = eval_pipe.retrieve(
+                eval_11_case["question"],
+                top_k=eval_top_k,
+                min_similarity_score=eval_min_sim,
+                source_ids=None,
+            )
+            wiki_filtered_eval_11 = eval_pipe.retrieve(
+                eval_11_case["question"],
+                top_k=eval_top_k,
+                min_similarity_score=eval_min_sim,
+                source_ids=["SRC-WIKIPEDIA"],
+            )
+            arxiv_filtered_eval_11 = eval_pipe.retrieve(
+                eval_11_case["question"],
+                top_k=eval_top_k,
+                min_similarity_score=eval_min_sim,
+                source_ids=["SRC-ARXIV"],
+            )
+            self.assertEqual(
+                {c.source_id for c in unfiltered_eval_11},
+                {"SRC-WIKIPEDIA", "SRC-ARXIV"},
+            )
+            self.assertEqual(
+                {c.source_id for c in wiki_filtered_eval_11},
+                {"SRC-WIKIPEDIA"},
+            )
+            self.assertNotEqual(
+                [c.chunk_id for c in wiki_filtered_eval_11],
+                [c.chunk_id for c in unfiltered_eval_11],
+            )
+            self.assertEqual(
+                {c.source_id for c in arxiv_filtered_eval_11},
+                {"SRC-ARXIV"},
+            )
+            # Also verify filtering excludes the only matching source on a single-source query
+            eval_01_case = next(
+                c for c in dataset["cases"] if c["case_id"] == "eval_01_backprop_chain_rule"
+            )
+            self.assertGreaterEqual(
+                len(
+                    eval_pipe.retrieve(
+                        eval_01_case["question"],
+                        top_k=eval_top_k,
+                        min_similarity_score=eval_min_sim,
+                        source_ids=None,
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                eval_pipe.retrieve(
+                    eval_01_case["question"],
+                    top_k=eval_top_k,
+                    min_similarity_score=eval_min_sim,
+                    source_ids=["SRC-ARXIV"],
+                ),
+                [],
+            )
+        finally:
+            eval_store.close()
+
+        # Task 033D F-03 (2) & F-04: Negative-perturbation tests proving run_offline_rag_evaluation
+        # detects regressions in (a) missing expected chunk, (b) omitted required concept,
+        # (c) fabricated/invalid citation, (d) incorrect abstention / incorrect answer classification,
+        # and (e) non-empty retrieval on negative-control cases & zero-denominator behavior.
+        def _run_perturbed(name: str, mutator) -> RAGEvalSummary:
+            perturbed_data = json.loads(DEFAULT_RAG_EVAL_DATASET_PATH.read_text(encoding="utf-8"))
+            mutator(perturbed_data)
+            perturbed_path = self.tmp_path / f"perturbed_{name}.json"
+            perturbed_path.write_text(json.dumps(perturbed_data), encoding="utf-8")
+            return run_offline_rag_evaluation(
+                perturbed_path,
+                work_dir=self.tmp_path / f"work_{name}",
+            )
+
+        # (a) Missing expected retrieved chunk -> chunk_recall_at_k drops below 1.0
+        def _mutate_missing_chunk(d: dict[str, Any]) -> None:
+            d["cases"][0]["expected_chunk_ids"].append("chk_364466882e422f57")
+
+        sum_missing_chunk = _run_perturbed("missing_chunk", _mutate_missing_chunk)
+        self.assertLess(sum_missing_chunk.chunk_recall_at_k, 1.0)
+        assert sum_missing_chunk.case_results[0].chunk_recall_at_k is not None
+        self.assertLess(sum_missing_chunk.case_results[0].chunk_recall_at_k, 1.0)
+
+        # (b) Omitted required concept -> required_concept_recall drops below 1.0
+        def _mutate_omitted_concept(d: dict[str, Any]) -> None:
+            d["cases"][0]["mock_generator_response"] = (
+                "Backpropagation computes the gradient of a loss function [chk_0a6023ab662bc6b4]."
+            )
+
+        sum_omitted_concept = _run_perturbed("omitted_concept", _mutate_omitted_concept)
+        self.assertLess(sum_omitted_concept.required_concept_recall, 1.0)
+        assert sum_omitted_concept.case_results[0].required_concept_recall is not None
+        self.assertLess(sum_omitted_concept.case_results[0].required_concept_recall, 1.0)
+
+        # (c) Fabricated or invalid citation -> fabricated_citation_rate > 0.0 and citation_precision < 1.0
+        def _mutate_fabricated_citation(d: dict[str, Any]) -> None:
+            d["cases"][0]["mock_generator_response"] += " [chk_deadbeef12345678] [chk_123]"
+
+        sum_fab_cit = _run_perturbed("fabricated_citation", _mutate_fabricated_citation)
+        self.assertGreater(sum_fab_cit.fabricated_citation_rate, 0.0)
+        self.assertLess(sum_fab_cit.citation_precision, 1.0)
+        self.assertGreaterEqual(sum_fab_cit.case_results[0].fabricated_citation_count, 2)
+
+        # (d1) Incorrect abstention on an answerable case -> abstention_precision < 1.0
+        def _mutate_false_abstention(d: dict[str, Any]) -> None:
+            d["cases"][0]["mock_generator_response"] = (
+                "The retrieved sources do not contain sufficient evidence to answer this question."
+            )
+
+        sum_false_abst = _run_perturbed("false_abstention", _mutate_false_abstention)
+        self.assertLess(sum_false_abst.abstention_precision, 1.0)
+        self.assertTrue(sum_false_abst.case_results[0].actual_abstain)
+        self.assertFalse(sum_false_abst.case_results[0].expected_abstain)
+
+        # (d2) Incorrect answer classification on a partial-evidence abstention case -> abstention_recall < 1.0
+        def _mutate_missed_abstention(d: dict[str, Any]) -> None:
+            for c in d["cases"]:
+                if c["case_id"] == "eval_15_partial_resnet_batch_size_learning_rate":
+                    c["mock_generator_response"] = (
+                        "The initial learning rate was 0.1 and mini-batch size was 256 [chk_819d87281b2a2264]."
+                    )
+
+        sum_missed_abst = _run_perturbed("missed_abstention", _mutate_missed_abstention)
+        self.assertLess(sum_missed_abst.abstention_recall, 1.0)
+
+        # (e) Negative-control case unexpectedly retrieving chunks -> negative_control_empty_retrieval_rate < 1.0
+        def _mutate_nonempty_negative_control(d: dict[str, Any]) -> None:
+            for c in d["cases"]:
+                if c["case_id"] == "eval_12_ood_sourdough_fermentation":
+                    c["question"] = "How does backpropagation compute gradients using the chain rule?"
+
+        sum_nonempty_neg = _run_perturbed("nonempty_neg_control", _mutate_nonempty_negative_control)
+        self.assertLess(sum_nonempty_neg.negative_control_empty_retrieval_rate, 1.0)
+
+        # (f) Zero-denominator behavior: dataset with 0 empty-target cases and 0 structured citations
+        def _mutate_zero_denominators(d: dict[str, Any]) -> None:
+            d["cases"] = [
+                c for c in d["cases"] if c["case_id"] == "eval_15_partial_resnet_batch_size_learning_rate"
+            ]
+
+        sum_zero_denoms = _run_perturbed("zero_denominators", _mutate_zero_denominators)
+        self.assertEqual(sum_zero_denoms.negative_control_empty_retrieval_rate, 1.0)
+        self.assertEqual(sum_zero_denoms.citation_metadata_resolution_accuracy, 1.0)
 
 
 if __name__ == "__main__":
