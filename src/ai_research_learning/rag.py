@@ -1720,22 +1720,78 @@ def build_grounded_rag_prompt(prompt_input: RAGPromptInput) -> tuple[str, str]:
 
 _CHUNK_ID_RE = re.compile(r"\bchk_[0-9a-f]{16}\b")
 
-# Matches canonical chunk IDs (`chk_<16 lowercase hex>`) as well as malformed or
-# uppercase pseudo-citation tokens (`chk_DEADBEEF12345678`, `chk_123`) while ignoring
-# ordinary snake_case technical identifiers that have no digits (e.g. `chk_sum`, `chk_flag`).
+# Context-aware pseudo-citation token patterns (Task 033F M-01):
+# 1. `_DELIMITED_PSEUDO_CHUNK_TOKEN_STR` matches tokens inside pure `[chk_...]` or `(chk_...)`
+#    citation groups, where short digit-bearing (`[chk_123]`, `(chk_99999)`), malformed
+#    (`[chk_bad_id_1]`), uppercase (`[chk_DEADBEEF12345678]`), or overlong (`[chk_<33+ hex>]`)
+#    tokens are clearly intended as citations.
+# 2. `_PSEUDO_CHUNK_TOKEN_STR` (bare tokens in prose or mixed parenthetical explanations) matches:
+#    - 16+ hex-prefix tokens (`chk_<16+ hex>[alnum_-]*`, including canonical 16-hex, uppercase
+#      `chk_DEADBEEF12345678`, and overlong 33+ hex tokens),
+#    - tokens starting with a digit after `chk_` (`chk_123`, `chk_99999`),
+#    - 8-15 char mixed digit+hex tokens (`chk_1234abcd`), or overlong 20+ char digit-bearing tokens,
+#    while preserving legitimate technical identifiers in prose such as `chk_v2`, `chk_step1`,
+#    `chk_deadbeef`, `chk_sum`, and `chk_flag`.
+_DELIMITED_PSEUDO_CHUNK_TOKEN_STR = (
+    r"\bchk_(?:[0-9a-fA-F]{6,}[0-9a-zA-Z_-]*|(?=[0-9a-zA-Z_-]*\d)[0-9a-zA-Z_-]{1,})\b"
+)
+_DELIMITED_PSEUDO_CHUNK_TOKEN_RE = re.compile(_DELIMITED_PSEUDO_CHUNK_TOKEN_STR)
+
 _PSEUDO_CHUNK_TOKEN_STR = (
-    r"\bchk_(?:[0-9a-fA-F]{8,32}|(?=[0-9a-zA-Z_-]*\d)[0-9a-zA-Z_-]{1,32})\b"
+    r"\bchk_(?:"
+    r"[0-9a-fA-F]{16,}[0-9a-zA-Z_-]*|"
+    r"\d+[0-9a-fA-F]*|"
+    r"(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{8,15}|"
+    r"(?=[0-9a-zA-Z_-]*\d)[0-9a-zA-Z_-]{20,}"
+    r")\b"
 )
 _PSEUDO_CHUNK_TOKEN_RE = re.compile(_PSEUDO_CHUNK_TOKEN_STR)
 
 # Pure citation groups where the entire bracketed or parenthesized expression consists
 # solely of chunk/pseudo-chunk citation tokens separated by commas, semicolons, whitespace, or "and".
+# Guarded with `(?<![0-9a-zA-Z_])` so code indexing/calls like `arr[chk_v2]` or `fn(chk_step1)`
+# are not treated as citation groups.
 _BRACKET_CIT_GROUP_RE = re.compile(
-    rf"\[\s*(?:{_PSEUDO_CHUNK_TOKEN_STR})(?:\s*(?:,|;|\band\b|\s)\s*(?:{_PSEUDO_CHUNK_TOKEN_STR}))*\s*\]"
+    rf"(?<![0-9a-zA-Z_])\[\s*(?:{_DELIMITED_PSEUDO_CHUNK_TOKEN_STR})(?:\s*(?:,|;|\band\b|\s)\s*(?:{_DELIMITED_PSEUDO_CHUNK_TOKEN_STR}))*\s*\]"
 )
 _PAREN_CIT_GROUP_RE = re.compile(
-    rf"\(\s*(?:{_PSEUDO_CHUNK_TOKEN_STR})(?:\s*(?:,|;|\band\b|\s)\s*(?:{_PSEUDO_CHUNK_TOKEN_STR}))*\s*\)"
+    rf"(?<![0-9a-zA-Z_])\(\s*(?:{_DELIMITED_PSEUDO_CHUNK_TOKEN_STR})(?:\s*(?:,|;|\band\b|\s)\s*(?:{_DELIMITED_PSEUDO_CHUNK_TOKEN_STR}))*\s*\)"
 )
+
+
+def _extract_all_citation_like_tokens(text: str) -> list[str]:
+    """Extract all delimited and bare citation/pseudo-citation tokens from `text` in order of appearance.
+
+    Tokens inside pure `[chk_...]` or `(chk_...)` citation groups are matched with
+    `_DELIMITED_PSEUDO_CHUNK_TOKEN_RE`, while tokens in remaining prose are matched with
+    `_PSEUDO_CHUNK_TOKEN_RE` so legitimate technical identifiers (`chk_v2`, `chk_step1`,
+    `chk_deadbeef`, `chk_sum`, `chk_flag`) are never misclassified as citations.
+    """
+    if not text:
+        return []
+    found: list[tuple[int, str]] = []
+    group_spans: list[tuple[int, int]] = []
+    for grp_re in (_BRACKET_CIT_GROUP_RE, _PAREN_CIT_GROUP_RE):
+        for m in grp_re.finditer(text):
+            g_start, g_end = m.span()
+            group_spans.append((g_start, g_end))
+            for sub_m in _DELIMITED_PSEUDO_CHUNK_TOKEN_RE.finditer(m.group(0)):
+                found.append((g_start + sub_m.start(), sub_m.group(0)))
+
+    def _inside_group(pos: int) -> bool:
+        return any(s <= pos < e for s, e in group_spans)
+
+    for m in _PSEUDO_CHUNK_TOKEN_RE.finditer(text):
+        if not _inside_group(m.start()):
+            found.append((m.start(), m.group(0)))
+
+    found.sort(key=lambda item: item[0])
+    deduped: list[str] = []
+    for _, tok in found:
+        if tok not in deduped:
+            deduped.append(tok)
+    return deduped
+
 
 # Unconditional abstention patterns: explicit statements that the retrieved evidence is
 # insufficient to answer the question or that the question cannot be answered from the sources.
@@ -1759,10 +1815,14 @@ _UNCONDITIONAL_ABSTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:cannot|can't|unable\s+to)\s+"
-        r"(?:be\s+answered|answer(?:\s+this|\s+the)?(?:\s+question)?|determine|verify)\s+"
-        r"(?:from|using|based\s+on)\s+(?:the\s+)?(?:retrieved|indexed|provided)\s+"
-        r"(?:sources?|chunks?|passages?|context|documents?|abstracts?)\b",
+        r"\b(?:cannot|can't|can\s+not|unable\s+to)\s+"
+        r"(?:be\s+answered|answer(?:\s+this|\s+the)?(?:\s+question)?|determine|verify|confirm|conclude)\b"
+        r"[^.!?;]*\b(?:from|using|based\s+on|in)\s+(?:the\s+)?(?:retrieved|indexed|provided)\s+"
+        r"(?:sources?|chunks?|passages?|context|documents?|abstracts?|evidence)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\babstain(?:ing|ed)?\s+from\s+answering\b",
         re.IGNORECASE,
     ),
 )
@@ -1775,17 +1835,30 @@ _MISSING_DETAIL_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"\b(?:the\s+)?(?:(?:retrieved|indexed|provided)\s+)?"
         r"(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?|papers?|texts?|articles?)\s+"
         r"(?:do\s+not|don't|does\s+not|doesn't|cannot|can't|never)\s+"
-        r"(?:contain|provide|include|specify|mention|state|have|support|report|list|describe|give)\b",
+        r"(?:contain|provide|include|specify|mention|state|have|support|report|list|describe|give|cover|address|discuss)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:it|they|this|these)\s+"
+        r"(?:do\s+not|don't|does\s+not|doesn't)\s+"
+        r"(?:contain|provide|include|specify|mention|state|report|list|describe|give|cover|address|discuss)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:^\s*|\b(?:but|however|yet|and)\s+)"
+        r"(?:do\s+not|don't|does\s+not|doesn't)\s+"
+        r"(?:contain|provide|include|specify|mention|state|report|list|describe|give|cover|address|discuss)\b",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:there\s+is\s+no|there\s+are\s+no|no)\s+"
         r"(?:sufficient\s+)?(?:evidence|information|mention|details?|data|record)\s+"
+        r"(?:(?:is\s+|are\s+)?(?:provided|available|found|given|mentioned|included)\s+)?"
         r"(?:of|about|regarding|on|for|in|from|within)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:is|are)\s+not\s+(?:mentioned|specified|stated|provided|reported|included)\s+"
+        r"\b(?:is|are)\s+not\s+(?:mentioned|specified|stated|provided|reported|included|found|covered|addressed|discussed|described)\s+"
         r"in\s+(?:the\s+)?(?:(?:retrieved|indexed|provided)\s+)?"
         r"(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?|papers?|texts?)\b",
         re.IGNORECASE,
@@ -1793,11 +1866,15 @@ _MISSING_DETAIL_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _CONCESSIVE_OR_META_CLAUSE_START_RE = re.compile(
-    r"^\s*(?:while|although|even\s+though|though|whereas|despite|"
-    r"based\s+on\s+(?:the\s+)?(?:retrieved|indexed|provided)|"
-    r"according\s+to\s+(?:the\s+)?(?:retrieved|indexed|provided)|"
-    r"in\s+(?:the\s+)?(?:retrieved|indexed|provided)|"
-    r"the\s+(?:retrieved|indexed|provided)\s+(?:sources?|chunks?|passages?|abstracts?|documents?|excerpts?))\b",
+    r"^\s*(?:"
+    r"(?:while|although|even\s+though|though|whereas|despite)\b|"
+    r"based\s+on\s+(?:the\s+)?(?:retrieved|indexed|provided)\b|"
+    r"according\s+to\s+(?:the\s+)?(?:retrieved|indexed|provided)\b|"
+    r"in\s+(?:the\s+)?(?:(?:retrieved|indexed|provided)\s+)?(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?|papers?|texts?|articles?)\b|"
+    r"in\s*,|"
+    r"(?:the|this|these)\s+(?:(?:retrieved|indexed|provided)\s+)?(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?|papers?|texts?|articles?)\b|"
+    r"(?:only\s+)?(?:discusses?|describes?|mentions?|covers?|focuses\s+on|addresses?|notes?|states?|explains?)\b"
+    r")",
     re.IGNORECASE,
 )
 
@@ -1836,9 +1913,10 @@ def _sanitize_answer_citations(
        (e.g., `(also called reverse mode, chk_...)` or `(explanation [chk_...])`) have only
        invalid citation tokens removed while preserving surrounding explanatory text and
        balanced delimiters.
-    4. Malformed or uppercase `chk_...` pseudo-citation markers (e.g., `chk_123`,
-       `chk_DEADBEEF12345678`) are stripped without altering ordinary snake_case technical
-       identifiers such as `chk_sum` or `chk_flag`.
+    4. Malformed, uppercase, or overlong `chk_...` pseudo-citation markers (e.g., `[chk_123]`,
+       `chk_123`, `chk_DEADBEEF12345678`, `chk_<33+ hex>`) are stripped without altering
+       legitimate technical identifiers in prose such as `chk_v2`, `chk_step1`, `chk_deadbeef`,
+       `chk_sum`, or `chk_flag`.
     """
     valid_set = set(valid_chunk_ids)
     verified_ids = _extract_cited_chunk_ids_from_text(answer_text, valid_chunk_ids)
@@ -1851,14 +1929,14 @@ def _sanitize_answer_citations(
         return kept
 
     def _replace_bracket_group(match: re.Match[str]) -> str:
-        tokens = _PSEUDO_CHUNK_TOKEN_RE.findall(match.group(0))
+        tokens = _DELIMITED_PSEUDO_CHUNK_TOKEN_RE.findall(match.group(0))
         kept = _keep_valid_dedup(tokens)
         if not kept:
             return ""
         return " ".join(f"[{cid}]" for cid in kept)
 
     def _replace_paren_group(match: re.Match[str]) -> str:
-        tokens = _PSEUDO_CHUNK_TOKEN_RE.findall(match.group(0))
+        tokens = _DELIMITED_PSEUDO_CHUNK_TOKEN_RE.findall(match.group(0))
         kept = _keep_valid_dedup(tokens)
         if not kept:
             return ""
@@ -1869,7 +1947,8 @@ def _sanitize_answer_citations(
     cleaned = _BRACKET_CIT_GROUP_RE.sub(_replace_bracket_group, answer_text)
     cleaned = _PAREN_CIT_GROUP_RE.sub(_replace_paren_group, cleaned)
 
-    # Step 2: Sanitize any remaining bare `chk_...` tokens (such as those inside mixed prose parens).
+    # Step 2: Sanitize any remaining bare `chk_...` pseudo-citation tokens (such as those inside
+    # mixed prose parens or bare prose) while preserving ordinary technical identifiers.
     def _replace_bare_token(match: re.Match[str]) -> str:
         tok = match.group(0)
         return tok if (tok in valid_set and _CHUNK_ID_RE.fullmatch(tok)) else ""
@@ -1879,8 +1958,13 @@ def _sanitize_answer_citations(
     # Step 3: Clean up orphaned punctuation or empty delimiters left behind by token removal.
     cleaned = re.sub(r"(\(|\[)\s*[,;:]+\s*", r"\1", cleaned)
     cleaned = re.sub(r"\s*[,;:]+\s*(\)|\])", r"\1", cleaned)
-    cleaned = re.sub(r",\s*,+", ",", cleaned)
     cleaned = re.sub(r"\(\s*\)|\[\s*\]", "", cleaned)
+    cleaned = re.sub(r"([:;])\s*[,;]+", r"\1", cleaned)
+    cleaned = re.sub(r"(?:,\s*){2,}", ", ", cleaned)
+    cleaned = re.sub(r"(?:;\s*){2,}", "; ", cleaned)
+    cleaned = re.sub(r",\s*;", ";", cleaned)
+    cleaned = re.sub(r"\b(with|in|from|by|of|for|to)\s*[,;]+\s*", r"\1 ", cleaned)
+    cleaned = re.sub(r"[,;:]+\s*([.!?])", r"\1", cleaned)
     cleaned = re.sub(r"[ \t]+([.,;:!?])", r"\1", cleaned)
     cleaned = re.sub(r"(\(|\[)[ \t]+", r"\1", cleaned)
     cleaned = re.sub(r"[ \t]+(\)|\])", r"\1", cleaned)
@@ -1892,7 +1976,12 @@ def _sanitize_answer_citations(
 def _split_into_clauses(text: str) -> list[str]:
     """Split `text` into sentence and conjunction clauses for deterministic abstention analysis."""
     parts = re.split(
-        r"(?:[\n.!?;]+|,\s+(?=(?:but|however|while|although|though|whereas)\b)|\s+--\s+|\s+\u2014\s+)",
+        r"(?:"
+        r"[\n.!?;]+|"
+        r",\s+(?=(?:but|however|yet|while|although|though|whereas)\b|and\s+(?:(?:the|this|these|it|they|there|in|no)\b|\[chk_|chk_))|"
+        r"\s+(?:and|but|yet)\s+(?=(?:do\s+not|does\s+not|don't|doesn't|cannot|can't|can\s+not|unable\s+to)\b)|"
+        r"\s+--\s+|\s+\u2014\s+"
+        r")",
         text,
         flags=re.IGNORECASE,
     )
@@ -1916,6 +2005,7 @@ def _strip_citation_markers_for_analysis(text: str) -> str:
     """Remove bracketed, parenthesized, and bare chunk/pseudo-chunk citation markers for clause analysis."""
     cleaned = _BRACKET_CIT_GROUP_RE.sub(" ", text)
     cleaned = _PAREN_CIT_GROUP_RE.sub(" ", cleaned)
+    cleaned = _CHUNK_ID_RE.sub(" ", cleaned)
     cleaned = _PSEUDO_CHUNK_TOKEN_RE.sub(" ", cleaned)
     return " ".join(cleaned.strip().split())
 
@@ -1927,15 +2017,16 @@ def _is_generator_abstention(answer_text: str) -> bool:
     1. Empty or whitespace-only responses return `True` (abstain).
     2. Responses matching `_UNCONDITIONAL_ABSTENTION_PATTERNS` (e.g., stating that retrieved
        sources do not contain sufficient evidence to answer the question) return `True`.
-    3. Responses matching `_MISSING_DETAIL_PATTERNS` (e.g., noting that retrieved sources/abstracts
-       do not specify or mention a detail) are inspected at the clause level:
-       - If the response contains at least one independent, non-concessive clause with a valid
-         `chk_<16-hex>` citation that does NOT itself match any abstention/missing-detail pattern
-         (for example, a direct cited answer to the primary question followed by a secondary caveat),
-         return `False` so the valid cited answer is preserved.
-       - Otherwise (including when a retrieved chunk is cited only in a concessive or meta-source
-         clause to explain what the source contains before stating the requested fact is absent),
-         return `True` (abstain).
+    3. Responses matching `_MISSING_DETAIL_PATTERNS` (e.g., noting that retrieved sources/abstracts/
+       chunks or pronoun/chunk-subject references do not specify or mention a detail) are inspected
+       at the clause level:
+       - If the response contains at least one independent, non-concessive, non-meta clause with a
+         valid `chk_<16-hex>` citation that does NOT itself match any abstention/missing-detail
+         pattern (for example, a direct cited answer to the primary question followed by a secondary
+         caveat), return `False` so the valid cited answer is preserved.
+       - Otherwise (including when a retrieved chunk is cited only in a concessive, prepositional,
+         or meta-source clause to explain what the source discusses before stating the requested fact
+         is absent), return `True` (abstain).
 
     Note on limitations:
     This classifier is a deterministic lexical/clause heuristic for offline and runtime safety.
@@ -4046,6 +4137,9 @@ class RAGEvalCaseResult:
     citation_metadata_resolved: bool
     required_concept_recall: float | None
     lexical_claim_groundedness_proxy: float | None
+    post_sanitization_citation_precision: float | None = None
+    raw_generator_fabricated_citation_count: int = 0
+    post_sanitization_fabricated_citation_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -4075,10 +4169,19 @@ class RAGEvalCaseResult:
             "citation_precision": (
                 round(self.citation_precision, 4) if self.citation_precision is not None else None
             ),
+            "post_sanitization_citation_precision": (
+                round(self.post_sanitization_citation_precision, 4)
+                if self.post_sanitization_citation_precision is not None
+                else None
+            ),
             "citation_recall": (
                 round(self.citation_recall, 4) if self.citation_recall is not None else None
             ),
             "fabricated_citation_count": self.fabricated_citation_count,
+            "raw_generator_fabricated_citation_count": self.raw_generator_fabricated_citation_count,
+            "post_sanitization_fabricated_citation_count": (
+                self.post_sanitization_fabricated_citation_count
+            ),
             "citation_metadata_resolved": self.citation_metadata_resolved,
             "required_concept_recall": (
                 round(self.required_concept_recall, 4)
@@ -4117,6 +4220,9 @@ class RAGEvalSummary:
     abstention_recall: float
     lexical_claim_groundedness_proxy: float
     case_results: list[RAGEvalCaseResult]
+    post_sanitization_citation_precision: float = 0.0
+    raw_generator_fabricated_citation_rate: float = 0.0
+    post_sanitization_fabricated_citation_rate: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -4135,8 +4241,17 @@ class RAGEvalSummary:
                     self.negative_control_empty_retrieval_rate, 4
                 ),
                 "citation_precision": round(self.citation_precision, 4),
+                "post_sanitization_citation_precision": round(
+                    self.post_sanitization_citation_precision, 4
+                ),
                 "citation_recall": round(self.citation_recall, 4),
                 "fabricated_citation_rate": round(self.fabricated_citation_rate, 4),
+                "raw_generator_fabricated_citation_rate": round(
+                    self.raw_generator_fabricated_citation_rate, 4
+                ),
+                "post_sanitization_fabricated_citation_rate": round(
+                    self.post_sanitization_fabricated_citation_rate, 4
+                ),
                 "citation_metadata_resolution_accuracy": round(
                     self.citation_metadata_resolution_accuracy, 4
                 ),
@@ -4164,7 +4279,7 @@ def compute_lexical_claim_groundedness_proxy(
     """
     if not answer_text or not answer_text.strip() or not cited_chunks:
         return 0.0
-    stripped_answer = _PSEUDO_CHUNK_TOKEN_RE.sub("", answer_text)
+    stripped_answer = _strip_citation_markers_for_analysis(answer_text)
     answer_stems = extract_stemmed_content_set(stripped_answer)
     if not answer_stems:
         return 0.0
@@ -4253,6 +4368,7 @@ class _FixtureEvalGenerationProvider:
 
     def __init__(self, response_text: str) -> None:
         self._response_text = response_text
+        self.was_called: bool = False
 
     @property
     def provider_name(self) -> str:
@@ -4266,6 +4382,7 @@ class _FixtureEvalGenerationProvider:
         return True
 
     def generate_grounded_answer(self, prompt_input: RAGPromptInput) -> GeneratedAnswerPayload:
+        self.was_called = True
         valid_ids = [c.chunk_id for c in prompt_input.retrieved_chunks]
         cleaned_text, cited_ids = _sanitize_answer_citations(self._response_text, valid_ids)
         return GeneratedAnswerPayload(
@@ -4336,17 +4453,33 @@ def run_offline_rag_evaluation(
 ) -> RAGEvalSummary:
     """Run the deterministic offline RAG evaluation benchmark in an isolated SQLite + Chroma store.
 
-    Metric denominators and zero-denominator defaults:
+    Metric denominators, zero-denominator defaults, and raw vs. post-sanitization citation semantics:
     - `resource_hit_rate_at_k`: mean over cases with non-empty `expected_resource_ids` (`0.0` if none).
     - `chunk_recall_at_k` and `mrr_at_k`: mean over cases with non-empty `expected_chunk_ids` (`0.0` if none).
     - `negative_control_empty_retrieval_rate`: fraction of cases with empty expected retrieval targets
       (`not expected_resource_ids and not expected_chunk_ids`) that retrieve zero chunks (`1.0` if no
       empty-target negative-control cases exist in the dataset).
-    - `citation_precision`: mean over answerable cases (`not expected_abstain`; `0.0` if none).
+    - `citation_precision` (generator-inclusive): mean over answerable cases (`not expected_abstain`;
+      `0.0` if none) of `len(relevant_cited) / len(candidate_cids)`, where `candidate_cids` is the
+      deduplicated union of post-sanitization `resp.citations` (`cited_chk_ids`) and raw generator
+      citation tokens (`raw_cids` from `mock_generator_response` when the generator is invoked).
+      This penalizes raw-generator citation hallucinations even when the sanitizer strips them.
+    - `post_sanitization_citation_precision`: mean over answerable cases (`not expected_abstain`;
+      `0.0` if none) of `len([c for c in cited_chk_ids if c in expected_chunk_ids]) / len(cited_chk_ids)`
+      (`0.0` when `cited_chk_ids` is empty), measuring precision strictly over surviving post-sanitization
+      `resp.citations`.
     - `citation_recall`: mean over answerable cases with non-empty `expected_chunk_ids` (`0.0` if none).
-    - `fabricated_citation_rate`: `total_fabricated_citations / total_citations_emitted` across all
-      unique citation tokens emitted in `resp.citations`, `generated_answer.cited_chunk_ids`, and
-      `generated_answer.answer_text` (`0.0` when `total_citations_emitted == 0`).
+    - `fabricated_citation_rate` (combined raw + post-sanitization): `total_fabricated_citations / total_citations_emitted`
+      across the deduplicated union of citation-like tokens in raw generator output (when called) and
+      post-sanitization `resp.citations`, `generated_answer.cited_chunk_ids`, and `generated_answer.answer_text`
+      (`0.0` when `total_citations_emitted == 0`). Legitimate technical identifiers (`chk_v2`, `chk_step1`,
+      `chk_deadbeef`, `chk_sum`, `chk_flag`) are excluded via `_extract_all_citation_like_tokens`.
+    - `raw_generator_fabricated_citation_rate`: `total_raw_fabricated_citations / total_raw_citations_emitted`
+      strictly over citation-like tokens in `mock_generator_response` for cases where the generator is invoked
+      (`0.0` when `total_raw_citations_emitted == 0`).
+    - `post_sanitization_fabricated_citation_rate`: `total_post_sanitization_fabricated_citations / total_post_sanitization_citations_emitted`
+      strictly over citation-like tokens remaining in `resp.citations`, `generated_answer.cited_chunk_ids`, and
+      `generated_answer.answer_text` after sanitization (`0.0` when `total_post_sanitization_citations_emitted == 0`).
     - `citation_metadata_resolution_accuracy`: `total_resolved_citations / total_structured_citations`
       across all `SourceCitation` records in `resp.citations` (`1.0` when `total_structured_citations == 0`).
     - `required_concept_recall`: mean over answerable cases with non-empty `required_concepts` (`0.0` if none).
@@ -4386,12 +4519,17 @@ def run_offline_rag_evaluation(
             reciprocal_ranks: list[float] = []
             negative_control_empty_hits: list[float] = []
             citation_precisions: list[float] = []
+            post_sanitization_citation_precisions: list[float] = []
             citation_recalls: list[float] = []
             concept_recalls: list[float] = []
             groundedness_proxies: list[float] = []
 
             total_citations_emitted = 0
             total_fabricated_citations = 0
+            total_raw_citations_emitted = 0
+            total_raw_fabricated_citations = 0
+            total_post_san_citations_emitted = 0
+            total_post_san_fabricated_citations = 0
             total_structured_citations = 0
             total_resolved_citations = 0
 
@@ -4470,11 +4608,15 @@ def run_offline_rag_evaluation(
                 if not expected_res_ids and not expected_chk_ids:
                     negative_control_empty_hits.append(1.0 if not retrieved_chk_ids else 0.0)
 
-                # Fabricated citation check across generator output, citations, cited_chunk_ids, and answer_text
+                # Fabricated citation check separated into raw-generator, post-sanitization, and combined
                 retrieved_set = set(retrieved_chk_ids)
-                raw_cids = _PSEUDO_CHUNK_TOKEN_RE.findall(mock_text)
+                raw_cids = (
+                    _extract_all_citation_like_tokens(mock_text)
+                    if gen_provider.was_called
+                    else []
+                )
                 text_cids = (
-                    _PSEUDO_CHUNK_TOKEN_RE.findall(resp.generated_answer.answer_text)
+                    _extract_all_citation_like_tokens(resp.generated_answer.answer_text)
                     if resp.generated_answer is not None
                     else []
                 )
@@ -4483,14 +4625,28 @@ def run_offline_rag_evaluation(
                     if resp.generated_answer is not None
                     else []
                 )
+                post_san_cids = list(
+                    dict.fromkeys([*cited_chk_ids, *ans_cids, *text_cids])
+                )
                 all_emitted_cids = list(
-                    dict.fromkeys([*raw_cids, *cited_chk_ids, *ans_cids, *text_cids])
+                    dict.fromkeys([*raw_cids, *post_san_cids])
+                )
+
+                def _is_fabricated_token(cid: str) -> bool:
+                    return cid not in retrieved_set or not _CHUNK_ID_RE.fullmatch(cid)
+
+                raw_fab_count = sum(1 for cid in raw_cids if _is_fabricated_token(cid))
+                post_san_fab_count = sum(
+                    1 for cid in post_san_cids if _is_fabricated_token(cid)
                 )
                 fab_count = sum(
-                    1
-                    for cid in all_emitted_cids
-                    if cid not in retrieved_set or not _CHUNK_ID_RE.fullmatch(cid)
+                    1 for cid in all_emitted_cids if _is_fabricated_token(cid)
                 )
+
+                total_raw_citations_emitted += len(raw_cids)
+                total_raw_fabricated_citations += raw_fab_count
+                total_post_san_citations_emitted += len(post_san_cids)
+                total_post_san_fabricated_citations += post_san_fab_count
                 total_citations_emitted += len(all_emitted_cids)
                 total_fabricated_citations += fab_count
 
@@ -4505,6 +4661,7 @@ def run_offline_rag_evaluation(
 
                 # Answer & citation quality metrics on answerable cases
                 cit_prec: float | None = None
+                post_san_cit_prec: float | None = None
                 cit_rec: float | None = None
                 concept_rec: float | None = None
                 ground_proxy: float | None = None
@@ -4522,6 +4679,15 @@ def run_offline_rag_evaluation(
                     else:
                         cit_prec = 0.0
                     citation_precisions.append(cit_prec)
+
+                    if cited_chk_ids:
+                        relevant_post_san = [
+                            cid for cid in cited_chk_ids if cid in expected_chk_set
+                        ]
+                        post_san_cit_prec = len(relevant_post_san) / len(cited_chk_ids)
+                    else:
+                        post_san_cit_prec = 0.0
+                    post_sanitization_citation_precisions.append(post_san_cit_prec)
 
                     if expected_chk_ids:
                         recalled_cited = [
@@ -4577,6 +4743,9 @@ def run_offline_rag_evaluation(
                         citation_metadata_resolved=case_meta_ok,
                         required_concept_recall=concept_rec,
                         lexical_claim_groundedness_proxy=ground_proxy,
+                        post_sanitization_citation_precision=post_san_cit_prec,
+                        raw_generator_fabricated_citation_count=raw_fab_count,
+                        post_sanitization_fabricated_citation_count=post_san_fab_count,
                     )
                 )
 
@@ -4589,10 +4758,23 @@ def run_offline_rag_evaluation(
                 else 1.0
             )
             avg_cit_prec = sum(citation_precisions) / max(len(citation_precisions), 1)
+            avg_post_san_cit_prec = sum(post_sanitization_citation_precisions) / max(
+                len(post_sanitization_citation_precisions), 1
+            )
             avg_cit_rec = sum(citation_recalls) / max(len(citation_recalls), 1)
             fab_rate = (
                 total_fabricated_citations / total_citations_emitted
                 if total_citations_emitted > 0
+                else 0.0
+            )
+            raw_fab_rate = (
+                total_raw_fabricated_citations / total_raw_citations_emitted
+                if total_raw_citations_emitted > 0
+                else 0.0
+            )
+            post_san_fab_rate = (
+                total_post_san_fabricated_citations / total_post_san_citations_emitted
+                if total_post_san_citations_emitted > 0
                 else 0.0
             )
             meta_acc = (
@@ -4634,6 +4816,9 @@ def run_offline_rag_evaluation(
                 abstention_recall=abst_rec,
                 lexical_claim_groundedness_proxy=avg_ground_proxy,
                 case_results=case_results,
+                post_sanitization_citation_precision=avg_post_san_cit_prec,
+                raw_generator_fabricated_citation_rate=raw_fab_rate,
+                post_sanitization_fabricated_citation_rate=post_san_fab_rate,
             )
         finally:
             store.close()

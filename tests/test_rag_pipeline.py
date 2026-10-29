@@ -1703,6 +1703,46 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
         self.assertEqual(f01_f05_resp.generated_answer.cited_chunk_ids, [valid_wiki_cid])
         self.assertEqual([c.chunk_id for c in f01_f05_resp.citations], [valid_wiki_cid])
 
+        # (7) Task 033F M-01 regression checks: preserve legitimate technical identifiers
+        #     (chk_v2, chk_step1, chk_deadbeef, chk_sum, chk_flag) alongside valid citations,
+        #     strip overlong (33+ hex) bare and bracketed pseudo-citations, and clean up
+        #     adjacent punctuation without leaving `,,` or `:;`.
+        san_text_6, san_ids_6 = rag_module._sanitize_answer_citations(
+            f"The routine updates chk_v2, chk_step1, and chk_deadbeef during validation [{valid_wiki_cid}].",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_6,
+            f"The routine updates chk_v2, chk_step1, and chk_deadbeef during validation [{valid_wiki_cid}].",
+        )
+        self.assertEqual(san_ids_6, [valid_wiki_cid])
+
+        san_text_7, san_ids_7 = rag_module._sanitize_answer_citations(
+            f"Overlong tokens chk_0123456789abcdef0123456789abcdef0 and "
+            f"[chk_0123456789abcdef0123456789abcdef012345] are removed [{valid_wiki_cid}].",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_7,
+            f"Overlong tokens and are removed [{valid_wiki_cid}].",
+        )
+        self.assertEqual(san_ids_7, [valid_wiki_cid])
+        self.assertNotIn("0123456789abcdef0123456789abcdef", san_text_7)
+
+        san_text_8, san_ids_8 = rag_module._sanitize_answer_citations(
+            f"Backpropagation computes gradients (see: [chk_123]; [{valid_wiki_cid}]) "
+            f"with [chk_123], [{valid_wiki_cid}], and [chk_99999].",
+            [valid_wiki_cid],
+        )
+        self.assertEqual(
+            san_text_8,
+            f"Backpropagation computes gradients (see: [{valid_wiki_cid}]) "
+            f"with [{valid_wiki_cid}], and.",
+        )
+        self.assertNotIn(":;", san_text_8)
+        self.assertNotIn(",,", san_text_8)
+        self.assertEqual(san_ids_8, [valid_wiki_cid])
+
     def test_16_task033_post_retrieval_and_pre_retrieval_abstention(self) -> None:
         """Verify Task 033 Phase 3 pre-retrieval and post-retrieval abstention and non-rejection of valid answers."""
         seeded = self._seed_sample_resources()
@@ -1765,7 +1805,7 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
 
         # 2. Post-retrieval abstention: partial-evidence query where chunks are retrieved above threshold,
         #    and generator explicitly reports insufficient evidence (even if referencing the chunk ID,
-        #    including Task 033D F-02 false-negative examples).
+        #    including Task 033D F-02 and Task 033F M-02 false-negative examples).
         for abstention_msg in (
             "The retrieved sources do not contain sufficient evidence to answer what exact learning rate or mini-batch size was used.",
             f"The retrieved chunks [{valid_arxiv_cid}] do not specify the exact GPU model or learning rate schedule.",
@@ -1774,6 +1814,12 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
             f"While [{valid_arxiv_cid}] describes dropout on feedforward networks, the abstract does not mention the exact learning rate or mini-batch size.",
             f"Based on the retrieved chunks [{valid_arxiv_cid}], there is no mention of the Adam warmup schedule.",
             f"The retrieved chunk [{valid_arxiv_cid}] describes dropout regularization, but the sources do not specify the weight decay.",
+            f"[{valid_arxiv_cid}] discusses competitive programming, but does not mention the training GPU budget.",
+            f"In [{valid_arxiv_cid}], AlphaCode's architecture is described, yet it does not specify the GPU training hours.",
+            f"The retrieved chunk [{valid_arxiv_cid}] discusses competitive programming, and [{valid_arxiv_cid}] does not mention the training GPU budget.",
+            f"The provided chunks [{valid_arxiv_cid}] only discuss code generation and do not specify the carbon footprint.",
+            f"Although [{valid_arxiv_cid}] mentions sampling, there is no information provided about the optimizer's beta2 value.",
+            f"In [{valid_arxiv_cid}], the passage focuses on execution-based filtering; however, I cannot determine the exact dataset license from the provided context.",
         ):
             abst_provider = OpenAIGenerationProvider(
                 api_key="sk-test-openai",
@@ -1800,13 +1846,15 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
 
         # 3. Valid grounded answers containing words like "evidence", "insufficient", or "cannot"
         #    in domain explanations OR including a secondary limitation caveat alongside a cited
-        #    primary answer (Task 033D F-02 false-positive examples) must NOT be falsely rejected.
+        #    primary answer (Task 033D F-02 and Task 033F M-02 false-positive examples) must NOT be falsely rejected.
         for valid_domain_msg in (
             f"Empirical evidence shows that random dropout prevents complex co-adaptations of feature detectors [{valid_arxiv_cid}].",
             f"Training without regularization is insufficient to prevent overfitting on small datasets, whereas dropout reduces overfitting [{valid_arxiv_cid}].",
             f"Co-adapted feature detectors cannot generalize well alone without dropout regularization [{valid_arxiv_cid}].",
             f"Random dropout prevents complex co-adaptations of feature detectors [{valid_arxiv_cid}]. However, the retrieved sources do not specify the exact hardware used.",
             f"Although the retrieved sources do not specify second-order Hessian approximations, random dropout reduces overfitting by omitting half of the feature detectors [{valid_arxiv_cid}].",
+            f"Random dropout prevents co-adaptation [{valid_arxiv_cid}], though the exact parameter count of the smallest variant is not mentioned in the provided context.",
+            f"Random dropout reduces overfitting [{valid_arxiv_cid}], but the provided context does not specify the hyperparameter beta used in the experiment.",
         ):
             valid_provider = OpenAIGenerationProvider(
                 api_key="sk-test-openai",
@@ -1877,10 +1925,13 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
             1.0,
         )
 
-        # Citation integrity metrics
+        # Citation integrity metrics (including Task 033F M-03 raw vs. post-sanitization split)
         self.assertEqual(summary.citation_precision, 1.0)
+        self.assertEqual(summary.post_sanitization_citation_precision, 1.0)
         self.assertEqual(summary.citation_recall, 1.0)
         self.assertEqual(summary.fabricated_citation_rate, 0.0)
+        self.assertEqual(summary.raw_generator_fabricated_citation_rate, 0.0)
+        self.assertEqual(summary.post_sanitization_fabricated_citation_rate, 0.0)
         self.assertEqual(summary.citation_metadata_resolution_accuracy, 1.0)
 
         # Answer & abstention metrics
@@ -2036,14 +2087,44 @@ class TestRAGPipelineAndArchitecture(unittest.TestCase):
         assert sum_omitted_concept.case_results[0].required_concept_recall is not None
         self.assertLess(sum_omitted_concept.case_results[0].required_concept_recall, 1.0)
 
-        # (c) Fabricated or invalid citation -> fabricated_citation_rate > 0.0 and citation_precision < 1.0
+        # (c) Fabricated or invalid citation -> fabricated_citation_rate > 0.0,
+        #     raw_generator_fabricated_citation_rate > 0.0, citation_precision < 1.0,
+        #     while post_sanitization_fabricated_citation_rate == 0.0 and
+        #     post_sanitization_citation_precision == 1.0 (because sanitizer stripped the invalid tokens).
         def _mutate_fabricated_citation(d: dict[str, Any]) -> None:
             d["cases"][0]["mock_generator_response"] += " [chk_deadbeef12345678] [chk_123]"
 
         sum_fab_cit = _run_perturbed("fabricated_citation", _mutate_fabricated_citation)
         self.assertGreater(sum_fab_cit.fabricated_citation_rate, 0.0)
+        self.assertGreater(sum_fab_cit.raw_generator_fabricated_citation_rate, 0.0)
+        self.assertEqual(sum_fab_cit.post_sanitization_fabricated_citation_rate, 0.0)
         self.assertLess(sum_fab_cit.citation_precision, 1.0)
+        self.assertEqual(sum_fab_cit.post_sanitization_citation_precision, 1.0)
         self.assertGreaterEqual(sum_fab_cit.case_results[0].fabricated_citation_count, 2)
+        self.assertGreaterEqual(
+            sum_fab_cit.case_results[0].raw_generator_fabricated_citation_count, 2
+        )
+        self.assertEqual(
+            sum_fab_cit.case_results[0].post_sanitization_fabricated_citation_count, 0
+        )
+
+        # (c2) Task 033F M-01 & M-03: Legitimate technical identifiers (chk_v2, chk_step1, chk_deadbeef)
+        #      in mock_generator_response must NOT be counted as fabricated citations or reduce precision,
+        #      and uncalled mock_generator_response on pre-retrieval abstentions must NOT be counted.
+        def _mutate_tech_ids_and_pre_abstention_mock(d: dict[str, Any]) -> None:
+            d["cases"][0]["mock_generator_response"] += " using chk_v2, chk_step1, and chk_deadbeef."
+            for c in d["cases"]:
+                if c["case_id"] == "eval_12_ood_sourdough_fermentation":
+                    c["mock_generator_response"] = "Should never be called [chk_deadbeef12345678]."
+
+        sum_tech_ids = _run_perturbed(
+            "tech_ids_and_pre_abstention", _mutate_tech_ids_and_pre_abstention_mock
+        )
+        self.assertEqual(sum_tech_ids.fabricated_citation_rate, 0.0)
+        self.assertEqual(sum_tech_ids.raw_generator_fabricated_citation_rate, 0.0)
+        self.assertEqual(sum_tech_ids.post_sanitization_fabricated_citation_rate, 0.0)
+        self.assertEqual(sum_tech_ids.citation_precision, 1.0)
+        self.assertEqual(sum_tech_ids.post_sanitization_citation_precision, 1.0)
 
         # (d1) Incorrect abstention on an answerable case -> abstention_precision < 1.0
         def _mutate_false_abstention(d: dict[str, Any]) -> None:
