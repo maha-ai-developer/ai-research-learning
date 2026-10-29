@@ -1718,18 +1718,111 @@ def build_grounded_rag_prompt(prompt_input: RAGPromptInput) -> tuple[str, str]:
     return system_prompt, user_prompt
 
 
+_CHUNK_ID_RE = re.compile(r"chk_[0-9a-f]{16}")
+
+_ABSTENTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:the\s+)?(?:retrieved|indexed|provided)\s+"
+        r"(?:sources?|chunks?|passages?|context|documents?|excerpts?|abstracts?)\s+"
+        r"(?:do\s+not|don't|does\s+not|doesn't|cannot|can't)\s+"
+        r"(?:contain|provide|include|specify|mention|state|have|support)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:not\s+enough|insufficient|no\s+sufficient|lack(?:s|ing)?(?:\s+sufficient)?)\s+"
+        r"(?:evidence|information|context|details?|data)\s+"
+        r"(?:in|from|within|across)\s+(?:the\s+)?(?:retrieved|indexed|provided)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:there\s+is\s+no|there\s+are\s+no)\s+"
+        r"(?:sufficient\s+)?(?:evidence|information|mention)\s+"
+        r"(?:in|from|within)\s+(?:the\s+)?(?:retrieved|indexed|provided)\s+"
+        r"(?:sources?|chunks?|passages?|context|documents?|abstracts?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:cannot|can't|unable\s+to)\s+"
+        r"(?:be\s+answered|answer(?:\s+this|\s+the)?(?:\s+question)?|determine|verify)\s+"
+        r"(?:from|using|based\s+on)\s+(?:the\s+)?(?:retrieved|indexed|provided)\s+"
+        r"(?:sources?|chunks?|passages?|context|documents?|abstracts?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*insufficient[\s_]+evidence\b",
+        re.IGNORECASE,
+    ),
+)
+
+
 def _extract_cited_chunk_ids_from_text(
     answer_text: str,
     valid_chunk_ids: Sequence[str],
 ) -> list[str]:
     """Extract cited `chk_...` identifiers from `answer_text` and filter to valid retrieved IDs."""
     valid_set = set(valid_chunk_ids)
-    mentioned = re.findall(r"chk_[0-9a-f]{16}", answer_text)
+    mentioned = _CHUNK_ID_RE.findall(answer_text)
     verified: list[str] = []
     for cid in mentioned:
         if cid in valid_set and cid not in verified:
             verified.append(cid)
     return verified
+
+
+def _sanitize_answer_citations(
+    answer_text: str,
+    valid_chunk_ids: Sequence[str],
+) -> tuple[str, list[str]]:
+    """Strip fabricated `chk_<16-hex>` markers from `answer_text` and return `(cleaned_text, verified_ids)`.
+
+    Only chunk IDs present in `valid_chunk_ids` (the retrieved chunks for the query)
+    are preserved in both the rendered answer text and the returned `cited_chunk_ids` list.
+    """
+    valid_set = set(valid_chunk_ids)
+    verified_ids = _extract_cited_chunk_ids_from_text(answer_text, valid_chunk_ids)
+
+    def _replace_group(match: re.Match[str]) -> str:
+        open_ch = match.group(1)
+        inner = match.group(2)
+        close_ch = match.group(3)
+        cids = _CHUNK_ID_RE.findall(inner)
+        if not cids:
+            return match.group(0)
+        kept = [cid for cid in cids if cid in valid_set]
+        if not kept:
+            return ""
+        dedup_kept: list[str] = []
+        for cid in kept:
+            if cid not in dedup_kept:
+                dedup_kept.append(cid)
+        if open_ch == "[" and close_ch == "]":
+            return " ".join(f"[{cid}]" for cid in dedup_kept)
+        return f"{open_ch}{', '.join(dedup_kept)}{close_ch}"
+
+    cleaned = re.sub(
+        r"(\[|\()([^\]\)\n]*chk_[0-9a-f]{16}[^\]\)\n]*)(\]|\))",
+        _replace_group,
+        answer_text,
+    )
+
+    def _replace_bare(match: re.Match[str]) -> str:
+        cid = match.group(0)
+        return cid if cid in valid_set else ""
+
+    cleaned = _CHUNK_ID_RE.sub(_replace_bare, cleaned)
+    cleaned = re.sub(r"[ \t]+([.,;:!?])", r"\1", cleaned)
+    lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in cleaned.split("\n")]
+    cleaned = "\n".join(lines).strip()
+    return cleaned, verified_ids
+
+
+def _is_generator_abstention(answer_text: str) -> bool:
+    """Return True when the generator explicitly states that retrieved sources lack sufficient evidence."""
+    if not answer_text or not answer_text.strip():
+        return True
+    without_cids = re.sub(r"[\[\(]?\bchk_[0-9a-f]{16}\b[\]\)]?", " ", answer_text)
+    normalized = " ".join(without_cids.strip().split())
+    return any(pattern.search(normalized) for pattern in _ABSTENTION_PATTERNS)
 
 
 class RetrievalOnlyFallbackGenerationProvider:
@@ -1811,10 +1904,10 @@ class OpenAIGenerationProvider:
             raise RuntimeError("OpenAI chat completion returned no choices.")
         content = str(choices[0].get("message", {}).get("content", "")).strip()
         valid_ids = [c.chunk_id for c in prompt_input.retrieved_chunks]
-        cited_ids = _extract_cited_chunk_ids_from_text(content, valid_ids)
+        cleaned_text, cited_ids = _sanitize_answer_citations(content, valid_ids)
         return GeneratedAnswerPayload(
-            answer_text=content,
-            cited_chunk_ids=cited_ids or valid_ids[:1],
+            answer_text=cleaned_text,
+            cited_chunk_ids=cited_ids,
             provider_name=self.provider_name,
             model_name=self.model_name,
         )
@@ -1870,10 +1963,10 @@ class AnthropicGenerationProvider:
         text_parts = [str(b.get("text", "")) for b in blocks if b.get("type") == "text"]
         content = "\n".join(text_parts).strip()
         valid_ids = [c.chunk_id for c in prompt_input.retrieved_chunks]
-        cited_ids = _extract_cited_chunk_ids_from_text(content, valid_ids)
+        cleaned_text, cited_ids = _sanitize_answer_citations(content, valid_ids)
         return GeneratedAnswerPayload(
-            answer_text=content,
-            cited_chunk_ids=cited_ids or valid_ids[:1],
+            answer_text=cleaned_text,
+            cited_chunk_ids=cited_ids,
             provider_name=self.provider_name,
             model_name=self.model_name,
         )
@@ -2013,10 +2106,10 @@ class GeminiGenerationProvider:
         else:
             content = "\n".join(str(p.get("text", "")) for p in parts if isinstance(p, dict)).strip()
         valid_ids = [c.chunk_id for c in prompt_input.retrieved_chunks]
-        cited_ids = _extract_cited_chunk_ids_from_text(content, valid_ids)
+        cleaned_text, cited_ids = _sanitize_answer_citations(content, valid_ids)
         return GeneratedAnswerPayload(
-            answer_text=content,
-            cited_chunk_ids=cited_ids or valid_ids[:1],
+            answer_text=cleaned_text,
+            cited_chunk_ids=cited_ids,
             provider_name=self.provider_name,
             model_name=self.model_name,
         )
@@ -2872,14 +2965,54 @@ class LocalRAGPipeline:
                 provider_summary=provider_summary,
             )
 
-        # Verify citations against retrieved chunks (never allow fabricated chunk_ids)
-        verified_ids = [cid for cid in payload.cited_chunk_ids if cid in by_chunk_id]
+        # Sanitize answer text and verify citations against retrieved chunks (never allow fabricated chunk_ids)
+        valid_chunk_ids = [c.chunk_id for c in retrieved]
+        cleaned_answer_text, text_cited_ids = _sanitize_answer_citations(
+            payload.answer_text, valid_chunk_ids
+        )
+        verified_ids: list[str] = []
+        for cid in [*payload.cited_chunk_ids, *text_cited_ids]:
+            if cid in by_chunk_id and cid not in verified_ids:
+                verified_ids.append(cid)
+
+        # Post-retrieval abstention: generator explicitly states evidence is insufficient,
+        # or produced no valid citations for an answer that requires cited evidence.
+        if _is_generator_abstention(cleaned_answer_text):
+            return RAGResponse(
+                question=question,
+                status="insufficient_evidence",
+                sufficient_evidence=False,
+                retrieved_chunks=retrieved,
+                citations=[],
+                generated_answer=None,
+                insufficient_evidence_reason=(
+                    "Retrieved source chunks were inspected, but they do not contain "
+                    "sufficient evidence to answer the specific question."
+                ),
+                fallback_reason=None,
+                provider_summary=provider_summary,
+            )
+
         if not verified_ids:
-            verified_ids = [retrieved[0].chunk_id]
+            return RAGResponse(
+                question=question,
+                status="insufficient_evidence",
+                sufficient_evidence=False,
+                retrieved_chunks=retrieved,
+                citations=[],
+                generated_answer=None,
+                insufficient_evidence_reason=(
+                    "Generated response did not include any valid citations to the retrieved "
+                    "source chunks; abstaining to preserve citation integrity."
+                ),
+                fallback_reason=None,
+                provider_summary=provider_summary,
+            )
+
         citations = _build_citations(verified_ids)
 
         generated = GeneratedAnswer(
-            answer_text=payload.answer_text,
+            answer_text=cleaned_answer_text,
             provider_name=payload.provider_name,
             model_name=payload.model_name,
             cited_chunk_ids=verified_ids,
@@ -3738,6 +3871,593 @@ def main(
         safe_msg = redact_secrets(str(exc), known_secrets)
         err_stream.write(f"ERROR [{type(exc).__name__}]: {safe_msg}\n")
         return 1
+
+
+# ---------------------------------------------------------------------------
+# Offline RAG Evaluation Harness (Task 033)
+# ---------------------------------------------------------------------------
+
+DEFAULT_RAG_EVAL_DATASET_PATH = REPO_ROOT / "tests" / "fixtures" / "rag_eval_dataset_v1.json"
+
+
+@dataclass(frozen=True)
+class RAGEvalCaseResult:
+    """Per-case evaluation metrics for the offline RAG benchmark harness."""
+
+    case_id: str
+    category: str
+    question: str
+    expected_status: str
+    actual_status: str
+    expected_abstain: bool
+    actual_abstain: bool
+    expected_resource_ids: list[str]
+    retrieved_resource_ids: list[str]
+    expected_chunk_ids: list[str]
+    retrieved_chunk_ids: list[str]
+    cited_chunk_ids: list[str]
+    resource_hit_at_k: float | None
+    chunk_recall_at_k: float | None
+    reciprocal_rank_at_k: float | None
+    citation_precision: float | None
+    citation_recall: float | None
+    fabricated_citation_count: int
+    citation_metadata_resolved: bool
+    required_concept_recall: float | None
+    lexical_claim_groundedness_proxy: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "case_id": self.case_id,
+            "category": self.category,
+            "question": self.question,
+            "expected_status": self.expected_status,
+            "actual_status": self.actual_status,
+            "expected_abstain": self.expected_abstain,
+            "actual_abstain": self.actual_abstain,
+            "expected_resource_ids": list(self.expected_resource_ids),
+            "retrieved_resource_ids": list(self.retrieved_resource_ids),
+            "expected_chunk_ids": list(self.expected_chunk_ids),
+            "retrieved_chunk_ids": list(self.retrieved_chunk_ids),
+            "cited_chunk_ids": list(self.cited_chunk_ids),
+            "resource_hit_at_k": (
+                round(self.resource_hit_at_k, 4) if self.resource_hit_at_k is not None else None
+            ),
+            "chunk_recall_at_k": (
+                round(self.chunk_recall_at_k, 4) if self.chunk_recall_at_k is not None else None
+            ),
+            "reciprocal_rank_at_k": (
+                round(self.reciprocal_rank_at_k, 4)
+                if self.reciprocal_rank_at_k is not None
+                else None
+            ),
+            "citation_precision": (
+                round(self.citation_precision, 4) if self.citation_precision is not None else None
+            ),
+            "citation_recall": (
+                round(self.citation_recall, 4) if self.citation_recall is not None else None
+            ),
+            "fabricated_citation_count": self.fabricated_citation_count,
+            "citation_metadata_resolved": self.citation_metadata_resolved,
+            "required_concept_recall": (
+                round(self.required_concept_recall, 4)
+                if self.required_concept_recall is not None
+                else None
+            ),
+            "lexical_claim_groundedness_proxy": (
+                round(self.lexical_claim_groundedness_proxy, 4)
+                if self.lexical_claim_groundedness_proxy is not None
+                else None
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class RAGEvalSummary:
+    """Aggregate benchmark summary for offline RAG evaluation."""
+
+    dataset_version: str
+    task_id: str
+    total_cases: int
+    answerable_cases: int
+    abstention_cases: int
+    indexed_resource_count: int
+    indexed_chunk_count: int
+    resource_hit_rate_at_k: float
+    chunk_recall_at_k: float
+    mrr_at_k: float
+    citation_precision: float
+    citation_recall: float
+    fabricated_citation_rate: float
+    citation_metadata_resolution_accuracy: float
+    required_concept_recall: float
+    abstention_precision: float
+    abstention_recall: float
+    lexical_claim_groundedness_proxy: float
+    case_results: list[RAGEvalCaseResult]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "dataset_version": self.dataset_version,
+            "task_id": self.task_id,
+            "total_cases": self.total_cases,
+            "answerable_cases": self.answerable_cases,
+            "abstention_cases": self.abstention_cases,
+            "indexed_resource_count": self.indexed_resource_count,
+            "indexed_chunk_count": self.indexed_chunk_count,
+            "metrics": {
+                "resource_hit_rate_at_k": round(self.resource_hit_rate_at_k, 4),
+                "chunk_recall_at_k": round(self.chunk_recall_at_k, 4),
+                "mrr_at_k": round(self.mrr_at_k, 4),
+                "citation_precision": round(self.citation_precision, 4),
+                "citation_recall": round(self.citation_recall, 4),
+                "fabricated_citation_rate": round(self.fabricated_citation_rate, 4),
+                "citation_metadata_resolution_accuracy": round(
+                    self.citation_metadata_resolution_accuracy, 4
+                ),
+                "required_concept_recall": round(self.required_concept_recall, 4),
+                "abstention_precision": round(self.abstention_precision, 4),
+                "abstention_recall": round(self.abstention_recall, 4),
+                "lexical_claim_groundedness_proxy": round(
+                    self.lexical_claim_groundedness_proxy, 4
+                ),
+            },
+            "case_results": [c.to_dict() for c in self.case_results],
+        }
+
+
+def compute_lexical_claim_groundedness_proxy(
+    answer_text: str,
+    cited_chunks: Sequence[RetrievedChunk],
+) -> float:
+    """Compute a deterministic Lexical/Concept-Overlap Claim Groundedness Proxy in [0.0, 1.0].
+
+    NOTE: This metric measures the fraction of content word stems in `answer_text`
+    (excluding `[chk_...]` markers) that appear in the cited source chunks' titles or text.
+    It is a deterministic lexical/concept-overlap proxy and does not claim to prove
+    semantic entailment or scientific truth.
+    """
+    if not answer_text or not answer_text.strip() or not cited_chunks:
+        return 0.0
+    stripped_answer = _CHUNK_ID_RE.sub("", answer_text)
+    answer_stems = extract_stemmed_content_set(stripped_answer)
+    if not answer_stems:
+        return 0.0
+    evidence_stems: set[str] = set()
+    for chunk in cited_chunks:
+        evidence_stems |= extract_stemmed_content_set(f"{chunk.title} {chunk.chunk_text}")
+    overlap = answer_stems & evidence_stems
+    return len(overlap) / len(answer_stems)
+
+
+def seed_eval_corpus_from_fixture(
+    store: KnowledgeStore,
+    vector_store: ChromaPersistentVectorStore,
+    dataset: Mapping[str, Any],
+    *,
+    embedding_provider: EmbeddingProvider | None = None,
+) -> dict[str, Any]:
+    """Deterministically seed the 6 pilot resources and 18 knowledge chunks into an isolated store."""
+    embedder = embedding_provider or DeterministicHashEmbeddingProvider(
+        model_name=str(dataset.get("embedding_model", "token-hash-bow-v1")),
+        dimensions=int(dataset.get("embedding_dimensions", 128)),
+    )
+    pipeline = LocalRAGPipeline(
+        store=store,
+        vector_store=vector_store,
+        embedding_provider=embedder,
+        generation_provider=RetrievalOnlyFallbackGenerationProvider(),
+    )
+
+    indexed_resource_ids: list[str] = []
+    indexed_chunk_ids: list[str] = []
+
+    for res_spec in dataset.get("corpus_resources", []):
+        upserted = store.upsert_resource(
+            source_id=str(res_spec["source_id"]),
+            canonical_url=str(res_spec["canonical_url"]),
+            title=str(res_spec["title"]),
+            resource_type=str(res_spec["resource_type"]),
+            authors=res_spec.get("authors"),
+            published_at=res_spec.get("published_at"),
+            abstract_or_description=str(res_spec["abstract_or_description"]),
+            license_status=str(res_spec["license_status"]),
+            license_spdx=res_spec.get("license_spdx"),
+            permitted_storage_scope=str(res_spec["permitted_storage_scope"]),
+            permits_full_text_storage=bool(res_spec.get("permits_full_text_storage")),
+        )
+        rid = str(upserted["resource_id"])
+        target_vid = str(res_spec["current_version_id"])
+        actual_vid = str(upserted["current_version_id"])
+        if actual_vid != target_vid:
+            with store.transaction() as conn:
+                conn.execute(
+                    "UPDATE resources SET current_version_id = NULL WHERE resource_id = ?",
+                    (rid,),
+                )
+                conn.execute(
+                    "UPDATE provenance_events SET version_id = NULL WHERE version_id = ?",
+                    (actual_vid,),
+                )
+                conn.execute(
+                    "UPDATE resource_versions SET version_id = ? WHERE version_id = ?",
+                    (target_vid, actual_vid),
+                )
+                conn.execute(
+                    "UPDATE resources SET current_version_id = ? WHERE resource_id = ?",
+                    (target_vid, rid),
+                )
+                conn.execute(
+                    "UPDATE provenance_events SET version_id = ? WHERE resource_id = ? AND version_id IS NULL",
+                    (target_vid, rid),
+                )
+        idx_res = pipeline.index_resource(rid)
+        indexed_resource_ids.append(rid)
+        indexed_chunk_ids.extend(idx_res["chunk_ids"])
+
+    return {
+        "resource_count": len(indexed_resource_ids),
+        "chunk_count": len(indexed_chunk_ids),
+        "resource_ids": indexed_resource_ids,
+        "chunk_ids": indexed_chunk_ids,
+    }
+
+
+class _FixtureEvalGenerationProvider:
+    """Deterministic offline generation provider driven by benchmark case specifications."""
+
+    def __init__(self, response_text: str) -> None:
+        self._response_text = response_text
+
+    @property
+    def provider_name(self) -> str:
+        return "offline_eval_mock"
+
+    @property
+    def model_name(self) -> str:
+        return "fixture-grounded-v1"
+
+    def is_configured(self) -> bool:
+        return True
+
+    def generate_grounded_answer(self, prompt_input: RAGPromptInput) -> GeneratedAnswerPayload:
+        valid_ids = [c.chunk_id for c in prompt_input.retrieved_chunks]
+        cleaned_text, cited_ids = _sanitize_answer_citations(self._response_text, valid_ids)
+        return GeneratedAnswerPayload(
+            answer_text=cleaned_text,
+            cited_chunk_ids=cited_ids,
+            provider_name=self.provider_name,
+            model_name=self.model_name,
+        )
+
+
+def _verify_citation_metadata_against_sqlite(
+    store: KnowledgeStore,
+    citation: SourceCitation,
+) -> bool:
+    """Verify that a `SourceCitation` resolves to exact SQLite provenance and slice boundaries."""
+    row = store.conn.execute(
+        """
+        SELECT kc.*,
+               r.canonical_url,
+               r.title,
+               r.authors,
+               r.published_at,
+               r.license_status,
+               r.license_spdx,
+               r.current_version_id,
+               r.lifecycle_state AS resource_lifecycle_state,
+               rv.abstract_or_description
+          FROM knowledge_chunks kc
+          JOIN resources r ON r.resource_id = kc.resource_id
+          JOIN resource_versions rv ON rv.version_id = kc.version_id
+         WHERE kc.chunk_id = ?
+        """,
+        (citation.chunk_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["lifecycle_state"] != "ACTIVE" or row["resource_lifecycle_state"] != "ACTIVE":
+        return False
+    if (
+        citation.resource_id != str(row["resource_id"])
+        or citation.version_id != str(row["version_id"])
+        or citation.version_id != str(row["current_version_id"])
+        or citation.source_id != str(row["source_id"])
+        or citation.canonical_url != str(row["canonical_url"])
+        or citation.title != str(row["title"])
+        or citation.authors != row["authors"]
+        or citation.published_at != row["published_at"]
+        or citation.license_status != str(row["license_status"])
+        or citation.license_spdx != row["license_spdx"]
+        or citation.char_start != int(row["char_start"])
+        or citation.char_end != int(row["char_end"])
+        or citation.content_origin != str(row["content_origin"])
+        or citation.epistemic_layer != str(row["epistemic_layer"])
+    ):
+        return False
+
+    normalized_doc = normalize_text_for_chunking(
+        f"{row['title']}\n\n{row['abstract_or_description'] or ''}"
+    )
+    expected_slice = normalized_doc[citation.char_start : citation.char_end]
+    return expected_slice == str(row["chunk_text"])
+
+
+def run_offline_rag_evaluation(
+    dataset_path: Path | str = DEFAULT_RAG_EVAL_DATASET_PATH,
+    *,
+    work_dir: Path | str | None = None,
+) -> RAGEvalSummary:
+    """Run the deterministic offline RAG evaluation benchmark in an isolated SQLite + Chroma store."""
+    resolved_dataset_path = Path(dataset_path)
+    dataset = json.loads(resolved_dataset_path.read_text(encoding="utf-8"))
+    top_k = int(dataset.get("default_top_k", DEFAULT_TOP_K))
+    min_sim = float(dataset.get("default_min_similarity_score", DEFAULT_MIN_SIMILARITY_SCORE))
+
+    def _execute_in_dir(base_dir: Path) -> RAGEvalSummary:
+        db_path = base_dir / "rag_eval_isolated.sqlite"
+        chroma_dir = base_dir / "chroma_eval_isolated"
+        store = KnowledgeStore(db_path)
+        try:
+            ensure_knowledge_chunks_schema(store.conn)
+            vector_store = ChromaPersistentVectorStore(
+                persist_directory=chroma_dir,
+                collection_name="rag_eval_benchmark_v1",
+            )
+            embedder = DeterministicHashEmbeddingProvider(
+                model_name=str(dataset.get("embedding_model", "token-hash-bow-v1")),
+                dimensions=int(dataset.get("embedding_dimensions", 128)),
+            )
+            seeded = seed_eval_corpus_from_fixture(
+                store,
+                vector_store,
+                dataset,
+                embedding_provider=embedder,
+            )
+
+            case_results: list[RAGEvalCaseResult] = []
+            resource_hits: list[float] = []
+            chunk_recalls: list[float] = []
+            reciprocal_ranks: list[float] = []
+            citation_precisions: list[float] = []
+            citation_recalls: list[float] = []
+            concept_recalls: list[float] = []
+            groundedness_proxies: list[float] = []
+
+            total_citations_emitted = 0
+            total_fabricated_citations = 0
+            total_resolved_citations = 0
+
+            expected_abstain_true = 0
+            predicted_abstain_true = 0
+            true_positive_abstentions = 0
+
+            for case in dataset.get("cases", []):
+                case_id = str(case["case_id"])
+                category = str(case["category"])
+                question = str(case["question"])
+                source_ids = case.get("source_ids")
+                expected_abstain = bool(case["expected_abstain"])
+                expected_status = str(case["expected_status"])
+                expected_res_ids = [str(x) for x in case.get("expected_resource_ids", [])]
+                expected_chk_ids = [str(x) for x in case.get("expected_chunk_ids", [])]
+                required_concepts = [str(x) for x in case.get("required_concepts", [])]
+                mock_text = str(case.get("mock_generator_response", ""))
+
+                gen_provider = _FixtureEvalGenerationProvider(mock_text)
+                pipeline = LocalRAGPipeline(
+                    store=store,
+                    vector_store=vector_store,
+                    embedding_provider=embedder,
+                    generation_provider=gen_provider,
+                )
+                resp = pipeline.answer_question(
+                    question,
+                    top_k=top_k,
+                    min_similarity_score=min_sim,
+                    source_ids=source_ids,
+                )
+
+                retrieved_chk_ids = [c.chunk_id for c in resp.retrieved_chunks]
+                retrieved_res_ids: list[str] = []
+                for c in resp.retrieved_chunks:
+                    if c.resource_id not in retrieved_res_ids:
+                        retrieved_res_ids.append(c.resource_id)
+
+                cited_chk_ids = [c.chunk_id for c in resp.citations]
+                actual_abstain = resp.status == "insufficient_evidence"
+
+                if expected_abstain:
+                    expected_abstain_true += 1
+                if actual_abstain:
+                    predicted_abstain_true += 1
+                if expected_abstain and actual_abstain:
+                    true_positive_abstentions += 1
+
+                # Retrieval metrics (for cases with expected retrieval targets)
+                res_hit: float | None = None
+                if expected_res_ids:
+                    res_hit = (
+                        1.0
+                        if any(rid in retrieved_res_ids for rid in expected_res_ids)
+                        else 0.0
+                    )
+                    resource_hits.append(res_hit)
+
+                chk_recall: float | None = None
+                mrr_val: float | None = None
+                if expected_chk_ids:
+                    matched_chks = [cid for cid in expected_chk_ids if cid in retrieved_chk_ids]
+                    chk_recall = len(matched_chks) / len(expected_chk_ids)
+                    chunk_recalls.append(chk_recall)
+
+                    rr = 0.0
+                    for rank_idx, r_cid in enumerate(retrieved_chk_ids, start=1):
+                        if r_cid in expected_chk_ids:
+                            rr = 1.0 / rank_idx
+                            break
+                    mrr_val = rr
+                    reciprocal_ranks.append(mrr_val)
+
+                # Fabricated citation check across citations, cited_chunk_ids, and answer_text
+                retrieved_set = set(retrieved_chk_ids)
+                text_cids = (
+                    _CHUNK_ID_RE.findall(resp.generated_answer.answer_text)
+                    if resp.generated_answer is not None
+                    else []
+                )
+                ans_cids = (
+                    list(resp.generated_answer.cited_chunk_ids)
+                    if resp.generated_answer is not None
+                    else []
+                )
+                all_emitted_cids = list(dict.fromkeys([*cited_chk_ids, *ans_cids, *text_cids]))
+                fab_count = sum(1 for cid in all_emitted_cids if cid not in retrieved_set)
+                total_citations_emitted += len(all_emitted_cids)
+                total_fabricated_citations += fab_count
+
+                # Metadata resolution check
+                case_meta_ok = True
+                for cit in resp.citations:
+                    if _verify_citation_metadata_against_sqlite(store, cit):
+                        total_resolved_citations += 1
+                    else:
+                        case_meta_ok = False
+
+                # Answer & citation quality metrics on answerable cases
+                cit_prec: float | None = None
+                cit_rec: float | None = None
+                concept_rec: float | None = None
+                ground_proxy: float | None = None
+
+                if not expected_abstain:
+                    expected_chk_set = set(expected_chk_ids)
+                    if cited_chk_ids:
+                        relevant_cited = [
+                            cid for cid in cited_chk_ids if cid in expected_chk_set
+                        ]
+                        cit_prec = len(relevant_cited) / len(cited_chk_ids)
+                    else:
+                        cit_prec = 0.0
+                    citation_precisions.append(cit_prec)
+
+                    if expected_chk_ids:
+                        recalled_cited = [
+                            cid for cid in expected_chk_ids if cid in cited_chk_ids
+                        ]
+                        cit_rec = len(recalled_cited) / len(expected_chk_ids)
+                        citation_recalls.append(cit_rec)
+
+                    if required_concepts:
+                        ans_lower = (
+                            resp.generated_answer.answer_text.lower()
+                            if resp.generated_answer is not None
+                            else ""
+                        )
+                        found_concepts = [
+                            concept
+                            for concept in required_concepts
+                            if concept.lower() in ans_lower
+                        ]
+                        concept_rec = len(found_concepts) / len(required_concepts)
+                        concept_recalls.append(concept_rec)
+
+                    if resp.generated_answer is not None:
+                        cited_chunk_objs = [
+                            c for c in resp.retrieved_chunks if c.chunk_id in cited_chk_ids
+                        ]
+                        ground_proxy = compute_lexical_claim_groundedness_proxy(
+                            resp.generated_answer.answer_text,
+                            cited_chunk_objs,
+                        )
+                        groundedness_proxies.append(ground_proxy)
+
+                case_results.append(
+                    RAGEvalCaseResult(
+                        case_id=case_id,
+                        category=category,
+                        question=question,
+                        expected_status=expected_status,
+                        actual_status=resp.status,
+                        expected_abstain=expected_abstain,
+                        actual_abstain=actual_abstain,
+                        expected_resource_ids=expected_res_ids,
+                        retrieved_resource_ids=retrieved_res_ids,
+                        expected_chunk_ids=expected_chk_ids,
+                        retrieved_chunk_ids=retrieved_chk_ids,
+                        cited_chunk_ids=cited_chk_ids,
+                        resource_hit_at_k=res_hit,
+                        chunk_recall_at_k=chk_recall,
+                        reciprocal_rank_at_k=mrr_val,
+                        citation_precision=cit_prec,
+                        citation_recall=cit_rec,
+                        fabricated_citation_count=fab_count,
+                        citation_metadata_resolved=case_meta_ok,
+                        required_concept_recall=concept_rec,
+                        lexical_claim_groundedness_proxy=ground_proxy,
+                    )
+                )
+
+            avg_res_hit = sum(resource_hits) / max(len(resource_hits), 1)
+            avg_chk_recall = sum(chunk_recalls) / max(len(chunk_recalls), 1)
+            avg_mrr = sum(reciprocal_ranks) / max(len(reciprocal_ranks), 1)
+            avg_cit_prec = sum(citation_precisions) / max(len(citation_precisions), 1)
+            avg_cit_rec = sum(citation_recalls) / max(len(citation_recalls), 1)
+            fab_rate = (
+                total_fabricated_citations / total_citations_emitted
+                if total_citations_emitted > 0
+                else 0.0
+            )
+            meta_acc = (
+                total_resolved_citations / total_citations_emitted
+                if total_citations_emitted > 0
+                else 1.0
+            )
+            avg_concept_rec = sum(concept_recalls) / max(len(concept_recalls), 1)
+            abst_prec = (
+                true_positive_abstentions / predicted_abstain_true
+                if predicted_abstain_true > 0
+                else 0.0
+            )
+            abst_rec = (
+                true_positive_abstentions / expected_abstain_true
+                if expected_abstain_true > 0
+                else 0.0
+            )
+            avg_ground_proxy = sum(groundedness_proxies) / max(len(groundedness_proxies), 1)
+
+            return RAGEvalSummary(
+                dataset_version=str(dataset.get("dataset_version", "1.0")),
+                task_id=str(dataset.get("task_id", "Task-033")),
+                total_cases=len(case_results),
+                answerable_cases=len(case_results) - expected_abstain_true,
+                abstention_cases=expected_abstain_true,
+                indexed_resource_count=int(seeded["resource_count"]),
+                indexed_chunk_count=int(seeded["chunk_count"]),
+                resource_hit_rate_at_k=avg_res_hit,
+                chunk_recall_at_k=avg_chk_recall,
+                mrr_at_k=avg_mrr,
+                citation_precision=avg_cit_prec,
+                citation_recall=avg_cit_rec,
+                fabricated_citation_rate=fab_rate,
+                citation_metadata_resolution_accuracy=meta_acc,
+                required_concept_recall=avg_concept_rec,
+                abstention_precision=abst_prec,
+                abstention_recall=abst_rec,
+                lexical_claim_groundedness_proxy=avg_ground_proxy,
+                case_results=case_results,
+            )
+        finally:
+            store.close()
+
+    if work_dir is not None:
+        base_path = Path(work_dir)
+        base_path.mkdir(parents=True, exist_ok=True)
+        return _execute_in_dir(base_path)
+
+    with tempfile.TemporaryDirectory(prefix="task033_rag_eval_") as tmp_dir:
+        return _execute_in_dir(Path(tmp_dir))
 
 
 if __name__ == "__main__":

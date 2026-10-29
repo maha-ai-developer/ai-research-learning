@@ -1,0 +1,337 @@
+{
+  "dataset_version": "1.0",
+  "task_id": "Task-033",
+  "description": "Offline RAG evaluation benchmark v1 grounded in the 6 indexed AI research pilot resources (18 deterministic knowledge chunks).",
+  "embedding_provider": "local_deterministic",
+  "embedding_model": "token-hash-bow-v1",
+  "embedding_dimensions": 128,
+  "default_top_k": 5,
+  "default_min_similarity_score": 0.22,
+  "corpus_resources": [
+    {
+      "resource_id": "res_0b4b872c018ccdcc",
+      "source_id": "SRC-ARXIV",
+      "canonical_url": "https://arxiv.org/abs/1409.0473",
+      "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+      "resource_type": "preprint_paper_metadata",
+      "current_version_id": "ver_20261024_17563f17_v1",
+      "authors": "Dzmitry Bahdanau, Kyunghyun Cho, Yoshua Bengio",
+      "published_at": "2014-09-01T16:33:02Z",
+      "license_status": "ARXIV_METADATA_AND_ABSTRACT_PERMITTED",
+      "license_spdx": null,
+      "permitted_storage_scope": "METADATA_AND_ABSTRACT",
+      "permits_full_text_storage": 0,
+      "abstract_or_description": "Neural machine translation is a recently proposed approach to machine translation. Unlike the traditional statistical machine translation, the neural machine translation aims at building a single neural network that can be jointly tuned to maximize the translation performance. The models proposed recently for neural machine translation often belong to a family of encoder-decoders and consists of an encoder that encodes a source sentence into a fixed-length vector from which a decoder generates a translation. In this paper, we conjecture that the use of a fixed-length vector is a bottleneck in improving the performance of this basic encoder-decoder architecture, and propose to extend this by allowing a model to automatically (soft-)search for parts of a source sentence that are relevant to predicting a target word, without having to form these parts as a hard segment explicitly. With this new approach, we achieve a translation performance comparable to the existing state-of-the-art phrase-based system on the task of English-to-French translation. Furthermore, qualitative analysis reveals that the (soft-)alignments found by the model agree well with our intuition.",
+      "expected_chunk_ids": [
+        "chk_fb78852dfe1044b4",
+        "chk_cbf933bd5853089c",
+        "chk_f38d9214a536ff59"
+      ]
+    },
+    {
+      "resource_id": "res_200d1687405c7db9",
+      "source_id": "SRC-ARXIV",
+      "canonical_url": "https://arxiv.org/abs/1512.03385",
+      "title": "Deep Residual Learning for Image Recognition",
+      "resource_type": "preprint_paper_metadata",
+      "current_version_id": "ver_20261027_a2a3ca67_v1",
+      "authors": "Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun",
+      "published_at": "2015-12-10T19:51:55Z",
+      "license_status": "ARXIV_METADATA_AND_ABSTRACT_PERMITTED",
+      "license_spdx": null,
+      "permitted_storage_scope": "METADATA_AND_ABSTRACT",
+      "permits_full_text_storage": 0,
+      "abstract_or_description": "Deeper neural networks are more difficult to train. We present a residual learning framework to ease the training of networks that are substantially deeper than those used previously. We explicitly reformulate the layers as learning residual functions with reference to the layer inputs, instead of learning unreferenced functions. We provide comprehensive empirical evidence showing that these residual networks are easier to optimize, and can gain accuracy from considerably increased depth. On the ImageNet dataset we evaluate residual nets with a depth of up to 152 layers---8x deeper than VGG nets but still having lower complexity. An ensemble of these residual nets achieves 3.57% error on the ImageNet test set. This result won the 1st place on the ILSVRC 2015 classification task. We also present analysis on CIFAR-10 with 100 and 1000 layers. The depth of representations is of central importance for many visual recognition tasks. Solely due to our extremely deep representations, we obtain a 28% relative improvement on the COCO object detection dataset. Deep residual nets are foundations of our submissions to ILSVRC & COCO 2015 competitions, where we also won the 1st places on the tasks of ImageNet detection, ImageNet localization, COCO detection, and COCO segmentation.",
+      "expected_chunk_ids": [
+        "chk_6307d5af3393ec0c",
+        "chk_819d87281b2a2264",
+        "chk_7dee843efa016d98"
+      ]
+    },
+    {
+      "resource_id": "res_24d64fe06f34c722",
+      "source_id": "SRC-WIKIPEDIA",
+      "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+      "title": "Backpropagation",
+      "resource_type": "encyclopedia_concept_metadata",
+      "current_version_id": "ver_20261024_842a8401_v1",
+      "authors": "Wikipedia contributors",
+      "published_at": null,
+      "license_status": "CC_BY_SA_4_0",
+      "license_spdx": "CC-BY-SA-4.0",
+      "permitted_storage_scope": "METADATA_ONLY",
+      "permits_full_text_storage": 1,
+      "abstract_or_description": "In machine learning, backpropagation is a gradient computation method commonly used for training a neural network in computing parameter updates.\nIt is an efficient application of the chain rule to neural networks. Backpropagation efficiently computes the gradient of the loss with respect to the network weights for a single input\u2013output example. It does this by propagating derivatives backward, one layer at a time, from the output layer to the input layer, thereby avoiding redundant chain-rule calculations.\nStrictly speaking, the term backpropagation refers only to an algorithm for efficiently computing the gradient, not how the gradient is used, but the term is often used loosely to refer to the entire learning algorithm. This includes changing model parameters in the negative direction of the gradient, such as by stochastic gradient descent, or as an intermediate step in a more complicated optimizer, such as Adaptive Moment Estimation.\nBackpropagation had multiple discoveries and partial discoveries, with a tangled history and terminology (see \u00a7 History). Some other names for the technique include \"reverse mode of automatic differentiation\" or \"reverse accumulation\".",
+      "expected_chunk_ids": [
+        "chk_0a6023ab662bc6b4",
+        "chk_258896475e232c3d",
+        "chk_0defbb8fe8944c71"
+      ]
+    },
+    {
+      "resource_id": "res_a475a00509c48269",
+      "source_id": "SRC-ARXIV",
+      "canonical_url": "https://arxiv.org/abs/1706.03762",
+      "title": "Attention Is All You Need",
+      "resource_type": "preprint_paper_metadata",
+      "current_version_id": "ver_20261027_8f8eff2b_v1",
+      "authors": "Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, Illia Polosukhin",
+      "published_at": "2017-06-12T17:57:34Z",
+      "license_status": "ARXIV_METADATA_AND_ABSTRACT_PERMITTED",
+      "license_spdx": null,
+      "permitted_storage_scope": "METADATA_AND_ABSTRACT",
+      "permits_full_text_storage": 0,
+      "abstract_or_description": "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks in an encoder-decoder configuration. The best performing models also connect the encoder and decoder through an attention mechanism. We propose a new simple network architecture, the Transformer, based solely on attention mechanisms, dispensing with recurrence and convolutions entirely. Experiments on two machine translation tasks show these models to be superior in quality while being more parallelizable and requiring significantly less time to train. Our model achieves 28.4 BLEU on the WMT 2014 English-to-German translation task, improving over the existing best results, including ensembles by over 2 BLEU. On the WMT 2014 English-to-French translation task, our model establishes a new single-model state-of-the-art BLEU score of 41.8 after training for 3.5 days on eight GPUs, a small fraction of the training costs of the best models from the literature. We show that the Transformer generalizes well to other tasks by applying it successfully to English constituency parsing both with large and limited training data.",
+      "expected_chunk_ids": [
+        "chk_473fcba29c29f97a",
+        "chk_2436d59a2b39053b",
+        "chk_f01c5990340cadda"
+      ]
+    },
+    {
+      "resource_id": "res_ab5dba0c12050d69",
+      "source_id": "SRC-ARXIV",
+      "canonical_url": "https://arxiv.org/abs/1207.0580",
+      "title": "Improving neural networks by preventing co-adaptation of feature detectors",
+      "resource_type": "preprint_paper_metadata",
+      "current_version_id": "ver_20261024_0843175d_v1",
+      "authors": "Geoffrey E. Hinton, Nitish Srivastava, Alex Krizhevsky, Ilya Sutskever, Ruslan R. Salakhutdinov",
+      "published_at": "2012-07-03T06:35:15Z",
+      "license_status": "ARXIV_METADATA_AND_ABSTRACT_PERMITTED",
+      "license_spdx": null,
+      "permitted_storage_scope": "METADATA_AND_ABSTRACT",
+      "permits_full_text_storage": 0,
+      "abstract_or_description": "When a large feedforward neural network is trained on a small training set, it typically performs poorly on held-out test data. This \"overfitting\" is greatly reduced by randomly omitting half of the feature detectors on each training case. This prevents complex co-adaptations in which a feature detector is only helpful in the context of several other specific feature detectors. Instead, each neuron learns to detect a feature that is generally helpful for producing the correct answer given the combinatorially large variety of internal contexts in which it must operate. Random \"dropout\" gives big improvements on many benchmark tasks and sets new records for speech and object recognition.",
+      "expected_chunk_ids": [
+        "chk_364466882e422f57",
+        "chk_79ddf8d5602675a3"
+      ]
+    },
+    {
+      "resource_id": "res_dd13dd0076cd4a6e",
+      "source_id": "SRC-WIKIPEDIA",
+      "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+      "title": "Boltzmann machine",
+      "resource_type": "encyclopedia_concept_metadata",
+      "current_version_id": "ver_20261024_d1f8525a_v1",
+      "authors": "Wikipedia contributors",
+      "published_at": null,
+      "license_status": "CC_BY_SA_4_0",
+      "license_spdx": "CC-BY-SA-4.0",
+      "permitted_storage_scope": "METADATA_ONLY",
+      "permits_full_text_storage": 1,
+      "abstract_or_description": "A Boltzmann machine (also called Sherrington\u2013Kirkpatrick model with external field or stochastic Ising model), named after Ludwig Boltzmann, is a spin-glass model with an external field, i.e., a Sherrington\u2013Kirkpatrick model, that is a stochastic Ising model. It is a statistical physics technique applied in the context of cognitive science. It is also classified as a Markov random field.\nBoltzmann machines are theoretically intriguing because of the locality and Hebbian nature of their training algorithm (being trained by Hebb's rule), and because of their parallelism and the resemblance of their dynamics to simple physical processes.  Boltzmann machines with unconstrained connectivity have not been proven useful for practical problems in machine learning or inference, but if the connectivity is properly constrained, the learning can be made efficient enough to be useful for practical problems.\nThey are named after the Boltzmann distribution in statistical mechanics, which is used in their sampling function.  They were heavily popularized and promoted by Geoffrey Hinton, Terry Sejnowski and Yann LeCun in cognitive sciences communities, particularly in machine learning,  as part of \"energy-based models\" (EBM), because Hamiltonians of spin glasses as energy are used as a starting point to define the learning task.",
+      "expected_chunk_ids": [
+        "chk_41f22d9bb264fa27",
+        "chk_3c549b1da926ac49",
+        "chk_0893e7fa2c80f931",
+        "chk_e030fa031667493c"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "eval_01_backprop_chain_rule",
+      "category": "answerable_single_chunk",
+      "question": "How does backpropagation apply the chain rule to compute the gradient of the loss with respect to network weights?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_24d64fe06f34c722"],
+      "expected_chunk_ids": ["chk_0a6023ab662bc6b4"],
+      "required_concepts": ["chain rule", "gradient", "loss", "network weights"],
+      "mock_generator_response": "Backpropagation is a gradient computation method that efficiently applies the chain rule to neural networks to compute the gradient of the loss with respect to network weights for a single input-output example [chk_0a6023ab662bc6b4]."
+    },
+    {
+      "case_id": "eval_02_backprop_optimizers_and_reverse_mode",
+      "category": "answerable_multi_chunk",
+      "question": "How are derivatives propagated backward across layers in backpropagation, what optimizers use the gradient, and what automatic differentiation names refer to this technique?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_24d64fe06f34c722"],
+      "expected_chunk_ids": ["chk_258896475e232c3d", "chk_0defbb8fe8944c71"],
+      "required_concepts": [
+        "propagating derivatives backward",
+        "stochastic gradient descent",
+        "Adaptive Moment Estimation",
+        "reverse mode of automatic differentiation"
+      ],
+      "mock_generator_response": "Backpropagation computes gradients by propagating derivatives backward one layer at a time from the output layer to the input layer to avoid redundant chain-rule calculations [chk_258896475e232c3d]. Model parameters are updated in the negative direction of the gradient using stochastic gradient descent or Adaptive Moment Estimation, and the technique is also called reverse mode of automatic differentiation or reverse accumulation [chk_0defbb8fe8944c71]."
+    },
+    {
+      "case_id": "eval_03_dropout_overfitting_coadaptation",
+      "category": "answerable_single_chunk",
+      "question": "How does randomly omitting half of the feature detectors on each training case reduce overfitting in a large feedforward neural network?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_ab5dba0c12050d69"],
+      "expected_chunk_ids": ["chk_364466882e422f57"],
+      "required_concepts": ["overfitting", "omitting half", "feature detectors", "co-adaptations"],
+      "mock_generator_response": "When a large feedforward neural network is trained on a small training set, overfitting is greatly reduced by randomly omitting half of the feature detectors on each training case, which prevents complex co-adaptations among feature detectors [chk_364466882e422f57]."
+    },
+    {
+      "case_id": "eval_04_dropout_benchmark_records",
+      "category": "answerable_multi_chunk",
+      "question": "Why does preventing co-adaptation help each neuron in random dropout, and which recognition benchmarks achieved new records?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_ab5dba0c12050d69"],
+      "expected_chunk_ids": ["chk_364466882e422f57", "chk_79ddf8d5602675a3"],
+      "required_concepts": ["co-adaptations", "internal contexts", "dropout", "speech and object recognition"],
+      "mock_generator_response": "By randomly omitting half of the feature detectors to prevent complex co-adaptations [chk_364466882e422f57], each neuron learns to detect a feature that is generally helpful across a combinatorially large variety of internal contexts, enabling random dropout to set new records for speech and object recognition [chk_79ddf8d5602675a3]."
+    },
+    {
+      "case_id": "eval_05_boltzmann_ising_spin_glass",
+      "category": "answerable_single_chunk",
+      "question": "What statistical physics spin-glass model is a Boltzmann machine equivalent to in cognitive science?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_dd13dd0076cd4a6e"],
+      "expected_chunk_ids": ["chk_41f22d9bb264fa27"],
+      "required_concepts": ["Sherrington", "Kirkpatrick", "stochastic Ising model", "spin-glass"],
+      "mock_generator_response": "A Boltzmann machine is a spin-glass model with an external field, also called a Sherrington-Kirkpatrick model or stochastic Ising model, applied as a statistical physics technique in cognitive science [chk_41f22d9bb264fa27]."
+    },
+    {
+      "case_id": "eval_06_boltzmann_hebbian_energy_models",
+      "category": "answerable_multi_chunk",
+      "question": "How is a Boltzmann machine trained by Hebb's rule, why must connectivity be constrained for practical machine learning problems, and who popularized Boltzmann machines as energy-based models?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_dd13dd0076cd4a6e"],
+      "expected_chunk_ids": ["chk_3c549b1da926ac49", "chk_0893e7fa2c80f931", "chk_e030fa031667493c"],
+      "required_concepts": [
+        "Hebb's rule",
+        "connectivity",
+        "Boltzmann distribution",
+        "Geoffrey Hinton",
+        "energy-based models"
+      ],
+      "mock_generator_response": "Boltzmann machines are classified as Markov random fields with a local Hebbian training algorithm trained by Hebb's rule [chk_3c549b1da926ac49]. Unconstrained connectivity is not proven useful for practical problems, so connectivity must be constrained for efficient learning while sampling uses the Boltzmann distribution [chk_0893e7fa2c80f931]. Geoffrey Hinton, Terry Sejnowski, and Yann LeCun popularized them in machine learning as energy-based models using spin-glass Hamiltonians [chk_e030fa031667493c]."
+    },
+    {
+      "case_id": "eval_07_nmt_fixed_length_vector_bottleneck",
+      "category": "answerable_multi_chunk",
+      "question": "Why is encoding a source sentence into a fixed-length vector a bottleneck in encoder-decoder neural machine translation, and how does soft-search alignment address it?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_0b4b872c018ccdcc"],
+      "expected_chunk_ids": ["chk_fb78852dfe1044b4", "chk_cbf933bd5853089c"],
+      "required_concepts": ["encoder-decoders", "fixed-length vector", "bottleneck", "target word"],
+      "mock_generator_response": "Basic neural machine translation encoder-decoders encode a source sentence into a fixed-length vector from which a decoder generates a translation [chk_fb78852dfe1044b4]. Using a fixed-length vector is a bottleneck, which is addressed by allowing the model to automatically soft-search for parts of a source sentence relevant to predicting a target word without forming hard segments explicitly [chk_cbf933bd5853089c]."
+    },
+    {
+      "case_id": "eval_08_resnet_152_layers_imagenet_error",
+      "category": "answerable_single_chunk",
+      "question": "What depth of residual networks was evaluated on ImageNet compared to VGG nets, and what test error did the ensemble achieve on ILSVRC 2015?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_200d1687405c7db9"],
+      "expected_chunk_ids": ["chk_819d87281b2a2264"],
+      "required_concepts": ["152 layers", "VGG", "3.57% error", "ILSVRC 2015"],
+      "mock_generator_response": "On the ImageNet dataset, residual nets were evaluated with a depth of up to 152 layers (8x deeper than VGG nets with lower complexity), and an ensemble achieved 3.57% error on the ImageNet test set to win 1st place on the ILSVRC 2015 classification task [chk_819d87281b2a2264]."
+    },
+    {
+      "case_id": "eval_09_resnet_residual_functions_and_coco",
+      "category": "answerable_multi_chunk",
+      "question": "How do residual networks reformulate layers with reference to layer inputs, and what relative improvement did deep representations achieve on the COCO object detection dataset?",
+      "source_ids": null,
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_200d1687405c7db9"],
+      "expected_chunk_ids": ["chk_6307d5af3393ec0c", "chk_7dee843efa016d98"],
+      "required_concepts": ["residual functions", "layer inputs", "28% relative improvement", "COCO"],
+      "mock_generator_response": "Deep residual learning explicitly reformulates network layers as learning residual functions with reference to the layer inputs instead of learning unreferenced functions [chk_6307d5af3393ec0c]. Due to these extremely deep representations, the authors obtained a 28% relative improvement on the COCO object detection dataset and won 1st places in ILSVRC and COCO 2015 tasks [chk_7dee843efa016d98]."
+    },
+    {
+      "case_id": "eval_10_transformer_architecture_and_bleu",
+      "category": "source_filtered_arxiv_multi_chunk",
+      "question": "How does the Transformer architecture dispense with recurrence and convolutions, and what BLEU scores did it achieve on WMT 2014 English-to-German and English-to-French translation?",
+      "source_ids": ["SRC-ARXIV"],
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_a475a00509c48269"],
+      "expected_chunk_ids": ["chk_473fcba29c29f97a", "chk_2436d59a2b39053b"],
+      "required_concepts": ["Transformer", "attention mechanisms", "28.4 BLEU", "41.8"],
+      "mock_generator_response": "The Transformer is a network architecture based solely on attention mechanisms, dispensing with recurrence and convolutions entirely [chk_473fcba29c29f97a]. It achieved 28.4 BLEU on WMT 2014 English-to-German translation and a single-model state-of-the-art BLEU score of 41.8 on WMT 2014 English-to-French translation after training for 3.5 days on eight GPUs [chk_2436d59a2b39053b]."
+    },
+    {
+      "case_id": "eval_11_wikipedia_filter_backprop_history",
+      "category": "source_filtered_wikipedia_single_chunk",
+      "question": "What alternative names from automatic differentiation are used for backpropagation?",
+      "source_ids": ["SRC-WIKIPEDIA"],
+      "expected_abstain": false,
+      "expected_status": "answered",
+      "expected_resource_ids": ["res_24d64fe06f34c722"],
+      "expected_chunk_ids": ["chk_0defbb8fe8944c71"],
+      "required_concepts": ["reverse mode of automatic differentiation", "reverse accumulation"],
+      "mock_generator_response": "Alternative names for backpropagation include reverse mode of automatic differentiation and reverse accumulation [chk_0defbb8fe8944c71]."
+    },
+    {
+      "case_id": "eval_12_ood_sourdough_fermentation",
+      "category": "out_of_domain_negative_control",
+      "question": "What hydration ratio and bulk fermentation temperature should be used when baking artisan sourdough bread?",
+      "source_ids": null,
+      "expected_abstain": true,
+      "expected_status": "insufficient_evidence",
+      "expected_resource_ids": [],
+      "expected_chunk_ids": [],
+      "required_concepts": [],
+      "mock_generator_response": "The retrieved sources do not contain sufficient evidence to answer this question."
+    },
+    {
+      "case_id": "eval_13_ood_europa_orbital_period",
+      "category": "out_of_domain_negative_control",
+      "question": "What is the orbital eccentricity and subsurface ocean salinity of Jupiter's moon Europa?",
+      "source_ids": null,
+      "expected_abstain": true,
+      "expected_status": "insufficient_evidence",
+      "expected_resource_ids": [],
+      "expected_chunk_ids": [],
+      "required_concepts": [],
+      "mock_generator_response": "The retrieved sources do not contain sufficient evidence to answer this question."
+    },
+    {
+      "case_id": "eval_14_unindexed_ppo_clipping_rl",
+      "category": "in_domain_unindexed_topic_control",
+      "question": "How does Proximal Policy Optimization (PPO) clip probability ratios in actor-critic reinforcement policy rollouts?",
+      "source_ids": null,
+      "expected_abstain": true,
+      "expected_status": "insufficient_evidence",
+      "expected_resource_ids": [],
+      "expected_chunk_ids": [],
+      "required_concepts": [],
+      "mock_generator_response": "The retrieved sources do not contain sufficient evidence to answer this question."
+    },
+    {
+      "case_id": "eval_15_partial_resnet_batch_size_learning_rate",
+      "category": "partial_evidence_post_retrieval_abstention",
+      "question": "In Deep Residual Learning for Image Recognition on ImageNet with 152 layers, what exact initial learning rate, weight decay, and mini-batch size were used during training?",
+      "source_ids": null,
+      "expected_abstain": true,
+      "expected_status": "insufficient_evidence",
+      "expected_resource_ids": ["res_200d1687405c7db9"],
+      "expected_chunk_ids": ["chk_819d87281b2a2264", "chk_6307d5af3393ec0c"],
+      "required_concepts": [],
+      "mock_generator_response": "The retrieved sources do not contain sufficient evidence to answer the question: while the retrieved abstract chunks describe 152-layer residual networks on ImageNet, they do not specify the initial learning rate, weight decay, or mini-batch size."
+    },
+    {
+      "case_id": "eval_16_partial_transformer_adam_warmup_steps",
+      "category": "partial_evidence_post_retrieval_abstention",
+      "question": "In the Transformer model trained on WMT 2014 English-to-French translation for 3.5 days on eight GPUs, what exact Adam optimizer beta_2 hyperparameter and warmup_steps schedule were used?",
+      "source_ids": null,
+      "expected_abstain": true,
+      "expected_status": "insufficient_evidence",
+      "expected_resource_ids": ["res_a475a00509c48269"],
+      "expected_chunk_ids": ["chk_2436d59a2b39053b", "chk_f01c5990340cadda"],
+      "required_concepts": [],
+      "mock_generator_response": "The retrieved sources do not contain enough evidence to answer the question because the indexed Transformer abstract does not state the Adam beta_2 hyperparameter or warmup_steps schedule."
+    }
+  ]
+}
