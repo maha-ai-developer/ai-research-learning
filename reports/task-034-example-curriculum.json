@@ -1,0 +1,1789 @@
+{
+  "curriculum_id": "curr_d4e5110c934b",
+  "run_id": "run_6272b3a2d8ce",
+  "schema_version": "1.0.0",
+  "status": "VALIDATED",
+  "created_at": "2026-10-31T06:03:45Z",
+  "learner_goal": "I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations.",
+  "title": "Foundational-to-Research AI Engineering & Research Curriculum",
+  "executive_summary": "Prerequisite-ordered, citation-verified learning path across 4 stages and 8 lessons generated for goal: \"I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations.\". Grounded in 18 active knowledge chunks and 12 verified collected documents, with explicit reporting of 4 evidence and curation gaps.",
+  "rationale_for_ordering": "The curriculum follows a strict topological sort over the concept prerequisite DAG: (1) Stage 1 establishes linear algebra, multivariable calculus, and reverse-mode backpropagation; (2) Stage 2 builds core generalization (Dropout regularization) and stochastic energy-based representation learning (Boltzmann machines & RBMs) atop gradient optimization; (3) Stage 3 scales depth via Deep Residual Learning (ResNet), resolves fixed-vector sequence bottlenecks via Bahdanau soft alignment, and synthesizes both into the recurrence-free Transformer architecture; (4) Stage 4 bridges engineering implementation to AI research methodology, ablation design, GFlowNets, and AI safety. Per platform governance, foundational prerequisites always precede recent architectures regardless of news recency in SRC-THE-BATCH.",
+  "mastery_assessment_disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+  "abstention_reason": null,
+  "source_ecosystem_summary": {
+    "total_registered_sources": 11,
+    "approved_operational_sources": 10,
+    "candidate_pending_sources": 1,
+    "tier_counts": {
+      "DISCOVERED_LINK": 181,
+      "APPROVED_UNCOLLECTED_RESOURCE": 48,
+      "COLLECTED_DOCUMENT": 12,
+      "EXTRACTED_KNOWLEDGE": 6,
+      "CURRICULUM_READY_EVIDENCE": 18
+    },
+    "curriculum_ready_chunk_count": 18,
+    "curriculum_ready_resource_count": 12,
+    "extracted_resource_count": 6,
+    "collected_document_count": 12,
+    "approved_uncollected_resource_count": 48,
+    "discovered_link_candidate_count": 181,
+    "the_batch_governance": {
+      "source_id": "SRC-THE-BATCH",
+      "canonical_url": "https://www.deeplearning.ai",
+      "status": "CANDIDATE_PENDING_REVIEW",
+      "permits_full_text_storage": false,
+      "max_requests_per_run": 0,
+      "role_in_platform": "AI_NEWS_AND_RESEARCH_DISCOVERY_RADAR_ONLY",
+      "can_ground_curriculum_citations": false,
+      "can_override_foundational_prerequisites": false
+    }
+  },
+  "stages": [
+    {
+      "stage_id": "stage_01_mathematical_and_programming_foundations",
+      "stage_order": 1,
+      "title": "Stage 1: Mathematical, Numerical, and Optimization Foundations",
+      "stage_objectives": [
+        "Represent inputs, parameters, and activations as vectors, matrices, and tensors.",
+        "Compute Jacobians, directional derivatives, and multivariable chain-rule expansions.",
+        "Formulate reverse-mode automatic differentiation over a computational graph using the chain rule.",
+        "Explain how backpropagation computes layer-wise error sensitivities efficiently in a single backward pass."
+      ],
+      "prerequisite_stage_ids": [],
+      "rationale_for_ordering": "Stage 1: Mathematical, Numerical, and Optimization Foundations is positioned at stage_order=1 because all constituent lessons (lesson_01_linear_algebra_and_multivariable_calculus, lesson_02_backpropagation_and_automatic_differentiation) have their prerequisite concepts satisfied by earlier stages (foundational entry point).",
+      "lessons": [
+        {
+          "lesson_id": "lesson_01_linear_algebra_and_multivariable_calculus",
+          "concept_id": "math_linear_algebra_calculus",
+          "lesson_order": 1,
+          "title": "Linear Algebra, Vector Spaces, and Multivariable Calculus for Machine Learning",
+          "learning_objectives": [
+            "Represent inputs, parameters, and activations as vectors, matrices, and tensors.",
+            "Compute Jacobians, directional derivatives, and multivariable chain-rule expansions.",
+            "Connect geometric linear transformations (3Blue1Brown visual intuition) to matrix multiplication."
+          ],
+          "prerequisites": [],
+          "prerequisite_lesson_ids": [],
+          "explanation": "Every neural architecture is a composition of parameterized linear maps and nonlinear activations. Before studying multilayer networks, learners must master vector spaces, matrix multiplication, eigenvalues/singular values, and multivariable calculus. In our knowledge store, visual geometric intuition is anchored by verified 3Blue1Brown educational resources, while the exact chain-rule formulation is grounded in the primary Backpropagation text. Retrieved primary evidence (Backpropagation, SRC-WIKIPEDIA): \"Backpropagation In machine learning, backpropagation is a gradient computation method commonly used for training a neural network in computing parameter updates. It is an efficient application of the chain rule to neural networks. Backpr...\" [chk_0a6023ab662bc6b4] [chk_258896475e232c3d] [chk_0defbb8fe8944c71].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_0a6023ab662bc6b4",
+              "title": "Backpropagation",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "chunk_id": "chk_0a6023ab662bc6b4",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_258896475e232c3d",
+              "title": "Backpropagation",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "chunk_id": "chk_258896475e232c3d",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_0defbb8fe8944c71",
+              "title": "Backpropagation",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "chunk_id": "chk_0defbb8fe8944c71",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_res_63c0a0d121a09f38",
+              "title": "3Blue1Brown",
+              "source_id": "SRC-3B1B",
+              "resource_id": "res_63c0a0d121a09f38",
+              "chunk_id": "",
+              "canonical_url": "https://www.3blue1brown.com/topics/neural-networks",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            },
+            {
+              "citation_id": "cit_res_b6377e0dd4279dae",
+              "title": "3Blue1Brown",
+              "source_id": "SRC-3B1B",
+              "resource_id": "res_b6377e0dd4279dae",
+              "chunk_id": "",
+              "canonical_url": "https://www.3blue1brown.com/",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_01_jacobian_chain_rule",
+              "title": "Analytical & Numerical Jacobian Verification",
+              "description": "Derive the analytical Jacobian of f(W, x, b) = tanh(Wx + b) with respect to W, x, and b, and verify it against finite-difference approximations in Python/NumPy.",
+              "deliverable": "Pure-Python/NumPy script with < 1e-6 maximum relative gradient error."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_01_numerical_tensor_microkernel",
+              "title": "Vectorized Matrix & Autodiff Primitives Workbench",
+              "description": "Implement batched matrix multiplication, broadcasting rules, and finite-difference gradient checking without deep learning frameworks.",
+              "deliverable": "Tested Python module + reproducible benchmark notebook."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_01_linear_algebra_and_multivariable_calculus",
+            "lesson_id": "lesson_01_linear_algebra_and_multivariable_calculus",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "Derive the gradient of L = 1/2 ||Wx - y||_2^2 with respect to W and verify dimensional consistency.",
+              "Explain why non-commutative matrix multiplication order determines forward vs. backward transpose operations."
+            ],
+            "pass_criteria": [
+              "Correctly derives matrix gradients with matching shapes (m x n vs. n x m).",
+              "Numeric finite-difference check agrees with analytical expression within 1e-6."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_0a6023ab662bc6b4",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "title": "Backpropagation",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "chunk_id": "chk_0a6023ab662bc6b4",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=0 (0..364)",
+              "excerpt_summary": "Backpropagation In machine learning, backpropagation is a gradient computation method commonly used for training a neural network in computing parameter updates. It is an efficient application of t...",
+              "relevance_score": 0.39
+            },
+            {
+              "citation_id": "cit_chk_258896475e232c3d",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "title": "Backpropagation",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "chunk_id": "chk_258896475e232c3d",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=1 (269..749)",
+              "excerpt_summary": "the gradient of the loss with respect to the network weights for a single input–output example. It does this by propagating derivatives backward, one layer at a time, from the output layer to the i...",
+              "relevance_score": 0.3239
+            },
+            {
+              "citation_id": "cit_chk_0defbb8fe8944c71",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "title": "Backpropagation",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "chunk_id": "chk_0defbb8fe8944c71",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=2 (650..1204)",
+              "excerpt_summary": "the gradient is used, but the term is often used loosely to refer to the entire learning algorithm. This includes changing model parameters in the negative direction of the gradient, such as by sto...",
+              "relevance_score": 0.2318
+            },
+            {
+              "citation_id": "cit_res_63c0a0d121a09f38",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-3B1B",
+              "resource_id": "res_63c0a0d121a09f38",
+              "title": "3Blue1Brown",
+              "canonical_url": "https://www.3blue1brown.com/topics/neural-networks",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_63c0a0d121a09f38 (metadata-only)",
+              "excerpt_summary": "Mathematics with a distinct visual perspective. Linear algebra, calculus, neural networks, topology, and more.",
+              "relevance_score": 0.85
+            },
+            {
+              "citation_id": "cit_res_b6377e0dd4279dae",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-3B1B",
+              "resource_id": "res_b6377e0dd4279dae",
+              "title": "3Blue1Brown",
+              "canonical_url": "https://www.3blue1brown.com/",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_b6377e0dd4279dae (metadata-only)",
+              "excerpt_summary": "Mathematics with a distinct visual perspective. Linear algebra, calculus, neural networks, topology, and more.",
+              "relevance_score": 0.85
+            }
+          ],
+          "rationale_for_ordering": "Placed first (root of the prerequisite DAG) because backpropagation, stochastic optimization, and attention mechanisms all require matrix algebra and multivariable chain-rule fluency.",
+          "evidence_gaps": [
+            "Resource '3Blue1Brown' (res_63c0a0d121a09f38, SRC-3B1B) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed.",
+            "Resource '3Blue1Brown' (res_b6377e0dd4279dae, SRC-3B1B) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed.",
+            "3Blue1Brown resources (res_63c0a0d121a09f38, res_b6377e0dd4279dae) are verified metadata-only records in SQLite (permits_full_text_storage=0); full lesson transcripts for linear algebra and Python programming foundations are not stored in Chroma."
+          ]
+        },
+        {
+          "lesson_id": "lesson_02_backpropagation_and_automatic_differentiation",
+          "concept_id": "backpropagation_and_gradient_descent",
+          "lesson_order": 2,
+          "title": "Backpropagation, Reverse-Mode Automatic Differentiation, and Gradient Descent",
+          "learning_objectives": [
+            "Formulate reverse-mode automatic differentiation over a computational graph using the chain rule.",
+            "Explain how backpropagation computes layer-wise error sensitivities efficiently in a single backward pass.",
+            "Implement forward and backward passes for a multilayer perceptron trained via stochastic gradient descent."
+          ],
+          "prerequisites": [
+            "math_linear_algebra_calculus"
+          ],
+          "prerequisite_lesson_ids": [
+            "lesson_01_linear_algebra_and_multivariable_calculus"
+          ],
+          "explanation": "Backpropagation applies the multivariable chain rule recursively from the output loss backward through intermediate layers to compute exact gradients with respect to every weight. Rather than recomputing shared subexpressions, reverse-mode differentiation caches forward activations and propagates local sensitivities in O(W) time, enabling gradient descent optimization across multilayer networks. Retrieved primary evidence (Backpropagation, SRC-WIKIPEDIA): \"Backpropagation In machine learning, backpropagation is a gradient computation method commonly used for training a neural network in computing parameter updates. It is an efficient application of the chain rule to neural networks. Backpr...\" [chk_0a6023ab662bc6b4] [chk_258896475e232c3d] [chk_0defbb8fe8944c71].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_0a6023ab662bc6b4",
+              "title": "Backpropagation",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "chunk_id": "chk_0a6023ab662bc6b4",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_258896475e232c3d",
+              "title": "Backpropagation",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "chunk_id": "chk_258896475e232c3d",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_0defbb8fe8944c71",
+              "title": "Backpropagation",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "chunk_id": "chk_0defbb8fe8944c71",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_res_0098016d9acf1f99",
+              "title": "Geoffrey Hinton",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_0098016d9acf1f99",
+              "chunk_id": "",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/index.html",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            },
+            {
+              "citation_id": "cit_res_a630f9fe47ef1eb5",
+              "title": "Neural-network tutorials",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_a630f9fe47ef1eb5",
+              "chunk_id": "",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/nntut.html",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_02_reverse_mode_mlp",
+              "title": "Two-Layer MLP Backward Pass from Scratch",
+              "description": "Implement forward caching and backward gradient propagation for a 2-layer MLP with cross-entropy loss and compare against numerical gradients.",
+              "deliverable": "Unit-tested backpropagation module passing gradient checks on synthetic classification data."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_02_scalar_and_tensor_autograd_engine",
+              "title": "Minimal Reverse-Mode Autograd Engine",
+              "description": "Build a computational graph engine supporting topological sorting, reverse-mode backprop, and SGD/Momentum optimizers.",
+              "deliverable": "End-to-end training run demonstrating loss convergence on a non-linear decision boundary."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_02_backpropagation_and_automatic_differentiation",
+            "lesson_id": "lesson_02_backpropagation_and_automatic_differentiation",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "Explain why reverse-mode differentiation scales vastly better than forward-mode differentiation when mapping millions of parameters to a scalar loss.",
+              "Trace the exact cached quantities needed from the forward pass to compute dL/dW^(l) during the backward pass."
+            ],
+            "pass_criteria": [
+              "Identifies upstream gradient delta^(l) and previous activation a^(l-1) as the required outer-product terms.",
+              "Correctly contrasts O(1) backward sweeps for scalar losses with O(N) forward-mode sweeps."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_0a6023ab662bc6b4",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "title": "Backpropagation",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "chunk_id": "chk_0a6023ab662bc6b4",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=0 (0..364)",
+              "excerpt_summary": "Backpropagation In machine learning, backpropagation is a gradient computation method commonly used for training a neural network in computing parameter updates. It is an efficient application of t...",
+              "relevance_score": 0.6894
+            },
+            {
+              "citation_id": "cit_chk_258896475e232c3d",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "title": "Backpropagation",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "chunk_id": "chk_258896475e232c3d",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=1 (269..749)",
+              "excerpt_summary": "the gradient of the loss with respect to the network weights for a single input–output example. It does this by propagating derivatives backward, one layer at a time, from the output layer to the i...",
+              "relevance_score": 0.5452
+            },
+            {
+              "citation_id": "cit_chk_0defbb8fe8944c71",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_24d64fe06f34c722",
+              "title": "Backpropagation",
+              "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+              "chunk_id": "chk_0defbb8fe8944c71",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=2 (650..1204)",
+              "excerpt_summary": "the gradient is used, but the term is often used loosely to refer to the entire learning algorithm. This includes changing model parameters in the negative direction of the gradient, such as by sto...",
+              "relevance_score": 0.4786
+            },
+            {
+              "citation_id": "cit_res_0098016d9acf1f99",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_0098016d9acf1f99",
+              "title": "Geoffrey Hinton",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/index.html",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_0098016d9acf1f99 (metadata-only)",
+              "excerpt_summary": "Approved catalog entry from Geoffrey Hinton Official Website (University of Toronto) (metadata-only).",
+              "relevance_score": 0.85
+            },
+            {
+              "citation_id": "cit_res_a630f9fe47ef1eb5",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_a630f9fe47ef1eb5",
+              "title": "Neural-network tutorials",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/nntut.html",
+              "chunk_id": null,
+              "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+              "locator": "resource_id=res_a630f9fe47ef1eb5 (metadata-only-not-yet-collected)",
+              "excerpt_summary": "Tutorial title, year, topic, duration, slide/PDF/readings/video links",
+              "relevance_score": 0.65
+            }
+          ],
+          "rationale_for_ordering": "Immediately follows Linear Algebra & Multivariable Calculus (`math_linear_algebra_calculus`) and precedes all deep neural architectures because every subsequent model relies on backpropagation for credit assignment.",
+          "evidence_gaps": [
+            "Resource 'Geoffrey Hinton' (res_0098016d9acf1f99, SRC-HINTON) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed.",
+            "Resource 'Neural-network tutorials' (res_a630f9fe47ef1eb5, SRC-HINTON) is currently at tier APPROVED_UNCOLLECTED_RESOURCE (metadata-only-not-yet-collected); full-text chunks are not yet indexed."
+          ]
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_02_core_deep_learning_and_regularization",
+      "stage_order": 2,
+      "title": "Stage 2: Core Deep Learning, Generalization, and Energy-Based Models",
+      "stage_objectives": [
+        "Diagnose overfitting and complex feature co-adaptation in overparameterized feedforward networks.",
+        "Implement inverted dropout during training and deterministic weight scaling at inference time.",
+        "Define the global energy function E(s) of a Boltzmann machine over symmetric binary stochastic units.",
+        "Relate the Boltzmann-Gibbs equilibrium probability distribution to thermal temperature T and energy gaps."
+      ],
+      "prerequisite_stage_ids": [
+        "stage_01_mathematical_and_programming_foundations"
+      ],
+      "rationale_for_ordering": "Stage 2: Core Deep Learning, Generalization, and Energy-Based Models is positioned at stage_order=2 because all constituent lessons (lesson_03_generalization_and_dropout_regularization, lesson_04_boltzmann_machines_and_stochastic_ representations) have their prerequisite concepts satisfied by earlier stages (stage_01_mathematical_and_programming_foundations).",
+      "lessons": [
+        {
+          "lesson_id": "lesson_03_generalization_and_dropout_regularization",
+          "concept_id": "regularization_and_dropout",
+          "lesson_order": 3,
+          "title": "Overfitting, Feature Co-Adaptation, and Dropout Regularization",
+          "learning_objectives": [
+            "Diagnose overfitting and complex feature co-adaptation in overparameterized feedforward networks.",
+            "Implement inverted dropout during training and deterministic weight scaling at inference time.",
+            "Analyze dropout as approximate geometric model averaging across exponentially many thinned sub-networks."
+          ],
+          "prerequisites": [
+            "backpropagation_and_gradient_descent"
+          ],
+          "prerequisite_lesson_ids": [
+            "lesson_02_backpropagation_and_automatic_differentiation"
+          ],
+          "explanation": "When a large feedforward neural network is trained on a finite dataset, hidden units can co-adapt to fix errors made by other specific units, leading to brittle generalization on unseen test data. Randomly omitting a fraction of hidden feature detectors on each training case prevents complex co-adaptations and acts as an efficient ensemble over thinned networks. Retrieved primary evidence (Improving neural networks by preventing co-adaptation of feature detectors, SRC-ARXIV): \"Improving neural networks by preventing co-adaptation of feature detectors When a large feedforward neural network is trained on a small training set, it typically performs poorly on held-out test data. This \"overfitting\" is greatly redu...\" [chk_364466882e422f57] [chk_79ddf8d5602675a3].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_364466882e422f57",
+              "title": "Improving neural networks by preventing co-adaptation of feature detectors",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_ab5dba0c12050d69",
+              "chunk_id": "chk_364466882e422f57",
+              "canonical_url": "https://arxiv.org/abs/1207.0580",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_79ddf8d5602675a3",
+              "title": "Improving neural networks by preventing co-adaptation of feature detectors",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_ab5dba0c12050d69",
+              "chunk_id": "chk_79ddf8d5602675a3",
+              "canonical_url": "https://arxiv.org/abs/1207.0580",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_res_e344b54452f01c96",
+              "title": "Publications - Geoffrey Hinton",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_e344b54452f01c96",
+              "chunk_id": "",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/pages/publications.html",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_03_inverted_dropout_layer",
+              "title": "Train vs. Eval Mode Inverted Dropout",
+              "description": "Implement an inverted dropout layer with configurable drop probability p, verifying that expected activation magnitude remains invariant between training and evaluation modes.",
+              "deliverable": "Python test suite validating expectation invariance and overfitting reduction."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_03_generalization_ablation_study",
+              "title": "Regularization Ablation Study (No Regularization vs. L2 vs. Dropout)",
+              "description": "Train deep MLPs on a small-sample benchmark across varying dropout rates (p in {0.0, 0.2, 0.5}) and log train/validation generalization gaps.",
+              "deliverable": "Structured experiment report with learning curves and co-adaptation diagnostics."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_03_generalization_and_dropout_regularization",
+            "lesson_id": "lesson_03_generalization_and_dropout_regularization",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "Why does randomly zeroing hidden units with probability p = 0.5 prevent feature co-adaptation?",
+              "How must outgoing weights or training activations be scaled so that test-time forward passes approximate the ensemble geometric mean without sampling masks?"
+            ],
+            "pass_criteria": [
+              "Explains that each hidden unit must learn to be useful across many random subsets of collaborating units.",
+              "Accurately derives the 1/(1-p) inverted training scaling or (1-p) test-time weight multiplication."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_364466882e422f57",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_ab5dba0c12050d69",
+              "title": "Improving neural networks by preventing co-adaptation of feature detectors",
+              "canonical_url": "https://arxiv.org/abs/1207.0580",
+              "chunk_id": "chk_364466882e422f57",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=0 (0..456)",
+              "excerpt_summary": "Improving neural networks by preventing co-adaptation of feature detectors When a large feedforward neural network is trained on a small training set, it typically performs poorly on held-out test...",
+              "relevance_score": 0.4917
+            },
+            {
+              "citation_id": "cit_chk_79ddf8d5602675a3",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_ab5dba0c12050d69",
+              "title": "Improving neural networks by preventing co-adaptation of feature detectors",
+              "canonical_url": "https://arxiv.org/abs/1207.0580",
+              "chunk_id": "chk_79ddf8d5602675a3",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=1 (362..770)",
+              "excerpt_summary": "a feature detector is only helpful in the context of several other specific feature detectors. Instead, each neuron learns to detect a feature that is generally helpful for producing the correct an...",
+              "relevance_score": 0.3999
+            },
+            {
+              "citation_id": "cit_res_e344b54452f01c96",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_e344b54452f01c96",
+              "title": "Publications - Geoffrey Hinton",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/pages/publications.html",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_e344b54452f01c96 (metadata-only)",
+              "excerpt_summary": "Approved catalog entry from Geoffrey Hinton Official Website (University of Toronto) (metadata-only).",
+              "relevance_score": 0.85
+            }
+          ],
+          "rationale_for_ordering": "Requires `backpropagation_and_gradient_descent` to train multilayer networks first, and precedes deeper architectural scaling (`deep_residual_networks`) where optimization and generalization must be separated.",
+          "evidence_gaps": [
+            "Resource 'Publications - Geoffrey Hinton' (res_e344b54452f01c96, SRC-HINTON) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed."
+          ]
+        },
+        {
+          "lesson_id": "lesson_04_boltzmann_machines_and_stochastic_ representations",
+          "concept_id": "energy_based_and_boltzmann_models",
+          "lesson_order": 4,
+          "title": "Energy-Based Models, Boltzmann Machines, and Stochastic Representation Learning",
+          "learning_objectives": [
+            "Define the global energy function E(s) of a Boltzmann machine over symmetric binary stochastic units.",
+            "Relate the Boltzmann-Gibbs equilibrium probability distribution to thermal temperature T and energy gaps.",
+            "Explain why unrestricted partition function intractability motivates Restricted Boltzmann Machines (RBMs) and Contrastive Divergence."
+          ],
+          "prerequisites": [
+            "backpropagation_and_gradient_descent"
+          ],
+          "prerequisite_lesson_ids": [
+            "lesson_02_backpropagation_and_automatic_differentiation"
+          ],
+          "explanation": "Beyond deterministic feedforward mappings, stochastic energy-based models assign a scalar energy to every joint configuration of visible and hidden units. Introduced by Geoffrey Hinton and Terry Sejnowski, Boltzmann machines bridge statistical mechanics and representation learning, while Restricted Boltzmann Machines (RBMs) remove intra-layer connections to make conditional inference tractable. Retrieved primary evidence (Boltzmann machine, SRC-WIKIPEDIA): \"Boltzmann machine A Boltzmann machine (also called Sherrington–Kirkpatrick model with external field or stochastic Ising model), named after Ludwig Boltzmann, is a spin-glass model with an external field, i.e., a Sherrington–Kirkpatrick...\" [chk_41f22d9bb264fa27] [chk_e030fa031667493c] [chk_3c549b1da926ac49].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_41f22d9bb264fa27",
+              "title": "Boltzmann machine",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "chunk_id": "chk_41f22d9bb264fa27",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_e030fa031667493c",
+              "title": "Boltzmann machine",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "chunk_id": "chk_e030fa031667493c",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_3c549b1da926ac49",
+              "title": "Boltzmann machine",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "chunk_id": "chk_3c549b1da926ac49",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_res_0098016d9acf1f99",
+              "title": "Geoffrey Hinton",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_0098016d9acf1f99",
+              "chunk_id": "",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/index.html",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            },
+            {
+              "citation_id": "cit_res_e344b54452f01c96",
+              "title": "Publications - Geoffrey Hinton",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_e344b54452f01c96",
+              "chunk_id": "",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/pages/publications.html",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_04_gibbs_sampling_rbm",
+              "title": "Energy Function & Block Gibbs Sampler for a Toy RBM",
+              "description": "Compute exact configuration energies E(v, h) on a small binary system and compare exact marginal probabilities against block Gibbs sampling.",
+              "deliverable": "Python script verifying KL divergence convergence toward the true Boltzmann distribution."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_04_rbm_feature_discovery",
+              "title": "Unsupervised Latent Feature Learning with an RBM",
+              "description": "Train a Restricted Boltzmann Machine using k-step Contrastive Divergence (CD-k) on binary patterns and inspect learned receptive fields.",
+              "deliverable": "Reproducible experiment log + visualization of hidden unit weights and reconstructions."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_04_boltzmann_machines_and_stochastic_ representations",
+            "lesson_id": "lesson_04_boltzmann_machines_and_stochastic_ representations",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "Write the global energy function E(s) of a Boltzmann machine and explain the role of symmetric weights w_ij = w_ji with zero self-connections.",
+              "Why does removing within-layer connections in an RBM make P(h | v) and P(v | h) conditionally independent?"
+            ],
+            "pass_criteria": [
+              "Correctly states E(s) = -sum_{i<j} w_ij s_i s_j - sum_i theta_i s_i.",
+              "Demonstrates that bipartite graph factorization eliminates couplings among hidden units given visible units."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_41f22d9bb264fa27",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "title": "Boltzmann machine",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "chunk_id": "chk_41f22d9bb264fa27",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=0 (0..361)",
+              "excerpt_summary": "Boltzmann machine A Boltzmann machine (also called Sherrington–Kirkpatrick model with external field or stochastic Ising model), named after Ludwig Boltzmann, is a spin-glass model with an external...",
+              "relevance_score": 0.4214
+            },
+            {
+              "citation_id": "cit_chk_e030fa031667493c",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "title": "Boltzmann machine",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "chunk_id": "chk_e030fa031667493c",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=3 (947..1349)",
+              "excerpt_summary": "the Boltzmann distribution in statistical mechanics, which is used in their sampling function. They were heavily popularized and promoted by Geoffrey Hinton, Terry Sejnowski and Yann LeCun in cogni...",
+              "relevance_score": 0.357
+            },
+            {
+              "citation_id": "cit_chk_3c549b1da926ac49",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "title": "Boltzmann machine",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "chunk_id": "chk_3c549b1da926ac49",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=1 (266..661)",
+              "excerpt_summary": "Ising model. It is a statistical physics technique applied in the context of cognitive science. It is also classified as a Markov random field. Boltzmann machines are theoretically intriguing becau...",
+              "relevance_score": 0.3236
+            },
+            {
+              "citation_id": "cit_res_0098016d9acf1f99",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_0098016d9acf1f99",
+              "title": "Geoffrey Hinton",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/index.html",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_0098016d9acf1f99 (metadata-only)",
+              "excerpt_summary": "Approved catalog entry from Geoffrey Hinton Official Website (University of Toronto) (metadata-only).",
+              "relevance_score": 0.85
+            },
+            {
+              "citation_id": "cit_res_e344b54452f01c96",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_e344b54452f01c96",
+              "title": "Publications - Geoffrey Hinton",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/pages/publications.html",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_e344b54452f01c96 (metadata-only)",
+              "excerpt_summary": "Approved catalog entry from Geoffrey Hinton Official Website (University of Toronto) (metadata-only).",
+              "relevance_score": 0.85
+            }
+          ],
+          "rationale_for_ordering": "Builds on optimization and probability foundations from Stage 1 to introduce unsupervised/generative representation learning before modern deep architectures and frontier research.",
+          "evidence_gaps": [
+            "Resource 'Geoffrey Hinton' (res_0098016d9acf1f99, SRC-HINTON) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed.",
+            "Resource 'Publications - Geoffrey Hinton' (res_e344b54452f01c96, SRC-HINTON) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed."
+          ]
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_03_deep_architectures_and_sequence_attention",
+      "stage_order": 3,
+      "title": "Stage 3: Deep Residual Architectures, Sequence Alignment, and Transformers",
+      "stage_objectives": [
+        "Distinguish the deep network training degradation problem from classical overfitting.",
+        "Reformulate stacked layers to learn residual mappings F(x) := H(x) - x with parameter-free identity shortcuts F(x) + x.",
+        "Identify why compressing variable-length input sequences into a single fixed-length vector bottlenecks encoder-decoder performance.",
+        "Formulate additive (Bahdanau) soft alignment scores e_{ij}, attention weights alpha_{ij}, and dynamic context vectors c_i.",
+        "Contrast recurrent/convolutional sequence transduction with the recurrence-free Transformer architecture.",
+        "Implement Scaled Dot-Product Attention, Multi-Head Attention projections, and residual layer-normalized sub-layers."
+      ],
+      "prerequisite_stage_ids": [
+        "stage_01_mathematical_and_programming_foundations",
+        "stage_02_core_deep_learning_and_regularization"
+      ],
+      "rationale_for_ordering": "Stage 3: Deep Residual Architectures, Sequence Alignment, and Transformers is positioned at stage_order=3 because all constituent lessons (lesson_05_residual_learning_and_identity_shortcuts, lesson_06_encoder_decoder_bottlenecks_and_bahdanau_attention, lesson_07_transformer_multi_head_self_attention) have their prerequisite concepts satisfied by earlier stages (stage_01_mathematical_and_programming_foundations, stage_02_core_deep_learning_and_regularization).",
+      "lessons": [
+        {
+          "lesson_id": "lesson_05_residual_learning_and_identity_shortcuts",
+          "concept_id": "deep_residual_networks",
+          "lesson_order": 5,
+          "title": "Deep Residual Learning (ResNet), Degradation vs. Overfitting, and Identity Shortcut Connections",
+          "learning_objectives": [
+            "Distinguish the deep network training degradation problem from classical overfitting.",
+            "Reformulate stacked layers to learn residual mappings F(x) := H(x) - x with parameter-free identity shortcuts F(x) + x.",
+            "Analyze why identity skip connections preserve gradient flow across 100+ layer networks and Transformer blocks."
+          ],
+          "prerequisites": [
+            "backpropagation_and_gradient_descent",
+            "regularization_and_dropout"
+          ],
+          "prerequisite_lesson_ids": [
+            "lesson_02_backpropagation_and_automatic_differentiation",
+            "lesson_03_generalization_and_dropout_regularization"
+          ],
+          "explanation": "As neural networks grow deeper, training accuracy can saturate and degrade rapidly—not from overfitting, but because stacked nonlinear layers struggle to approximate identity mappings. By explicitly reformulating layers to learn residual functions F(x) = H(x) - x added to an identity shortcut x, Deep Residual Networks (ResNets) enable stable optimization at extreme depth without adding extra parameters or computational complexity. Retrieved primary evidence (Deep Residual Learning for Image Recognition, SRC-ARXIV): \"Deep Residual Learning for Image Recognition Deeper neural networks are more difficult to train. We present a residual learning framework to ease the training of networks that are substantially deeper than those used previously. We expli...\" [chk_6307d5af3393ec0c] [chk_819d87281b2a2264] [chk_7dee843efa016d98].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_6307d5af3393ec0c",
+              "title": "Deep Residual Learning for Image Recognition",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "chunk_id": "chk_6307d5af3393ec0c",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_819d87281b2a2264",
+              "title": "Deep Residual Learning for Image Recognition",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "chunk_id": "chk_819d87281b2a2264",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_7dee843efa016d98",
+              "title": "Deep Residual Learning for Image Recognition",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "chunk_id": "chk_7dee843efa016d98",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_05_residual_gradient_flow",
+              "title": "Plain Network vs. Residual Block Gradient Norm Diagnostic",
+              "description": "Implement a ResidualBlock(x) = x + F(x) and measure backward gradient norms dL/dx across a 32-block stack compared to a plain stack.",
+              "deliverable": "Diagnostic script demonstrating non-vanishing gradient propagation through identity shortcuts."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_05_resnet_ablation_benchmark",
+              "title": "Plain vs. Residual Network Degradation Reproduction",
+              "description": "Compare shallow vs. deep plain networks against residual counterparts, logging training error to verify resolution of the degradation anomaly.",
+              "deliverable": "Benchmark script and quantitative training/validation loss comparison table."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_05_residual_learning_and_identity_shortcuts",
+            "lesson_id": "lesson_05_residual_learning_and_identity_shortcuts",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "Why do the authors of ResNet argue that the degradation of training accuracy in deeper plain networks is NOT caused by overfitting?",
+              "Using the backward chain rule on y = x + F(x, W), show why gradients can flow unimpeded to earlier layers even when dF/dx is small."
+            ],
+            "pass_criteria": [
+              "Points out that overfitting lowers test accuracy while training error stays low, whereas degradation raises training error itself.",
+              "Derives dy/dx = I + dF/dx, showing the additive identity term I prevents multiplicative gradient collapse."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_6307d5af3393ec0c",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "title": "Deep Residual Learning for Image Recognition",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "chunk_id": "chk_6307d5af3393ec0c",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=0 (0..539)",
+              "excerpt_summary": "Deep Residual Learning for Image Recognition Deeper neural networks are more difficult to train. We present a residual learning framework to ease the training of networks that are substantially dee...",
+              "relevance_score": 0.3647
+            },
+            {
+              "citation_id": "cit_chk_819d87281b2a2264",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "title": "Deep Residual Learning for Image Recognition",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "chunk_id": "chk_819d87281b2a2264",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=1 (441..987)",
+              "excerpt_summary": "residual networks are easier to optimize, and can gain accuracy from considerably increased depth. On the ImageNet dataset we evaluate residual nets with a depth of up to 152 layers---8x deeper tha...",
+              "relevance_score": 0.356
+            },
+            {
+              "citation_id": "cit_chk_7dee843efa016d98",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "title": "Deep Residual Learning for Image Recognition",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "chunk_id": "chk_7dee843efa016d98",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=2 (891..1333)",
+              "excerpt_summary": "layers. The depth of representations is of central importance for many visual recognition tasks. Solely due to our extremely deep representations, we obtain a 28% relative improvement on the COCO o...",
+              "relevance_score": 0.2185
+            }
+          ],
+          "rationale_for_ordering": "Requires both `backpropagation_and_gradient_descent` and `regularization_and_dropout` (to contrast degradation against overfitting) and provides the residual skip-connection primitive used inside every Transformer sub-layer.",
+          "evidence_gaps": []
+        },
+        {
+          "lesson_id": "lesson_06_encoder_decoder_bottlenecks_and_bahdanau_attention",
+          "concept_id": "sequence_alignment_and_bahdanau_attention",
+          "lesson_order": 6,
+          "title": "Sequence-to-Sequence Bottlenecks and Joint Alignment & Translation (Bahdanau Attention)",
+          "learning_objectives": [
+            "Identify why compressing variable-length input sequences into a single fixed-length vector bottlenecks encoder-decoder performance.",
+            "Formulate additive (Bahdanau) soft alignment scores e_{ij}, attention weights alpha_{ij}, and dynamic context vectors c_i.",
+            "Implement a Differentiable Attention Alignment module that searches over source annotations during decoding."
+          ],
+          "prerequisites": [
+            "backpropagation_and_gradient_descent",
+            "regularization_and_dropout"
+          ],
+          "prerequisite_lesson_ids": [
+            "lesson_02_backpropagation_and_automatic_differentiation",
+            "lesson_03_generalization_and_dropout_regularization"
+          ],
+          "explanation": "Classical encoder-decoder sequence models compress an entire input sentence into a single fixed-length vector, causing severe information loss on long sequences. Bahdanau, Cho, and Bengio (2014) resolved this bottleneck by allowing the decoder to softly search over all encoder hidden annotations at each generation step, computing differentiable alignment weights jointly with translation. Retrieved primary evidence (Neural Machine Translation by Jointly Learning to Align and Translate, SRC-ARXIV): \"encodes a source sentence into a fixed-length vector from which a decoder generates a translation. In this paper, we conjecture that the use of a fixed-length vector is a bottleneck in improving the performance of this basic encoder-deco...\" [chk_cbf933bd5853089c] [chk_fb78852dfe1044b4] [chk_f38d9214a536ff59].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_cbf933bd5853089c",
+              "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_0b4b872c018ccdcc",
+              "chunk_id": "chk_cbf933bd5853089c",
+              "canonical_url": "https://arxiv.org/abs/1409.0473",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_fb78852dfe1044b4",
+              "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_0b4b872c018ccdcc",
+              "chunk_id": "chk_fb78852dfe1044b4",
+              "canonical_url": "https://arxiv.org/abs/1409.0473",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_f38d9214a536ff59",
+              "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_0b4b872c018ccdcc",
+              "chunk_id": "chk_f38d9214a536ff59",
+              "canonical_url": "https://arxiv.org/abs/1409.0473",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_res_5fb3d618c7ed17ec",
+              "title": "Research | Yoshua Bengio",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_5fb3d618c7ed17ec",
+              "chunk_id": "",
+              "canonical_url": "https://yoshuabengio.org/en/research",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_06_additive_attention_alignment",
+              "title": "Additive (Bahdanau) Attention & Alignment Matrix Inspector",
+              "description": "Implement score(s_{i-1}, h_j) = v_a^T tanh(W_a s_{i-1} + U_a h_j), normalize with softmax, and compute step-wise context vectors.",
+              "deliverable": "Python module outputting normalized alignment weights (summing to 1.0 per decoding step)."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_06_seq2seq_length_bottleneck_study",
+              "title": "Fixed-Vector Encoder-Decoder vs. Soft-Attention Sequence Benchmark",
+              "description": "Evaluate sequence reconstruction/lookup accuracy as sequence length grows from 8 to 64 tokens with and without soft attention.",
+              "deliverable": "Accuracy-vs-sequence-length evaluation report and attention heatmap artifact."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_06_encoder_decoder_bottlenecks_and_bahdanau_attention",
+            "lesson_id": "lesson_06_encoder_decoder_bottlenecks_and_bahdanau_attention",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "What specific structural limitation of standard encoder-decoder architectures motivated Bahdanau et al. (2014)?",
+              "How does soft alignment remain end-to-end differentiable with standard backpropagation?"
+            ],
+            "pass_criteria": [
+              "Identifies the fixed-length context vector compression bottleneck on long sentences.",
+              "Explains that continuous softmax-weighted sums over encoder annotations replace discrete hard alignments."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_cbf933bd5853089c",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_0b4b872c018ccdcc",
+              "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+              "canonical_url": "https://arxiv.org/abs/1409.0473",
+              "chunk_id": "chk_cbf933bd5853089c",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=1 (486..961)",
+              "excerpt_summary": "encodes a source sentence into a fixed-length vector from which a decoder generates a translation. In this paper, we conjecture that the use of a fixed-length vector is a bottleneck in improving th...",
+              "relevance_score": 0.5778
+            },
+            {
+              "citation_id": "cit_chk_fb78852dfe1044b4",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_0b4b872c018ccdcc",
+              "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+              "canonical_url": "https://arxiv.org/abs/1409.0473",
+              "chunk_id": "chk_fb78852dfe1044b4",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=0 (0..584)",
+              "excerpt_summary": "Neural Machine Translation by Jointly Learning to Align and Translate Neural machine translation is a recently proposed approach to machine translation. Unlike the traditional statistical machine t...",
+              "relevance_score": 0.5352
+            },
+            {
+              "citation_id": "cit_chk_f38d9214a536ff59",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_0b4b872c018ccdcc",
+              "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+              "canonical_url": "https://arxiv.org/abs/1409.0473",
+              "chunk_id": "chk_f38d9214a536ff59",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=2 (868..1251)",
+              "excerpt_summary": "to predicting a target word, without having to form these parts as a hard segment explicitly. With this new approach, we achieve a translation performance comparable to the existing state-of-the-ar...",
+              "relevance_score": 0.1669
+            },
+            {
+              "citation_id": "cit_res_5fb3d618c7ed17ec",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_5fb3d618c7ed17ec",
+              "title": "Research | Yoshua Bengio",
+              "canonical_url": "https://yoshuabengio.org/en/research",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_5fb3d618c7ed17ec (metadata-only)",
+              "excerpt_summary": "At the beginning of 2023, I began a pivot from research in machine learning aimed at increasing AI capabilities and applying AI for the benefit of society to research on AI safety: what can go possibly wrong as we approach or surpass human-level intelligence with AI, and how do we design AI so that it will not harm humans in the first place?",
+              "relevance_score": 0.85
+            }
+          ],
+          "rationale_for_ordering": "Builds on Stage 1-2 neural training foundations and must precede `transformer_self_attention_architecture`, which generalizes encoder-decoder alignment into purely attention-driven sequence transduction.",
+          "evidence_gaps": [
+            "Resource 'Research | Yoshua Bengio' (res_5fb3d618c7ed17ec, SRC-BENGIO) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed."
+          ]
+        },
+        {
+          "lesson_id": "lesson_07_transformer_multi_head_self_attention",
+          "concept_id": "transformer_self_attention_architecture",
+          "lesson_order": 7,
+          "title": "The Transformer Architecture: Scaled Dot-Product and Multi-Head Self-Attention",
+          "learning_objectives": [
+            "Contrast recurrent/convolutional sequence transduction with the recurrence-free Transformer architecture.",
+            "Implement Scaled Dot-Product Attention, Multi-Head Attention projections, and residual layer-normalized sub-layers.",
+            "Explain how eliminating sequential recurrence unlocks O(1) sequential operations and massive training parallelization."
+          ],
+          "prerequisites": [
+            "deep_residual_networks",
+            "sequence_alignment_and_bahdanau_attention"
+          ],
+          "prerequisite_lesson_ids": [
+            "lesson_05_residual_learning_and_identity_shortcuts",
+            "lesson_06_encoder_decoder_bottlenecks_and_bahdanau_attention"
+          ],
+          "explanation": "Vaswani et al. (2017) introduced the Transformer, a sequence transduction architecture based solely on attention mechanisms, dispensing with recurrence and convolutions entirely. By combining multi-head self-attention with residual connections (from ResNet) and position-wise feed-forward networks, Transformers achieve superior quality while allowing significantly greater parallelization during training. Retrieved primary evidence (Attention Is All You Need, SRC-ARXIV): \"Attention Is All You Need The dominant sequence transduction models are based on complex recurrent or convolutional neural networks in an encoder-decoder configuration. The best performing models also connect the encoder and decoder thro...\" [chk_473fcba29c29f97a] [chk_f01c5990340cadda] [chk_2436d59a2b39053b].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_473fcba29c29f97a",
+              "title": "Attention Is All You Need",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_a475a00509c48269",
+              "chunk_id": "chk_473fcba29c29f97a",
+              "canonical_url": "https://arxiv.org/abs/1706.03762",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_f01c5990340cadda",
+              "title": "Attention Is All You Need",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_a475a00509c48269",
+              "chunk_id": "chk_f01c5990340cadda",
+              "canonical_url": "https://arxiv.org/abs/1706.03762",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_2436d59a2b39053b",
+              "title": "Attention Is All You Need",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_a475a00509c48269",
+              "chunk_id": "chk_2436d59a2b39053b",
+              "canonical_url": "https://arxiv.org/abs/1706.03762",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_07_scaled_dot_product_multihead",
+              "title": "Scaled Dot-Product & Causal Multi-Head Attention Implementation",
+              "description": "Implement Attention(Q, K, V) = softmax(QK^T / sqrt(d_k))V with causal masking and multi-head concatenation.",
+              "deliverable": "Unit-tested Python module verifying causal masking (zero leakage from future tokens) and shape invariants."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_07_mini_transformer_transducer",
+              "title": "End-to-End Transformer Block with Residual Connections",
+              "description": "Assemble multi-head self-attention, residual skip connections, layer normalization, and position-wise MLPs into a complete trainable Transformer encoder-decoder.",
+              "deliverable": "Trainable Transformer implementation with attention head inspection and throughput comparison."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_07_transformer_multi_head_self_attention",
+            "lesson_id": "lesson_07_transformer_multi_head_self_attention",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "How does the Transformer differ from prior dominant sequence transduction models that paired RNNs or CNNs with attention?",
+              "Why do residual connections (`deep_residual_networks`) and attention alignment (`sequence_alignment_and_bahdanau_attention`) both serve as direct prerequisites for the Transformer?"
+            ],
+            "pass_criteria": [
+              "States that the Transformer dispenses with recurrence and convolutions entirely, relying solely on attention mechanisms.",
+              "Explains that self-attention generalizes alignment while residual shortcuts enable deep stacking of attention/MLP sublayers."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_473fcba29c29f97a",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_a475a00509c48269",
+              "title": "Attention Is All You Need",
+              "canonical_url": "https://arxiv.org/abs/1706.03762",
+              "chunk_id": "chk_473fcba29c29f97a",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=0 (0..589)",
+              "excerpt_summary": "Attention Is All You Need The dominant sequence transduction models are based on complex recurrent or convolutional neural networks in an encoder-decoder configuration. The best performing models a...",
+              "relevance_score": 0.6344
+            },
+            {
+              "citation_id": "cit_chk_f01c5990340cadda",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_a475a00509c48269",
+              "title": "Attention Is All You Need",
+              "canonical_url": "https://arxiv.org/abs/1706.03762",
+              "chunk_id": "chk_f01c5990340cadda",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=2 (901..1163)",
+              "excerpt_summary": "days on eight GPUs, a small fraction of the training costs of the best models from the literature. We show that the Transformer generalizes well to other tasks by applying it successfully to Englis...",
+              "relevance_score": 0.1875
+            },
+            {
+              "citation_id": "cit_chk_2436d59a2b39053b",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_a475a00509c48269",
+              "title": "Attention Is All You Need",
+              "canonical_url": "https://arxiv.org/abs/1706.03762",
+              "chunk_id": "chk_2436d59a2b39053b",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=1 (490..999)",
+              "excerpt_summary": "superior in quality while being more parallelizable and requiring significantly less time to train. Our model achieves 28.4 BLEU on the WMT 2014 English-to-German translation task, improving over t...",
+              "relevance_score": 0.1079
+            }
+          ],
+          "rationale_for_ordering": "Requires both `deep_residual_networks` (for residual sub-layer connections) and `sequence_alignment_and_bahdanau_attention` (for attention mechanisms) before synthesizing the full Transformer.",
+          "evidence_gaps": []
+        }
+      ]
+    },
+    {
+      "stage_id": "stage_04_research_methodology_and_frontier_safety",
+      "stage_order": 4,
+      "title": "Stage 4: AI Research Methodology, Generative Frontiers, and AI Safety",
+      "stage_objectives": [
+        "Design controlled ablation experiments, baselines, and reproducible evaluation harnesses (exemplified by Dropout, ResNet, and Transformer papers).",
+        "Survey frontier research directions in our curated catalog, including Generative Flow Networks (GFlowNets) and honest/cautious scientist AI safety frameworks."
+      ],
+      "prerequisite_stage_ids": [
+        "stage_01_mathematical_and_programming_foundations",
+        "stage_02_core_deep_learning_and_regularization",
+        "stage_03_deep_architectures_and_sequence_attention"
+      ],
+      "rationale_for_ordering": "Stage 4: AI Research Methodology, Generative Frontiers, and AI Safety is positioned at stage_order=4 because all constituent lessons (lesson_08_research_formulation_ablation_and_ai_safety) have their prerequisite concepts satisfied by earlier stages (stage_01_mathematical_and_programming_foundations, stage_02_core_deep_learning_and_regularization, stage_03_deep_architectures_and_sequence_attention).",
+      "lessons": [
+        {
+          "lesson_id": "lesson_08_research_formulation_ablation_and_ai_safety",
+          "concept_id": "ai_research_methodology_and_safety_frontiers",
+          "lesson_order": 8,
+          "title": "Transitioning from AI Engineer to AI Researcher: Hypothesis Design, GFlowNets, and AI Safety",
+          "learning_objectives": [
+            "Design controlled ablation experiments, baselines, and reproducible evaluation harnesses (exemplified by Dropout, ResNet, and Transformer papers).",
+            "Survey frontier research directions in our curated catalog, including Generative Flow Networks (GFlowNets) and honest/cautious scientist AI safety frameworks.",
+            "Maintain strict epistemic hygiene: separate primary empirical evidence from metadata-only research seeds and candidate news feeds (`SRC-THE-BATCH`)."
+          ],
+          "prerequisites": [
+            "energy_based_and_boltzmann_models",
+            "transformer_self_attention_architecture"
+          ],
+          "prerequisite_lesson_ids": [
+            "lesson_04_boltzmann_machines_and_stochastic_ representations",
+            "lesson_07_transformer_multi_head_self_attention"
+          ],
+          "explanation": "Transitioning from an AI engineer who implements architectures to an AI researcher who advances the field requires rigorous hypothesis formulation, controlled ablations, and awareness of long-horizon safety and governance challenges. In our curated repository, verified research portals from Geoffrey Hinton and Yoshua Bengio define key themes in representation learning, Generative Flow Networks, and AI safety, while also highlighting where full-text primary papers remain to be collected. Retrieved primary evidence (Deep Residual Learning for Image Recognition, SRC-ARXIV): \"Deep Residual Learning for Image Recognition Deeper neural networks are more difficult to train. We present a residual learning framework to ease the training of networks that are substantially deeper than those used previously. We expli...\" [chk_6307d5af3393ec0c] [chk_0893e7fa2c80f931].",
+          "reference_materials": [
+            {
+              "citation_id": "cit_chk_6307d5af3393ec0c",
+              "title": "Deep Residual Learning for Image Recognition",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "chunk_id": "chk_6307d5af3393ec0c",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_chk_0893e7fa2c80f931",
+              "title": "Boltzmann machine",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "chunk_id": "chk_0893e7fa2c80f931",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE"
+            },
+            {
+              "citation_id": "cit_res_5fb3d618c7ed17ec",
+              "title": "Research | Yoshua Bengio",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_5fb3d618c7ed17ec",
+              "chunk_id": "",
+              "canonical_url": "https://yoshuabengio.org/en/research",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            },
+            {
+              "citation_id": "cit_res_73e51a454ee1f4eb",
+              "title": "Home | Yoshua Bengio",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_73e51a454ee1f4eb",
+              "chunk_id": "",
+              "canonical_url": "https://yoshuabengio.org/en",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            },
+            {
+              "citation_id": "cit_res_e344b54452f01c96",
+              "title": "Publications - Geoffrey Hinton",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_e344b54452f01c96",
+              "chunk_id": "",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/pages/publications.html",
+              "evidence_tier": "COLLECTED_DOCUMENT"
+            },
+            {
+              "citation_id": "cit_res_17e0fc05c2897a85",
+              "title": "Safety from Honesty in a Disinterested AI Predictor",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_17e0fc05c2897a85",
+              "chunk_id": "",
+              "canonical_url": "https://yoshuabengio.org/en/publication/safety-honesty-disinterested-ai-predictor",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE"
+            },
+            {
+              "citation_id": "cit_res_99569ba920d30adb",
+              "title": "Towards a Cautious Scientist AI with Convergent Safety Bounds",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_99569ba920d30adb",
+              "chunk_id": "",
+              "canonical_url": "https://yoshuabengio.org/en/blog/towards-cautious-scientist-ai-convergent-safety-bounds",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE"
+            },
+            {
+              "citation_id": "cit_res_c6cd5d1200d9419a",
+              "title": "Generative Flow Networks",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_c6cd5d1200d9419a",
+              "chunk_id": "",
+              "canonical_url": "https://yoshuabengio.org/en/blog/generative-flow-networks",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE"
+            }
+          ],
+          "exercises": [
+            {
+              "exercise_id": "ex_08_research_ablation_protocol",
+              "title": "Pre-Registered Ablation & Citation Integrity Audit",
+              "description": "Write a structured research ablation protocol comparing two architectural hypotheses, specifying primary metrics, negative controls, and verified source citations.",
+              "deliverable": "Peer-review-ready experimental protocol document with explicit epistemic tier annotations."
+            }
+          ],
+          "projects": [
+            {
+              "project_id": "proj_08_reproducible_research_replication",
+              "title": "Mini-Paper Replication & Evidence Gap Analysis",
+              "description": "Replicate a core claim from one indexed primary paper (Dropout, Bahdanau Attention, ResNet, or Transformer) and produce an evaluation report with abstention/uncertainty tracking.",
+              "deliverable": "Reproducible benchmark script + structured replication report."
+            }
+          ],
+          "mastery_check": {
+            "check_id": "mc_lesson_08_research_formulation_ablation_and_ai_safety",
+            "lesson_id": "lesson_08_research_formulation_ablation_and_ai_safety",
+            "assessment_status": "DESIGN_ONLY_NOT_YET_ASSESSED",
+            "disclaimer": "Design-only mastery check specification: interactive learner mastery evaluation and grading are planned for the Assessment Agent milestone and are not claimed as active verification in this release.",
+            "prompts": [
+              "Why must an AI researcher separate verified primary-source chunks (`CURRICULUM_READY_EVIDENCE`) from uncollected seed metadata (`APPROVED_UNCOLLECTED_RESOURCE`) and candidate news feeds (`SRC-THE-BATCH`)?",
+              "What makes an architectural ablation study scientifically valid when claiming a new mechanism improves training or generalization?"
+            ],
+            "pass_criteria": [
+              "Accurately distinguishes the five epistemic source tiers and explains why news recency never dictates foundational truth.",
+              "Identifies controlled parameter budgets, isolated causal variables, and reproducible baseline comparisons."
+            ]
+          },
+          "source_citations": [
+            {
+              "citation_id": "cit_chk_6307d5af3393ec0c",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-ARXIV",
+              "resource_id": "res_200d1687405c7db9",
+              "title": "Deep Residual Learning for Image Recognition",
+              "canonical_url": "https://arxiv.org/abs/1512.03385",
+              "chunk_id": "chk_6307d5af3393ec0c",
+              "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+              "locator": "chunk_index=0 (0..539)",
+              "excerpt_summary": "Deep Residual Learning for Image Recognition Deeper neural networks are more difficult to train. We present a residual learning framework to ease the training of networks that are substantially dee...",
+              "relevance_score": 0.2541
+            },
+            {
+              "citation_id": "cit_chk_0893e7fa2c80f931",
+              "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+              "source_id": "SRC-WIKIPEDIA",
+              "resource_id": "res_dd13dd0076cd4a6e",
+              "title": "Boltzmann machine",
+              "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+              "chunk_id": "chk_0893e7fa2c80f931",
+              "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+              "locator": "chunk_index=2 (565..1041)",
+              "excerpt_summary": "because of their parallelism and the resemblance of their dynamics to simple physical processes. Boltzmann machines with unconstrained connectivity have not been proven useful for practical problem...",
+              "relevance_score": 0.2478
+            },
+            {
+              "citation_id": "cit_res_5fb3d618c7ed17ec",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_5fb3d618c7ed17ec",
+              "title": "Research | Yoshua Bengio",
+              "canonical_url": "https://yoshuabengio.org/en/research",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_5fb3d618c7ed17ec (metadata-only)",
+              "excerpt_summary": "At the beginning of 2023, I began a pivot from research in machine learning aimed at increasing AI capabilities and applying AI for the benefit of society to research on AI safety: what can go possibly wrong as we approach or surpass human-level intelligence with AI, and how do we design AI so that it will not harm humans in the first place?",
+              "relevance_score": 0.85
+            },
+            {
+              "citation_id": "cit_res_73e51a454ee1f4eb",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_73e51a454ee1f4eb",
+              "title": "Home | Yoshua Bengio",
+              "canonical_url": "https://yoshuabengio.org/en",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_73e51a454ee1f4eb (metadata-only)",
+              "excerpt_summary": "Yoshua Bengio is Full Professor of Computer Science at Université de Montreal, Co-President and Scientific Director of LawZero, as well as the Founder and Scientific Advisor of Mila. He also holds a Canada CIFAR AI Chair.",
+              "relevance_score": 0.85
+            },
+            {
+              "citation_id": "cit_res_e344b54452f01c96",
+              "evidence_tier": "COLLECTED_DOCUMENT",
+              "source_id": "SRC-HINTON",
+              "resource_id": "res_e344b54452f01c96",
+              "title": "Publications - Geoffrey Hinton",
+              "canonical_url": "https://www.cs.toronto.edu/~hinton/pages/publications.html",
+              "chunk_id": null,
+              "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+              "locator": "resource_id=res_e344b54452f01c96 (metadata-only)",
+              "excerpt_summary": "Approved catalog entry from Geoffrey Hinton Official Website (University of Toronto) (metadata-only).",
+              "relevance_score": 0.85
+            },
+            {
+              "citation_id": "cit_res_17e0fc05c2897a85",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_17e0fc05c2897a85",
+              "title": "Safety from Honesty in a Disinterested AI Predictor",
+              "canonical_url": "https://yoshuabengio.org/en/publication/safety-honesty-disinterested-ai-predictor",
+              "chunk_id": null,
+              "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+              "locator": "resource_id=res_17e0fc05c2897a85 (metadata-only-not-yet-collected)",
+              "excerpt_summary": "Title, authors, published date, abstract/summary, full-text link, identifiers",
+              "relevance_score": 0.65
+            },
+            {
+              "citation_id": "cit_res_99569ba920d30adb",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_99569ba920d30adb",
+              "title": "Towards a Cautious Scientist AI with Convergent Safety Bounds",
+              "canonical_url": "https://yoshuabengio.org/en/blog/towards-cautious-scientist-ai-convergent-safety-bounds",
+              "chunk_id": null,
+              "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+              "locator": "resource_id=res_99569ba920d30adb (metadata-only-not-yet-collected)",
+              "excerpt_summary": "Title, date, author, category, paper/report links",
+              "relevance_score": 0.65
+            },
+            {
+              "citation_id": "cit_res_c6cd5d1200d9419a",
+              "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+              "source_id": "SRC-BENGIO",
+              "resource_id": "res_c6cd5d1200d9419a",
+              "title": "Generative Flow Networks",
+              "canonical_url": "https://yoshuabengio.org/en/blog/generative-flow-networks",
+              "chunk_id": null,
+              "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+              "locator": "resource_id=res_c6cd5d1200d9419a (metadata-only-not-yet-collected)",
+              "excerpt_summary": "Title, date, author, research explanation, tutorial and paper links",
+              "relevance_score": 0.65
+            }
+          ],
+          "rationale_for_ordering": "Placed as the capstone stage (`stage_04`) after mastering probabilistic/energy models (`energy_based_and_boltzmann_models`) and modern deep sequence/residual architectures (`transformer_self_attention_architecture`).",
+          "evidence_gaps": [
+            "Resource 'Research | Yoshua Bengio' (res_5fb3d618c7ed17ec, SRC-BENGIO) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed.",
+            "Resource 'Home | Yoshua Bengio' (res_73e51a454ee1f4eb, SRC-BENGIO) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed.",
+            "Resource 'Publications - Geoffrey Hinton' (res_e344b54452f01c96, SRC-HINTON) is currently at tier COLLECTED_DOCUMENT (metadata-only); full-text chunks are not yet indexed.",
+            "Resource 'Safety from Honesty in a Disinterested AI Predictor' (res_17e0fc05c2897a85, SRC-BENGIO) is currently at tier APPROVED_UNCOLLECTED_RESOURCE (metadata-only-not-yet-collected); full-text chunks are not yet indexed.",
+            "Resource 'Towards a Cautious Scientist AI with Convergent Safety Bounds' (res_99569ba920d30adb, SRC-BENGIO) is currently at tier APPROVED_UNCOLLECTED_RESOURCE (metadata-only-not-yet-collected); full-text chunks are not yet indexed.",
+            "Resource 'Generative Flow Networks' (res_c6cd5d1200d9419a, SRC-BENGIO) is currently at tier APPROVED_UNCOLLECTED_RESOURCE (metadata-only-not-yet-collected); full-text chunks are not yet indexed.",
+            "Frontier AI safety and GFlowNet entries in SRC-BENGIO (e.g., res_17e0fc05c2897a85, res_99569ba920d30adb, res_c6cd5d1200d9419a) are currently registered as approved uncollected seed records (`metadata-only-not-yet-collected`), and `SRC-THE-BATCH` remains `CANDIDATE_PENDING_REVIEW`."
+          ]
+        }
+      ]
+    }
+  ],
+  "source_citations": [
+    {
+      "citation_id": "cit_chk_0a6023ab662bc6b4",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-WIKIPEDIA",
+      "resource_id": "res_24d64fe06f34c722",
+      "title": "Backpropagation",
+      "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+      "chunk_id": "chk_0a6023ab662bc6b4",
+      "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+      "locator": "chunk_index=0 (0..364)",
+      "excerpt_summary": "Backpropagation In machine learning, backpropagation is a gradient computation method commonly used for training a neural network in computing parameter updates. It is an efficient application of t...",
+      "relevance_score": 0.6894
+    },
+    {
+      "citation_id": "cit_chk_258896475e232c3d",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-WIKIPEDIA",
+      "resource_id": "res_24d64fe06f34c722",
+      "title": "Backpropagation",
+      "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+      "chunk_id": "chk_258896475e232c3d",
+      "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+      "locator": "chunk_index=1 (269..749)",
+      "excerpt_summary": "the gradient of the loss with respect to the network weights for a single input–output example. It does this by propagating derivatives backward, one layer at a time, from the output layer to the i...",
+      "relevance_score": 0.5452
+    },
+    {
+      "citation_id": "cit_chk_0defbb8fe8944c71",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-WIKIPEDIA",
+      "resource_id": "res_24d64fe06f34c722",
+      "title": "Backpropagation",
+      "canonical_url": "https://en.wikipedia.org/wiki/Backpropagation",
+      "chunk_id": "chk_0defbb8fe8944c71",
+      "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+      "locator": "chunk_index=2 (650..1204)",
+      "excerpt_summary": "the gradient is used, but the term is often used loosely to refer to the entire learning algorithm. This includes changing model parameters in the negative direction of the gradient, such as by sto...",
+      "relevance_score": 0.4786
+    },
+    {
+      "citation_id": "cit_res_63c0a0d121a09f38",
+      "evidence_tier": "COLLECTED_DOCUMENT",
+      "source_id": "SRC-3B1B",
+      "resource_id": "res_63c0a0d121a09f38",
+      "title": "3Blue1Brown",
+      "canonical_url": "https://www.3blue1brown.com/topics/neural-networks",
+      "chunk_id": null,
+      "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+      "locator": "resource_id=res_63c0a0d121a09f38 (metadata-only)",
+      "excerpt_summary": "Mathematics with a distinct visual perspective. Linear algebra, calculus, neural networks, topology, and more.",
+      "relevance_score": 0.85
+    },
+    {
+      "citation_id": "cit_res_b6377e0dd4279dae",
+      "evidence_tier": "COLLECTED_DOCUMENT",
+      "source_id": "SRC-3B1B",
+      "resource_id": "res_b6377e0dd4279dae",
+      "title": "3Blue1Brown",
+      "canonical_url": "https://www.3blue1brown.com/",
+      "chunk_id": null,
+      "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+      "locator": "resource_id=res_b6377e0dd4279dae (metadata-only)",
+      "excerpt_summary": "Mathematics with a distinct visual perspective. Linear algebra, calculus, neural networks, topology, and more.",
+      "relevance_score": 0.85
+    },
+    {
+      "citation_id": "cit_res_0098016d9acf1f99",
+      "evidence_tier": "COLLECTED_DOCUMENT",
+      "source_id": "SRC-HINTON",
+      "resource_id": "res_0098016d9acf1f99",
+      "title": "Geoffrey Hinton",
+      "canonical_url": "https://www.cs.toronto.edu/~hinton/index.html",
+      "chunk_id": null,
+      "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+      "locator": "resource_id=res_0098016d9acf1f99 (metadata-only)",
+      "excerpt_summary": "Approved catalog entry from Geoffrey Hinton Official Website (University of Toronto) (metadata-only).",
+      "relevance_score": 0.85
+    },
+    {
+      "citation_id": "cit_res_a630f9fe47ef1eb5",
+      "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+      "source_id": "SRC-HINTON",
+      "resource_id": "res_a630f9fe47ef1eb5",
+      "title": "Neural-network tutorials",
+      "canonical_url": "https://www.cs.toronto.edu/~hinton/nntut.html",
+      "chunk_id": null,
+      "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+      "locator": "resource_id=res_a630f9fe47ef1eb5 (metadata-only-not-yet-collected)",
+      "excerpt_summary": "Tutorial title, year, topic, duration, slide/PDF/readings/video links",
+      "relevance_score": 0.65
+    },
+    {
+      "citation_id": "cit_chk_364466882e422f57",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_ab5dba0c12050d69",
+      "title": "Improving neural networks by preventing co-adaptation of feature detectors",
+      "canonical_url": "https://arxiv.org/abs/1207.0580",
+      "chunk_id": "chk_364466882e422f57",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=0 (0..456)",
+      "excerpt_summary": "Improving neural networks by preventing co-adaptation of feature detectors When a large feedforward neural network is trained on a small training set, it typically performs poorly on held-out test...",
+      "relevance_score": 0.4917
+    },
+    {
+      "citation_id": "cit_chk_79ddf8d5602675a3",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_ab5dba0c12050d69",
+      "title": "Improving neural networks by preventing co-adaptation of feature detectors",
+      "canonical_url": "https://arxiv.org/abs/1207.0580",
+      "chunk_id": "chk_79ddf8d5602675a3",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=1 (362..770)",
+      "excerpt_summary": "a feature detector is only helpful in the context of several other specific feature detectors. Instead, each neuron learns to detect a feature that is generally helpful for producing the correct an...",
+      "relevance_score": 0.3999
+    },
+    {
+      "citation_id": "cit_res_e344b54452f01c96",
+      "evidence_tier": "COLLECTED_DOCUMENT",
+      "source_id": "SRC-HINTON",
+      "resource_id": "res_e344b54452f01c96",
+      "title": "Publications - Geoffrey Hinton",
+      "canonical_url": "https://www.cs.toronto.edu/~hinton/pages/publications.html",
+      "chunk_id": null,
+      "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+      "locator": "resource_id=res_e344b54452f01c96 (metadata-only)",
+      "excerpt_summary": "Approved catalog entry from Geoffrey Hinton Official Website (University of Toronto) (metadata-only).",
+      "relevance_score": 0.85
+    },
+    {
+      "citation_id": "cit_chk_41f22d9bb264fa27",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-WIKIPEDIA",
+      "resource_id": "res_dd13dd0076cd4a6e",
+      "title": "Boltzmann machine",
+      "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+      "chunk_id": "chk_41f22d9bb264fa27",
+      "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+      "locator": "chunk_index=0 (0..361)",
+      "excerpt_summary": "Boltzmann machine A Boltzmann machine (also called Sherrington–Kirkpatrick model with external field or stochastic Ising model), named after Ludwig Boltzmann, is a spin-glass model with an external...",
+      "relevance_score": 0.4214
+    },
+    {
+      "citation_id": "cit_chk_e030fa031667493c",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-WIKIPEDIA",
+      "resource_id": "res_dd13dd0076cd4a6e",
+      "title": "Boltzmann machine",
+      "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+      "chunk_id": "chk_e030fa031667493c",
+      "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+      "locator": "chunk_index=3 (947..1349)",
+      "excerpt_summary": "the Boltzmann distribution in statistical mechanics, which is used in their sampling function. They were heavily popularized and promoted by Geoffrey Hinton, Terry Sejnowski and Yann LeCun in cogni...",
+      "relevance_score": 0.357
+    },
+    {
+      "citation_id": "cit_chk_3c549b1da926ac49",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-WIKIPEDIA",
+      "resource_id": "res_dd13dd0076cd4a6e",
+      "title": "Boltzmann machine",
+      "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+      "chunk_id": "chk_3c549b1da926ac49",
+      "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+      "locator": "chunk_index=1 (266..661)",
+      "excerpt_summary": "Ising model. It is a statistical physics technique applied in the context of cognitive science. It is also classified as a Markov random field. Boltzmann machines are theoretically intriguing becau...",
+      "relevance_score": 0.3236
+    },
+    {
+      "citation_id": "cit_chk_6307d5af3393ec0c",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_200d1687405c7db9",
+      "title": "Deep Residual Learning for Image Recognition",
+      "canonical_url": "https://arxiv.org/abs/1512.03385",
+      "chunk_id": "chk_6307d5af3393ec0c",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=0 (0..539)",
+      "excerpt_summary": "Deep Residual Learning for Image Recognition Deeper neural networks are more difficult to train. We present a residual learning framework to ease the training of networks that are substantially dee...",
+      "relevance_score": 0.2541
+    },
+    {
+      "citation_id": "cit_chk_819d87281b2a2264",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_200d1687405c7db9",
+      "title": "Deep Residual Learning for Image Recognition",
+      "canonical_url": "https://arxiv.org/abs/1512.03385",
+      "chunk_id": "chk_819d87281b2a2264",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=1 (441..987)",
+      "excerpt_summary": "residual networks are easier to optimize, and can gain accuracy from considerably increased depth. On the ImageNet dataset we evaluate residual nets with a depth of up to 152 layers---8x deeper tha...",
+      "relevance_score": 0.356
+    },
+    {
+      "citation_id": "cit_chk_7dee843efa016d98",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_200d1687405c7db9",
+      "title": "Deep Residual Learning for Image Recognition",
+      "canonical_url": "https://arxiv.org/abs/1512.03385",
+      "chunk_id": "chk_7dee843efa016d98",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=2 (891..1333)",
+      "excerpt_summary": "layers. The depth of representations is of central importance for many visual recognition tasks. Solely due to our extremely deep representations, we obtain a 28% relative improvement on the COCO o...",
+      "relevance_score": 0.2185
+    },
+    {
+      "citation_id": "cit_chk_cbf933bd5853089c",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_0b4b872c018ccdcc",
+      "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+      "canonical_url": "https://arxiv.org/abs/1409.0473",
+      "chunk_id": "chk_cbf933bd5853089c",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=1 (486..961)",
+      "excerpt_summary": "encodes a source sentence into a fixed-length vector from which a decoder generates a translation. In this paper, we conjecture that the use of a fixed-length vector is a bottleneck in improving th...",
+      "relevance_score": 0.5778
+    },
+    {
+      "citation_id": "cit_chk_fb78852dfe1044b4",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_0b4b872c018ccdcc",
+      "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+      "canonical_url": "https://arxiv.org/abs/1409.0473",
+      "chunk_id": "chk_fb78852dfe1044b4",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=0 (0..584)",
+      "excerpt_summary": "Neural Machine Translation by Jointly Learning to Align and Translate Neural machine translation is a recently proposed approach to machine translation. Unlike the traditional statistical machine t...",
+      "relevance_score": 0.5352
+    },
+    {
+      "citation_id": "cit_chk_f38d9214a536ff59",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_0b4b872c018ccdcc",
+      "title": "Neural Machine Translation by Jointly Learning to Align and Translate",
+      "canonical_url": "https://arxiv.org/abs/1409.0473",
+      "chunk_id": "chk_f38d9214a536ff59",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=2 (868..1251)",
+      "excerpt_summary": "to predicting a target word, without having to form these parts as a hard segment explicitly. With this new approach, we achieve a translation performance comparable to the existing state-of-the-ar...",
+      "relevance_score": 0.1669
+    },
+    {
+      "citation_id": "cit_res_5fb3d618c7ed17ec",
+      "evidence_tier": "COLLECTED_DOCUMENT",
+      "source_id": "SRC-BENGIO",
+      "resource_id": "res_5fb3d618c7ed17ec",
+      "title": "Research | Yoshua Bengio",
+      "canonical_url": "https://yoshuabengio.org/en/research",
+      "chunk_id": null,
+      "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+      "locator": "resource_id=res_5fb3d618c7ed17ec (metadata-only)",
+      "excerpt_summary": "At the beginning of 2023, I began a pivot from research in machine learning aimed at increasing AI capabilities and applying AI for the benefit of society to research on AI safety: what can go possibly wrong as we approach or surpass human-level intelligence with AI, and how do we design AI so that it will not harm humans in the first place?",
+      "relevance_score": 0.85
+    },
+    {
+      "citation_id": "cit_chk_473fcba29c29f97a",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_a475a00509c48269",
+      "title": "Attention Is All You Need",
+      "canonical_url": "https://arxiv.org/abs/1706.03762",
+      "chunk_id": "chk_473fcba29c29f97a",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=0 (0..589)",
+      "excerpt_summary": "Attention Is All You Need The dominant sequence transduction models are based on complex recurrent or convolutional neural networks in an encoder-decoder configuration. The best performing models a...",
+      "relevance_score": 0.6344
+    },
+    {
+      "citation_id": "cit_chk_f01c5990340cadda",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_a475a00509c48269",
+      "title": "Attention Is All You Need",
+      "canonical_url": "https://arxiv.org/abs/1706.03762",
+      "chunk_id": "chk_f01c5990340cadda",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=2 (901..1163)",
+      "excerpt_summary": "days on eight GPUs, a small fraction of the training costs of the best models from the literature. We show that the Transformer generalizes well to other tasks by applying it successfully to Englis...",
+      "relevance_score": 0.1875
+    },
+    {
+      "citation_id": "cit_chk_2436d59a2b39053b",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-ARXIV",
+      "resource_id": "res_a475a00509c48269",
+      "title": "Attention Is All You Need",
+      "canonical_url": "https://arxiv.org/abs/1706.03762",
+      "chunk_id": "chk_2436d59a2b39053b",
+      "epistemic_layer": "AUTHORIZED_ABSTRACT_OR_DESCRIPTION",
+      "locator": "chunk_index=1 (490..999)",
+      "excerpt_summary": "superior in quality while being more parallelizable and requiring significantly less time to train. Our model achieves 28.4 BLEU on the WMT 2014 English-to-German translation task, improving over t...",
+      "relevance_score": 0.1079
+    },
+    {
+      "citation_id": "cit_chk_0893e7fa2c80f931",
+      "evidence_tier": "CURRICULUM_READY_EVIDENCE",
+      "source_id": "SRC-WIKIPEDIA",
+      "resource_id": "res_dd13dd0076cd4a6e",
+      "title": "Boltzmann machine",
+      "canonical_url": "https://en.wikipedia.org/wiki/Boltzmann_machine",
+      "chunk_id": "chk_0893e7fa2c80f931",
+      "epistemic_layer": "PRIMARY_SOURCE_TEXT",
+      "locator": "chunk_index=2 (565..1041)",
+      "excerpt_summary": "because of their parallelism and the resemblance of their dynamics to simple physical processes. Boltzmann machines with unconstrained connectivity have not been proven useful for practical problem...",
+      "relevance_score": 0.2478
+    },
+    {
+      "citation_id": "cit_res_73e51a454ee1f4eb",
+      "evidence_tier": "COLLECTED_DOCUMENT",
+      "source_id": "SRC-BENGIO",
+      "resource_id": "res_73e51a454ee1f4eb",
+      "title": "Home | Yoshua Bengio",
+      "canonical_url": "https://yoshuabengio.org/en",
+      "chunk_id": null,
+      "epistemic_layer": "VERIFIED_RESOURCE_METADATA",
+      "locator": "resource_id=res_73e51a454ee1f4eb (metadata-only)",
+      "excerpt_summary": "Yoshua Bengio is Full Professor of Computer Science at Université de Montreal, Co-President and Scientific Director of LawZero, as well as the Founder and Scientific Advisor of Mila. He also holds a Canada CIFAR AI Chair.",
+      "relevance_score": 0.85
+    },
+    {
+      "citation_id": "cit_res_17e0fc05c2897a85",
+      "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+      "source_id": "SRC-BENGIO",
+      "resource_id": "res_17e0fc05c2897a85",
+      "title": "Safety from Honesty in a Disinterested AI Predictor",
+      "canonical_url": "https://yoshuabengio.org/en/publication/safety-honesty-disinterested-ai-predictor",
+      "chunk_id": null,
+      "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+      "locator": "resource_id=res_17e0fc05c2897a85 (metadata-only-not-yet-collected)",
+      "excerpt_summary": "Title, authors, published date, abstract/summary, full-text link, identifiers",
+      "relevance_score": 0.65
+    },
+    {
+      "citation_id": "cit_res_99569ba920d30adb",
+      "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+      "source_id": "SRC-BENGIO",
+      "resource_id": "res_99569ba920d30adb",
+      "title": "Towards a Cautious Scientist AI with Convergent Safety Bounds",
+      "canonical_url": "https://yoshuabengio.org/en/blog/towards-cautious-scientist-ai-convergent-safety-bounds",
+      "chunk_id": null,
+      "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+      "locator": "resource_id=res_99569ba920d30adb (metadata-only-not-yet-collected)",
+      "excerpt_summary": "Title, date, author, category, paper/report links",
+      "relevance_score": 0.65
+    },
+    {
+      "citation_id": "cit_res_c6cd5d1200d9419a",
+      "evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+      "source_id": "SRC-BENGIO",
+      "resource_id": "res_c6cd5d1200d9419a",
+      "title": "Generative Flow Networks",
+      "canonical_url": "https://yoshuabengio.org/en/blog/generative-flow-networks",
+      "chunk_id": null,
+      "epistemic_layer": "APPROVED_SYLLABUS_SEED_METADATA",
+      "locator": "resource_id=res_c6cd5d1200d9419a (metadata-only-not-yet-collected)",
+      "excerpt_summary": "Title, date, author, research explanation, tutorial and paper links",
+      "relevance_score": 0.65
+    }
+  ],
+  "evidence_gaps": [
+    {
+      "gap_id": "gap_lesson_01_linear_algebra_and_multivariable_calculus",
+      "scope": "LESSON_LEVEL",
+      "related_lesson_id": "lesson_01_linear_algebra_and_multivariable_calculus",
+      "related_source_ids": [
+        "SRC-3B1B",
+        "SRC-WIKIPEDIA"
+      ],
+      "current_evidence_tier": "COLLECTED_DOCUMENT",
+      "description": "3Blue1Brown resources (res_63c0a0d121a09f38, res_b6377e0dd4279dae) are verified metadata-only records in SQLite (permits_full_text_storage=0); full lesson transcripts for linear algebra and Python programming foundations are not stored in Chroma.",
+      "recommended_curation_action": "Approve and ingest open-licensed linear algebra/calculus textbook chunks (e.g., CC-BY math notes) or authorized caption tracks via the transcript ingestion pipeline."
+    },
+    {
+      "gap_id": "gap_lesson_08_research_formulation_ablation_and_ai_safety",
+      "scope": "LESSON_LEVEL",
+      "related_lesson_id": "lesson_08_research_formulation_ablation_and_ai_safety",
+      "related_source_ids": [
+        "SRC-BENGIO",
+        "SRC-HINTON"
+      ],
+      "current_evidence_tier": "COLLECTED_DOCUMENT",
+      "description": "Frontier AI safety and GFlowNet entries in SRC-BENGIO (e.g., res_17e0fc05c2897a85, res_99569ba920d30adb, res_c6cd5d1200d9419a) are currently registered as approved uncollected seed records (`metadata-only-not-yet-collected`), and `SRC-THE-BATCH` remains `CANDIDATE_PENDING_REVIEW`.",
+      "recommended_curation_action": "Collect and chunk full open-access arXiv/technical report texts for approved AI safety and GFlowNet publications before generating deep mathematical derivations for those frontier subtopics."
+    },
+    {
+      "gap_id": "gap_ecosystem_uncollected_seeds",
+      "scope": "ECOSYSTEM_CATALOG",
+      "related_lesson_id": null,
+      "related_source_ids": [
+        "SRC-HINTON",
+        "SRC-BENGIO",
+        "SRC-ARXIV"
+      ],
+      "current_evidence_tier": "APPROVED_UNCOLLECTED_RESOURCE",
+      "description": "48 approved seed resources remain at 'metadata-only-not-yet-collected', and 181 discovered outbound links remain in 'PENDING_REVIEW' (`DISCOVERED_LINK`).",
+      "recommended_curation_action": "Run policy-governed collection batches for approved seed resources and review high-priority discovered link candidates via KnowledgeCuratorAgent."
+    },
+    {
+      "gap_id": "gap_the_batch_discovery_governance",
+      "scope": "SOURCE_GOVERNANCE",
+      "related_lesson_id": null,
+      "related_source_ids": [
+        "SRC-THE-BATCH"
+      ],
+      "current_evidence_tier": "CANDIDATE_PENDING_REVIEW",
+      "description": "SRC-THE-BATCH (https://www.deeplearning.ai/the-batch) is registered with status='CANDIDATE_PENDING_REVIEW' and permits_full_text_storage=0. It serves strictly as an AI news and research-discovery source; no news items are cited as curriculum evidence or allowed to alter foundational prerequisite order.",
+      "recommended_curation_action": "Use The Batch solely to identify newly published primary papers (e.g., on arXiv), then ingest those primary papers through approved source connectors."
+    }
+  ],
+  "validation_report": {
+    "is_valid": true,
+    "schema_valid": true,
+    "prerequisites_consistent": true,
+    "citations_verified": true,
+    "mastery_disclaimer_present": true,
+    "the_batch_policy_respected": true,
+    "checked_lesson_count": 8,
+    "checked_citation_count": 36,
+    "errors": []
+  }
+}

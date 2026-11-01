@@ -77,6 +77,46 @@ _RAG_EXPORTS = frozenset(
     }
 )
 
+_PLATFORM_EXPORTS = frozenset(
+    {
+        "AgentCapability",
+        "AgentCapabilitySpec",
+        "CURRICULUM_SCHEMA_VERSION",
+        "ConceptGraph",
+        "ConceptNode",
+        "CurriculumCitation",
+        "CurriculumLesson",
+        "CurriculumManagementService",
+        "CurriculumPlan",
+        "CurriculumStage",
+        "CurriculumStatus",
+        "CurriculumValidationReport",
+        "CurriculumValidator",
+        "DEFAULT_CONCEPT_NODES",
+        "EvidenceGap",
+        "EvidenceTier",
+        "ExecutionPolicy",
+        "LearningPlannerAgent",
+        "MASTERY_ASSESSMENT_DISCLAIMER",
+        "MasteryCheckDesign",
+        "PlatformOrchestrator",
+        "PlatformValidationError",
+        "SourceEcosystemService",
+        "SourceEcosystemSummary",
+        "THE_BATCH_CANONICAL_URL",
+        "THE_BATCH_SOURCE_ID",
+        "ToolDefinition",
+        "ToolRegistry",
+        "WorkflowRunState",
+        "WorkflowStatus",
+        "WorkflowStepRecord",
+        "build_default_concept_graph",
+        "format_curriculum_plan",
+        "get_logical_agent_catalog",
+        "validate_learning_goal",
+    }
+)
+
 __all__ = [
     "APIError",
     "APIResponse",
@@ -85,7 +125,7 @@ __all__ = [
     "LocalResearchLibraryAPI",
     "__version__",
     "create_http_server",
-    *sorted(_RAG_EXPORTS),
+    *sorted(_RAG_EXPORTS | _PLATFORM_EXPORTS),
 ]
 __version__ = "0.1.0"
 
@@ -95,4 +135,8 @@ def __getattr__(name: str) -> Any:
         from . import rag
 
         return getattr(rag, name)
+    if name in _PLATFORM_EXPORTS:
+        from . import platform
+
+        return getattr(platform, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -21,7 +21,9 @@ ai-research-learning/
 ├── knowledge_store.py          # local SQLite persistence store, migrations, and manifest importer
 ├── src/
 │   └── ai_research_learning/
-│       ├── api.py              # local read-only Research Library HTTP API (v1)
+│       ├── api.py              # local Research Library & Curriculum HTTP API (v1)
+│       ├── platform.py         # Agent-First AI Learning Platform orchestrator, 5-tier ecosystem, & LearningPlannerAgent
+│       ├── rag.py              # local RAG retrieval, citation sanitization, abstention, & Research CLI
 │       └── sources/            # modular source adapters (Hinton, Bengio, 3B1B, arXiv, Wikipedia) & pilot coordinator
 ├── seed_urls.json              # 52-record source manifest
 ├── collection_plan.csv         # initial collection plan
@@ -354,7 +356,59 @@ No answer was generated and no citations were fabricated.
 
 - **`EmbeddingIncompatibilityError` (Exit Code `2`):** Raised if `--embedding-provider`, `--embedding-model`, or `--embedding-dimensions` does not match the metadata stored in the target Chroma collection (`local_deterministic/token-hash-bow-v1@128d` on `ai_research_knowledge_chunks_v1`). Omit `--embedding-provider` when querying the default collection, or specify a separate `--collection` when testing a different embedding space.
 - **`ProviderNotConfiguredError` (Exit Code `2`):** Raised when an explicitly requested generation provider (`gemini`, `openai`, or `anthropic`) lacks valid ADC or API key credentials. Pass `--allow-retrieval-fallback` if you want the CLI to degrade gracefully to `retrieval_only_fallback` instead of exiting with code `2`.
-- **Credential Redaction:** All CLI error messages pass through `redact_secrets(...)`, which masks `AIza...`, `sk-...`, `ya29...`, `Bearer ...`, and any configured secret values as `[REDACTED]` before writing to `stderr`. Never pass raw API keys on the command line; store them in `.env` (`chmod 600 .env`) or use Vertex AI ADC.
+- **Credential Redaction:** All CLI error messages pass through `redact_secrets(...)`, which masks `AIza...`, `sk-...`, `ya29...`, and `Bearer ...`, and any configured secret values as `[REDACTED]` before writing to `stderr`. Never pass raw API keys on the command line; store them in `.env` (`chmod 600 .env`) or use Vertex AI ADC.
+
+## 2.4 Agent-First AI Learning Platform & Curriculum Planner Vertical Slice (Task 034)
+
+`src/ai_research_learning/platform.py` and `docs/architecture/decisions/0008-agent-first-learning-platform-and-curriculum-slice.md` (`ADR-0008`) establish the five-layer **Agent-First AI Learning Platform** architecture:
+
+1. **Experience Layer:** CLI (`python3 -m src.ai_research_learning.platform`) and Web/HTTP API (`src/ai_research_learning/api.py`) sharing the same `CurriculumManagementService`.
+2. **Controlled Agent Runtime:** `PlatformOrchestrator`, `ToolRegistry` (capability-scoped tool permissions), `ExecutionPolicy` (bounded tool budgets), `WorkflowRunState`, and explicit contracts for all six logical agents (`RESEARCH`, `KNOWLEDGE_CURATOR`, `LEARNING_PLANNER`, `TEACHING`, `ASSESSMENT`, `LEARNING_PROGRESS`).
+3. **Platform Services (Deterministic Domain Logic):**
+   - `SourceEcosystemService`: Classifies knowledge store records into the five epistemic tiers (`DISCOVERED_LINK`, `APPROVED_UNCOLLECTED_RESOURCE`, `COLLECTED_DOCUMENT`, `EXTRACTED_KNOWLEDGE`, `CURRICULUM_READY_EVIDENCE`) and enforces that `SRC-THE-BATCH` (`CANDIDATE_PENDING_REVIEW`) acts only as an AI news/discovery radar without grounding curriculum lessons or overriding foundational prerequisites.
+   - `ConceptGraph`: Deterministic prerequisite DAG with cycle detection, transitive prerequisite closure, and topological sorting.
+   - `CurriculumValidator`: Verifies schema completeness, prerequisite consistency, citation integrity against real SQLite/Chroma records, `SRC-THE-BATCH` governance, and the mastery-check non-assessment honesty disclaimer.
+4. **Data Layer:** Read-only access to `data/runtime/task012_pilot.sqlite` (`18` active chunks, `12` verified collected documents, `48` approved uncollected seeds, `181` discovered link candidates) and `data/runtime/chroma`.
+
+### Running the Curriculum Planner Vertical Slice via CLI
+
+```bash
+# Generate a validated curriculum plan (Markdown to stdout, plus JSON and Markdown files):
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.platform \
+  --goal "I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations." \
+  --output-json reports/task-034-example-curriculum.json \
+  --output-md reports/task-034-example-curriculum.md
+
+# Emit structured JSON directly to stdout:
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.platform \
+  --goal "I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations." \
+  --format json
+```
+
+### Running the Curriculum Planner via HTTP API
+
+```bash
+# Start the local HTTP API server:
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.api --db data/runtime/task012_pilot.sqlite --host 127.0.0.1 --port 8000
+
+# 1. Generate a validated curriculum from a learner goal (POST /api/v1/curricula/generate):
+curl -s -X POST http://127.0.0.1:8000/api/v1/curricula/generate \
+  -H "Content-Type: application/json" \
+  -d '{"learner_goal": "I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations."}' \
+  | python3 -m json.tool
+
+# 2. Inspect workflow run state and step trace (GET /api/v1/curricula/runs/{run_id}):
+curl -s http://127.0.0.1:8000/api/v1/curricula/runs/run_851c39f9a71a | python3 -m json.tool
+
+# 3. List generated curricula (GET /api/v1/curricula):
+curl -s http://127.0.0.1:8000/api/v1/curricula | python3 -m json.tool
+
+# 4. Retrieve a validated curriculum plan (GET /api/v1/curricula/{curriculum_id}):
+curl -s http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b | python3 -m json.tool
+
+# 5. Inspect curriculum source citations grouped by epistemic tier (GET /api/v1/curricula/{curriculum_id}/sources):
+curl -s http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/sources | python3 -m json.tool
+```
 
 ## 3. Before enabling network collection
 
