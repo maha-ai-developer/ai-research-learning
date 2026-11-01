@@ -27,6 +27,7 @@ Implements Task 034:
 from __future__ import annotations
 
 import argparse
+import atexit
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -34,8 +35,10 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
@@ -63,6 +66,18 @@ MASTERY_ASSESSMENT_DISCLAIMER = (
     "and grading are planned for the Assessment Agent milestone and are not claimed as "
     "active verification in this release."
 )
+TEACHING_DEPTH_DISCLAIMER = (
+    "Explanation depth preference controls how the Teaching Agent presents material "
+    "(foundational_intuition, beginner, intermediate, advanced, or research_level) "
+    "and is not a claim or certification of learner mastery."
+)
+SINGLE_EXERCISE_MASTERY_DISCLAIMER = (
+    "A single correct exercise answer demonstrates progress on the targeted objective "
+    "but is never equated with complete lesson or concept mastery; full lesson completion "
+    "requires demonstrating all lesson objectives across conceptual, mathematical, and "
+    "practical exercises."
+)
+DEFAULT_LEARNER_ID = "learner_default"
 THE_BATCH_SOURCE_ID = "SRC-THE-BATCH"
 THE_BATCH_CANONICAL_URL = "https://www.deeplearning.ai/the-batch"
 
@@ -104,6 +119,33 @@ class CurriculumStatus(str, Enum):
     VALIDATED = "VALIDATED"
     ABSTAINED_INSUFFICIENT_EVIDENCE = "ABSTAINED_INSUFFICIENT_EVIDENCE"
     REJECTED_VALIDATION = "REJECTED_VALIDATION"
+
+
+class ExplanationDepth(str, Enum):
+    """Teaching depth preference for the Teaching Agent (not a claim of learner mastery)."""
+
+    FOUNDATIONAL_INTUITION = "foundational_intuition"
+    BEGINNER = "beginner"
+    INTERMEDIATE = "intermediate"
+    ADVANCED = "advanced"
+    RESEARCH_LEVEL = "research_level"
+
+
+class LessonProgressStatus(str, Enum):
+    """Persistent learner progress status for a lesson."""
+
+    NOT_STARTED = "NOT_STARTED"
+    IN_PROGRESS = "IN_PROGRESS"
+    PRACTICING = "PRACTICING"
+    COMPLETED = "COMPLETED"
+
+
+class AssessmentQuestionCategory(str, Enum):
+    """Categories of assessment questions generated from lesson objectives."""
+
+    CONCEPTUAL = "conceptual"
+    MATHEMATICAL = "mathematical"
+    PRACTICAL = "practical"
 
 
 # ---------------------------------------------------------------------------
@@ -335,40 +377,45 @@ def get_logical_agent_catalog() -> Tuple[AgentCapabilitySpec, ...]:
         AgentCapabilitySpec(
             capability=AgentCapability.TEACHING,
             display_name="Teaching Agent",
-            purpose="Deliver interactive lesson walkthroughs, intuitive explanations, and guided derivations.",
-            allowed_tools=("read_curriculum_plan", "search_knowledge_chunks"),
-            input_contract="LessonSessionRequest(curriculum_id, lesson_id, learner_prompt)",
-            output_contract="LessonTurnResponse(explanation, citations, follow_up_prompts)",
+            purpose="Deliver interactive lesson walkthroughs, intuitive explanations, prerequisite bridges, examples/analogies, and Socratic questions grounded in verified evidence.",
+            allowed_tools=("read_curriculum_plan", "search_knowledge_chunks", "query_concept_graph"),
+            input_contract="TeachingRequest(curriculum_id, lesson_id, learner_question, explanation_depth)",
+            output_contract="TeachingResponse(core_explanation, prerequisite_explanations, examples_and_analogies, socratic_questions, uncertainty_and_limits, source_citations)",
             deterministic_guardrails=(
                 "Lesson scope locked to validated CurriculumLesson objectives",
-                "Strict chunk citation verification",
+                "Strict chunk citation sanitization and SQLite verification",
+                "Explanation depth preference treated strictly as presentation preference, never mastery certification",
+                "Explicit uncertainty and insufficient-evidence disclosure",
             ),
-            milestone_status="CONTRACT_DEFINED_STAGE_2",
+            milestone_status="ACTIVE_INTERACTIVE_SLICE_TASK_035",
         ),
         AgentCapabilitySpec(
             capability=AgentCapability.ASSESSMENT,
             display_name="Assessment Agent",
-            purpose="Evaluate learner exercise, project, and mastery check submissions against explicit rubrics.",
+            purpose="Generate conceptual, mathematical, and practical exercises from lesson objectives and evaluate submissions against explicit deterministic rubrics.",
             allowed_tools=("read_curriculum_plan", "search_knowledge_chunks"),
-            input_contract="AssessmentSubmission(curriculum_id, lesson_id, check_id, learner_submission)",
-            output_contract="AssessmentEvaluation(score_band, rubric_breakdown, remediation_links)",
+            input_contract="AssessmentSubmission(curriculum_id, lesson_id, exercise_id, submitted_answer)",
+            output_contract="AssessmentEvaluation(score, score_band, criterion_evaluations, detected_misconceptions, demonstrated_objectives, objectives_needing_practice)",
             deterministic_guardrails=(
-                "Rubric criteria deterministically checked before LLM feedback",
-                "Explicitly separated from curriculum design in Task 034",
+                "Deterministic rubric evaluation explicitly separated from optional LLM feedback",
+                "Single correct answer never equated with complete lesson or concept mastery",
+                "Explicit misconception pattern detection and remediation mapping",
             ),
-            milestone_status="CONTRACT_DEFINED_STAGE_2",
+            milestone_status="ACTIVE_INTERACTIVE_SLICE_TASK_035",
         ),
         AgentCapabilitySpec(
             capability=AgentCapability.LEARNING_PROGRESS,
             display_name="Learning Progress Agent",
-            purpose="Track learner mastery progression across the concept DAG and schedule spaced reviews.",
+            purpose="Persist learner progress, assessment attempts, demonstrated objectives, and knowledge gaps across SQLite and compute prerequisite-aware next lesson recommendations.",
             allowed_tools=("read_curriculum_plan", "query_concept_graph"),
-            input_contract="ProgressUpdateRequest(learner_id, curriculum_id, completed_lesson_ids)",
-            output_contract="LearnerProgressState(unlocked_stage_ids, next_recommended_lesson_id)",
+            input_contract="ProgressUpdateRequest(learner_id, curriculum_id, lesson_id, assessment_evaluation)",
+            output_contract="CurriculumProgressSummary(lesson_progress, next_recommendation, overall_completion_ratio)",
             deterministic_guardrails=(
-                "Prerequisite unlock state computed deterministically from concept DAG",
+                "Prerequisite unlock state computed deterministically from concept DAG and actual progress",
+                "Lesson COMPLETED status requires demonstrating all lesson objectives across multiple exercises",
+                "Forward-only SQLite schema migration preserving read-only knowledge store integrity",
             ),
-            milestone_status="CONTRACT_DEFINED_STAGE_2",
+            milestone_status="ACTIVE_INTERACTIVE_SLICE_TASK_035",
         ),
     )
 
@@ -1249,6 +1296,15 @@ class ConceptGraph:
     @property
     def nodes(self) -> Dict[str, ConceptNode]:
         return dict(self._nodes)
+
+    def get_node(self, concept_id: str) -> ConceptNode:
+        if concept_id not in self._nodes:
+            raise PlatformValidationError(
+                "CONCEPT_NOT_FOUND",
+                f"Concept '{concept_id}' was not found in ConceptGraph.",
+                {"concept_id": concept_id},
+            )
+        return self._nodes[concept_id]
 
     def validate_dag(self) -> List[str]:
         """Validate that all prerequisites exist, the graph is cycle-free, and return topological order."""
@@ -2278,6 +2334,2435 @@ class LearningPlannerAgent:
         )
 
 
+# ---------------------------------------------------------------------------
+# Task 035: Interactive Learning Models, Progress Persistence, and Agents
+# ---------------------------------------------------------------------------
+
+
+def _find_lesson_in_plan(plan: CurriculumPlan, lesson_id: str) -> Optional[CurriculumLesson]:
+    """Locate a CurriculumLesson by lesson_id (also matching normalized whitespace)."""
+    target = lesson_id.strip()
+    target_norm = re.sub(r"\s+", "_", target)
+    for stage in plan.stages:
+        for lesson in stage.lessons:
+            if (
+                lesson.lesson_id == lesson_id
+                or lesson.lesson_id.strip() == target
+                or re.sub(r"\s+", "_", lesson.lesson_id.strip()) == target_norm
+            ):
+                return lesson
+    return None
+
+
+def _curriculum_plan_from_dict(data: Mapping[str, Any]) -> CurriculumPlan:
+    """Reconstruct a CurriculumPlan dataclass from its serialized dictionary representation."""
+    def _cit(c: Mapping[str, Any]) -> CurriculumCitation:
+        return CurriculumCitation(
+            citation_id=str(c["citation_id"]),
+            evidence_tier=EvidenceTier(str(c["evidence_tier"])),
+            source_id=str(c["source_id"]),
+            resource_id=str(c["resource_id"]),
+            title=str(c["title"]),
+            canonical_url=str(c["canonical_url"]),
+            chunk_id=c.get("chunk_id"),
+            epistemic_layer=str(c.get("epistemic_layer", "VERIFIED_RESOURCE_METADATA")),
+            locator=str(c.get("locator", "resource-metadata")),
+            excerpt_summary=str(c.get("excerpt_summary", "")),
+            relevance_score=float(c.get("relevance_score", 1.0)),
+        )
+
+    eco_raw = data["source_ecosystem_summary"]
+    eco_summary = SourceEcosystemSummary(
+        total_registered_sources=int(eco_raw["total_registered_sources"]),
+        approved_operational_sources=int(eco_raw["approved_operational_sources"]),
+        candidate_pending_sources=int(eco_raw["candidate_pending_sources"]),
+        tier_counts=dict(eco_raw["tier_counts"]),
+        curriculum_ready_chunk_count=int(eco_raw["curriculum_ready_chunk_count"]),
+        curriculum_ready_resource_count=int(eco_raw["curriculum_ready_resource_count"]),
+        extracted_resource_count=int(eco_raw["extracted_resource_count"]),
+        collected_document_count=int(eco_raw["collected_document_count"]),
+        approved_uncollected_resource_count=int(eco_raw["approved_uncollected_resource_count"]),
+        discovered_link_candidate_count=int(eco_raw["discovered_link_candidate_count"]),
+        the_batch_governance=dict(eco_raw["the_batch_governance"]),
+    )
+
+    stages: List[CurriculumStage] = []
+    for s_raw in data.get("stages", []):
+        lessons: List[CurriculumLesson] = []
+        for l_raw in s_raw.get("lessons", []):
+            mc_raw = l_raw["mastery_check"]
+            mc = MasteryCheckDesign(
+                check_id=str(mc_raw["check_id"]),
+                lesson_id=str(mc_raw["lesson_id"]),
+                assessment_status=str(mc_raw["assessment_status"]),
+                disclaimer=str(mc_raw["disclaimer"]),
+                prompts=tuple(str(p) for p in mc_raw.get("prompts", [])),
+                pass_criteria=tuple(str(p) for p in mc_raw.get("pass_criteria", [])),
+            )
+            lessons.append(
+                CurriculumLesson(
+                    lesson_id=str(l_raw["lesson_id"]),
+                    concept_id=str(l_raw["concept_id"]),
+                    lesson_order=int(l_raw["lesson_order"]),
+                    title=str(l_raw["title"]),
+                    learning_objectives=tuple(str(x) for x in l_raw.get("learning_objectives", [])),
+                    prerequisites=tuple(str(x) for x in l_raw.get("prerequisites", [])),
+                    prerequisite_lesson_ids=tuple(str(x) for x in l_raw.get("prerequisite_lesson_ids", [])),
+                    explanation=str(l_raw["explanation"]),
+                    reference_materials=tuple(dict(m) for m in l_raw.get("reference_materials", [])),
+                    exercises=tuple(dict(e) for e in l_raw.get("exercises", [])),
+                    projects=tuple(dict(p) for p in l_raw.get("projects", [])),
+                    mastery_check=mc,
+                    source_citations=tuple(_cit(c) for c in l_raw.get("source_citations", [])),
+                    rationale_for_ordering=str(l_raw["rationale_for_ordering"]),
+                    evidence_gaps=tuple(str(g) for g in l_raw.get("evidence_gaps", [])),
+                )
+            )
+        stages.append(
+            CurriculumStage(
+                stage_id=str(s_raw["stage_id"]),
+                stage_order=int(s_raw["stage_order"]),
+                title=str(s_raw["title"]),
+                stage_objectives=tuple(str(x) for x in s_raw.get("stage_objectives", [])),
+                prerequisite_stage_ids=tuple(str(x) for x in s_raw.get("prerequisite_stage_ids", [])),
+                rationale_for_ordering=str(s_raw["rationale_for_ordering"]),
+                lessons=tuple(lessons),
+            )
+        )
+
+    gaps = tuple(
+        EvidenceGap(
+            gap_id=str(g["gap_id"]),
+            scope=str(g["scope"]),
+            related_lesson_id=g.get("related_lesson_id"),
+            related_source_ids=tuple(str(s) for s in g.get("related_source_ids", [])),
+            current_evidence_tier=str(g["current_evidence_tier"]),
+            description=str(g["description"]),
+            recommended_curation_action=str(g["recommended_curation_action"]),
+        )
+        for g in data.get("evidence_gaps", [])
+    )
+
+    vr_raw = data["validation_report"]
+    val_report = CurriculumValidationReport(
+        is_valid=bool(vr_raw["is_valid"]),
+        schema_valid=bool(vr_raw["schema_valid"]),
+        prerequisites_consistent=bool(vr_raw["prerequisites_consistent"]),
+        citations_verified=bool(vr_raw["citations_verified"]),
+        mastery_disclaimer_present=bool(vr_raw["mastery_disclaimer_present"]),
+        the_batch_policy_respected=bool(vr_raw["the_batch_policy_respected"]),
+        checked_lesson_count=int(vr_raw["checked_lesson_count"]),
+        checked_citation_count=int(vr_raw["checked_citation_count"]),
+        errors=tuple(str(e) for e in vr_raw.get("errors", [])),
+    )
+
+    return CurriculumPlan(
+        curriculum_id=str(data["curriculum_id"]),
+        run_id=str(data["run_id"]),
+        schema_version=str(data.get("schema_version", CURRICULUM_SCHEMA_VERSION)),
+        status=CurriculumStatus(str(data["status"])),
+        created_at=str(data["created_at"]),
+        learner_goal=str(data["learner_goal"]),
+        title=str(data["title"]),
+        executive_summary=str(data["executive_summary"]),
+        rationale_for_ordering=str(data["rationale_for_ordering"]),
+        mastery_assessment_disclaimer=str(data["mastery_assessment_disclaimer"]),
+        abstention_reason=data.get("abstention_reason"),
+        source_ecosystem_summary=eco_summary,
+        stages=tuple(stages),
+        source_citations=tuple(_cit(c) for c in data.get("source_citations", [])),
+        evidence_gaps=gaps,
+        validation_report=val_report,
+    )
+
+
+@dataclass(frozen=True)
+class PrerequisiteExplanation:
+    """Prerequisite concept bridge generated by the Teaching Agent."""
+
+    concept_id: str
+    lesson_id: str
+    title: str
+    why_needed: str
+    intuitive_summary: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TeachingRequest:
+    """Structured input contract for the Teaching Agent."""
+
+    curriculum_id: str
+    lesson_id: str
+    learner_question: str
+    explanation_depth: ExplanationDepth = ExplanationDepth.INTERMEDIATE
+    learner_id: str = DEFAULT_LEARNER_ID
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "curriculum_id": self.curriculum_id,
+            "lesson_id": self.lesson_id,
+            "learner_question": self.learner_question,
+            "explanation_depth": self.explanation_depth.value,
+            "learner_id": self.learner_id,
+        }
+
+
+@dataclass(frozen=True)
+class TeachingResponse:
+    """Structured output contract for the Teaching Agent."""
+
+    interaction_id: str
+    run_id: str
+    curriculum_id: str
+    lesson_id: str
+    concept_id: str
+    lesson_title: str
+    learner_id: str
+    learner_question: str
+    explanation_depth: ExplanationDepth
+    depth_disclaimer: str
+    status: str  # "GROUNDED_EXPLANATION" | "PEDAGOGICAL_SYNTHESIS_WITH_METADATA" | "INSUFFICIENT_EVIDENCE"
+    core_explanation: str
+    prerequisite_explanations: Tuple[PrerequisiteExplanation, ...]
+    examples_and_analogies: Tuple[str, ...]
+    socratic_questions: Tuple[str, ...]
+    uncertainty_and_limits: str
+    source_citations: Tuple[CurriculumCitation, ...]
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "interaction_id": self.interaction_id,
+            "run_id": self.run_id,
+            "curriculum_id": self.curriculum_id,
+            "lesson_id": self.lesson_id,
+            "concept_id": self.concept_id,
+            "lesson_title": self.lesson_title,
+            "learner_id": self.learner_id,
+            "learner_question": self.learner_question,
+            "explanation_depth": self.explanation_depth.value,
+            "depth_disclaimer": self.depth_disclaimer,
+            "status": self.status,
+            "core_explanation": self.core_explanation,
+            "prerequisite_explanations": [p.to_dict() for p in self.prerequisite_explanations],
+            "examples_and_analogies": list(self.examples_and_analogies),
+            "socratic_questions": list(self.socratic_questions),
+            "uncertainty_and_limits": self.uncertainty_and_limits,
+            "source_citations": [c.to_dict() for c in self.source_citations],
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class RubricCriterion:
+    """Explicit deterministic grading criterion for an AssessmentExercise."""
+
+    criterion_id: str
+    description: str
+    target_objective: str
+    required_concepts: Tuple[str, ...]
+    weight: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "criterion_id": self.criterion_id,
+            "description": self.description,
+            "target_objective": self.target_objective,
+            "required_concepts": list(self.required_concepts),
+            "weight": self.weight,
+        }
+
+
+@dataclass(frozen=True)
+class MisconceptionPattern:
+    """Deterministic detector for common conceptual or mathematical misconceptions."""
+
+    pattern_id: str
+    trigger_phrases: Tuple[str, ...]
+    explanation: str
+    remediation_objective: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pattern_id": self.pattern_id,
+            "trigger_phrases": list(self.trigger_phrases),
+            "explanation": self.explanation,
+            "remediation_objective": self.remediation_objective,
+        }
+
+
+@dataclass(frozen=True)
+class AssessmentExercise:
+    """Structured exercise generated from lesson objectives with an explicit rubric."""
+
+    exercise_id: str
+    curriculum_id: str
+    lesson_id: str
+    concept_id: str
+    category: AssessmentQuestionCategory
+    title: str
+    prompt: str
+    targeted_objectives: Tuple[str, ...]
+    starter_hint: str
+    rubric: Tuple[RubricCriterion, ...]
+    misconception_patterns: Tuple[MisconceptionPattern, ...]
+    alias_exercise_ids: Tuple[str, ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "exercise_id": self.exercise_id,
+            "curriculum_id": self.curriculum_id,
+            "lesson_id": self.lesson_id,
+            "concept_id": self.concept_id,
+            "category": self.category.value,
+            "title": self.title,
+            "prompt": self.prompt,
+            "targeted_objectives": list(self.targeted_objectives),
+            "starter_hint": self.starter_hint,
+            "rubric": [r.to_dict() for r in self.rubric],
+            "misconception_patterns": [m.to_dict() for m in self.misconception_patterns],
+            "alias_exercise_ids": list(self.alias_exercise_ids),
+        }
+
+
+@dataclass(frozen=True)
+class CriterionEvaluation:
+    """Deterministic grading outcome for a single RubricCriterion."""
+
+    criterion_id: str
+    description: str
+    target_objective: str
+    passed: bool
+    score_awarded: float
+    max_weight: float
+    matched_concepts: Tuple[str, ...]
+    missing_concepts: Tuple[str, ...]
+    feedback: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "criterion_id": self.criterion_id,
+            "description": self.description,
+            "target_objective": self.target_objective,
+            "passed": self.passed,
+            "score_awarded": self.score_awarded,
+            "max_weight": self.max_weight,
+            "matched_concepts": list(self.matched_concepts),
+            "missing_concepts": list(self.missing_concepts),
+            "feedback": self.feedback,
+        }
+
+
+@dataclass(frozen=True)
+class AssessmentEvaluation:
+    """Structured assessment result returned by AssessmentAgent."""
+
+    attempt_id: str
+    run_id: str
+    learner_id: str
+    curriculum_id: str
+    lesson_id: str
+    concept_id: str
+    exercise_id: str
+    category: AssessmentQuestionCategory
+    submitted_answer: str
+    score: float
+    score_band: str  # "DEMONSTRATED" | "PARTIAL" | "NEEDS_PRACTICE"
+    passed: bool
+    complete_lesson_mastery_claimed: bool
+    mastery_disclaimer: str
+    evaluation_mode: str  # "DETERMINISTIC_RUBRIC_ONLY" | "DETERMINISTIC_PLUS_OPTIONAL_LLM"
+    deterministic_feedback: str
+    optional_llm_feedback: Optional[str]
+    criterion_evaluations: Tuple[CriterionEvaluation, ...]
+    detected_misconceptions: Tuple[Dict[str, str], ...]
+    demonstrated_objectives: Tuple[str, ...]
+    objectives_needing_practice: Tuple[str, ...]
+    evaluated_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "run_id": self.run_id,
+            "learner_id": self.learner_id,
+            "curriculum_id": self.curriculum_id,
+            "lesson_id": self.lesson_id,
+            "concept_id": self.concept_id,
+            "exercise_id": self.exercise_id,
+            "category": self.category.value,
+            "submitted_answer": self.submitted_answer,
+            "score": self.score,
+            "score_band": self.score_band,
+            "passed": self.passed,
+            "complete_lesson_mastery_claimed": self.complete_lesson_mastery_claimed,
+            "mastery_disclaimer": self.mastery_disclaimer,
+            "evaluation_mode": self.evaluation_mode,
+            "deterministic_feedback": self.deterministic_feedback,
+            "optional_llm_feedback": self.optional_llm_feedback,
+            "criterion_evaluations": [c.to_dict() for c in self.criterion_evaluations],
+            "detected_misconceptions": [dict(m) for m in self.detected_misconceptions],
+            "demonstrated_objectives": list(self.demonstrated_objectives),
+            "objectives_needing_practice": list(self.objectives_needing_practice),
+            "evaluated_at": self.evaluated_at,
+        }
+
+
+@dataclass(frozen=True)
+class LearnerLessonProgress:
+    """Persistent progress record for a learner on a single lesson."""
+
+    learner_id: str
+    curriculum_id: str
+    lesson_id: str
+    concept_id: str
+    lesson_order: int
+    title: str
+    status: LessonProgressStatus
+    prerequisites_met: bool
+    unmet_prerequisite_lesson_ids: Tuple[str, ...]
+    teaching_questions_count: int
+    assessment_attempts_count: int
+    best_score: float
+    latest_score: Optional[float]
+    completed_exercise_ids: Tuple[str, ...]
+    total_exercises_count: int
+    demonstrated_objectives: Tuple[str, ...]
+    total_objectives_count: int
+    knowledge_gaps: Tuple[str, ...]
+    last_activity_at: Optional[str]
+    recent_attempts: Tuple[Dict[str, Any], ...] = ()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "learner_id": self.learner_id,
+            "curriculum_id": self.curriculum_id,
+            "lesson_id": self.lesson_id,
+            "concept_id": self.concept_id,
+            "lesson_order": self.lesson_order,
+            "title": self.title,
+            "status": self.status.value,
+            "prerequisites_met": self.prerequisites_met,
+            "unmet_prerequisite_lesson_ids": list(self.unmet_prerequisite_lesson_ids),
+            "teaching_questions_count": self.teaching_questions_count,
+            "assessment_attempts_count": self.assessment_attempts_count,
+            "best_score": self.best_score,
+            "latest_score": self.latest_score,
+            "completed_exercise_ids": list(self.completed_exercise_ids),
+            "total_exercises_count": self.total_exercises_count,
+            "demonstrated_objectives": list(self.demonstrated_objectives),
+            "total_objectives_count": self.total_objectives_count,
+            "knowledge_gaps": list(self.knowledge_gaps),
+            "last_activity_at": self.last_activity_at,
+            "recent_attempts": [dict(a) for a in self.recent_attempts],
+        }
+
+
+@dataclass(frozen=True)
+class NextLessonRecommendation:
+    """Prerequisite-aware next lesson recommendation computed by LearningProgressAgent."""
+
+    learner_id: str
+    curriculum_id: str
+    recommendation_type: str  # "CONTINUE_ACTIVE_LESSON" | "REMEDIATE_KNOWLEDGE_GAPS" | "START_NEXT_UNLOCKED_LESSON" | "COMPLETE_PREREQUISITE_FIRST" | "CURRICULUM_COMPLETED"
+    recommended_lesson_id: Optional[str]
+    recommended_concept_id: Optional[str]
+    recommended_lesson_title: Optional[str]
+    rationale: str
+    unmet_prerequisite_lesson_ids: Tuple[str, ...]
+    focus_objectives: Tuple[str, ...]
+    recommended_action: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "learner_id": self.learner_id,
+            "curriculum_id": self.curriculum_id,
+            "recommendation_type": self.recommendation_type,
+            "recommended_lesson_id": self.recommended_lesson_id,
+            "recommended_concept_id": self.recommended_concept_id,
+            "recommended_lesson_title": self.recommended_lesson_title,
+            "rationale": self.rationale,
+            "unmet_prerequisite_lesson_ids": list(self.unmet_prerequisite_lesson_ids),
+            "focus_objectives": list(self.focus_objectives),
+            "recommended_action": self.recommended_action,
+        }
+
+
+@dataclass(frozen=True)
+class CurriculumProgressSummary:
+    """Aggregate persistent learning progress across an entire curriculum."""
+
+    learner_id: str
+    curriculum_id: str
+    curriculum_title: str
+    total_lessons: int
+    not_started_count: int
+    in_progress_count: int
+    practicing_count: int
+    completed_count: int
+    overall_completion_ratio: float
+    total_demonstrated_objectives: int
+    total_curriculum_objectives: int
+    active_knowledge_gaps: Tuple[str, ...]
+    lesson_progress: Tuple[LearnerLessonProgress, ...]
+    next_recommendation: NextLessonRecommendation
+    updated_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "learner_id": self.learner_id,
+            "curriculum_id": self.curriculum_id,
+            "curriculum_title": self.curriculum_title,
+            "total_lessons": self.total_lessons,
+            "not_started_count": self.not_started_count,
+            "in_progress_count": self.in_progress_count,
+            "practicing_count": self.practicing_count,
+            "completed_count": self.completed_count,
+            "overall_completion_ratio": self.overall_completion_ratio,
+            "total_demonstrated_objectives": self.total_demonstrated_objectives,
+            "total_curriculum_objectives": self.total_curriculum_objectives,
+            "active_knowledge_gaps": list(self.active_knowledge_gaps),
+            "lesson_progress": [lp.to_dict() for lp in self.lesson_progress],
+            "next_recommendation": self.next_recommendation.to_dict(),
+            "updated_at": self.updated_at,
+        }
+
+
+LEARNING_PROGRESS_LATEST_SCHEMA_VERSION = 2
+
+LEARNING_PROGRESS_MIGRATIONS: Tuple[Tuple[int, str, str], ...] = (
+    (
+        1,
+        "0001_learning_progress_core",
+        """
+        CREATE TABLE IF NOT EXISTS persisted_curricula (
+            curriculum_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            learner_goal TEXT NOT NULL,
+            title TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            plan_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS learner_lesson_progress (
+            learner_id TEXT NOT NULL,
+            curriculum_id TEXT NOT NULL,
+            lesson_id TEXT NOT NULL,
+            concept_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('NOT_STARTED', 'IN_PROGRESS', 'PRACTICING', 'COMPLETED')),
+            teaching_questions_count INTEGER NOT NULL DEFAULT 0,
+            assessment_attempts_count INTEGER NOT NULL DEFAULT 0,
+            best_score REAL NOT NULL DEFAULT 0.0,
+            latest_score REAL,
+            demonstrated_objectives_json TEXT NOT NULL DEFAULT '[]',
+            knowledge_gaps_json TEXT NOT NULL DEFAULT '[]',
+            completed_exercise_ids_json TEXT NOT NULL DEFAULT '[]',
+            last_activity_at TEXT NOT NULL,
+            PRIMARY KEY (learner_id, curriculum_id, lesson_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_learner_progress_lookup
+            ON learner_lesson_progress(learner_id, curriculum_id);
+        """,
+    ),
+    (
+        2,
+        "0002_teaching_and_assessment_audit",
+        """
+        CREATE TABLE IF NOT EXISTS learner_assessment_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            learner_id TEXT NOT NULL,
+            curriculum_id TEXT NOT NULL,
+            lesson_id TEXT NOT NULL,
+            exercise_id TEXT NOT NULL,
+            category TEXT NOT NULL,
+            submitted_answer TEXT NOT NULL,
+            score REAL NOT NULL,
+            score_band TEXT NOT NULL,
+            passed INTEGER NOT NULL CHECK (passed IN (0, 1)),
+            rubric_feedback_json TEXT NOT NULL,
+            misconceptions_json TEXT NOT NULL,
+            demonstrated_objectives_json TEXT NOT NULL,
+            objectives_needing_practice_json TEXT NOT NULL,
+            attempted_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_assessment_attempts_lookup
+            ON learner_assessment_attempts(learner_id, curriculum_id, lesson_id, attempted_at DESC);
+
+        CREATE TABLE IF NOT EXISTS learner_teaching_interactions (
+            interaction_id TEXT PRIMARY KEY,
+            learner_id TEXT NOT NULL,
+            curriculum_id TEXT NOT NULL,
+            lesson_id TEXT NOT NULL,
+            learner_question TEXT NOT NULL,
+            explanation_depth TEXT NOT NULL,
+            response_status TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_teaching_interactions_lookup
+            ON learner_teaching_interactions(learner_id, curriculum_id, lesson_id, created_at DESC);
+        """,
+    ),
+)
+
+
+class LearningProgressStore:
+    """SQLite persistence layer for curricula, learner progress, teaching sessions, and assessments.
+
+    Uses a forward-only migration system (`learning_schema_migrations`) with SHA-256 checksum
+    verification while keeping the primary knowledge store (`task012_pilot.sqlite`) strictly read-only.
+    """
+
+    def __init__(self, db_path: Optional[Path | str] = None) -> None:
+        self._temp_dir_path: Optional[Path] = None
+        if db_path is None:
+            temp_dir_str = tempfile.mkdtemp(prefix="ai_learning_progress_")
+            self._temp_dir_path = Path(temp_dir_str)
+            atexit.register(shutil.rmtree, temp_dir_str, True)
+            self.db_path = (self._temp_dir_path / "learning_progress.sqlite").resolve()
+        else:
+            self.db_path = Path(db_path).resolve()
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.apply_migrations()
+
+    def close(self) -> None:
+        if self._temp_dir_path is not None and self._temp_dir_path.exists():
+            shutil.rmtree(str(self._temp_dir_path), ignore_errors=True)
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        return conn
+
+    @staticmethod
+    def _checksum(sql: str) -> str:
+        normalized = "\n".join(line.strip() for line in sql.strip().splitlines() if line.strip())
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+    def apply_migrations(self) -> List[Dict[str, Any]]:
+        """Apply forward-only migrations and verify checksums of already-applied migrations."""
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS learning_schema_migrations (
+                        version INTEGER PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        checksum TEXT NOT NULL,
+                        applied_at TEXT NOT NULL
+                    );
+                    """
+                )
+                existing_rows = conn.execute(
+                    "SELECT version, name, checksum, applied_at FROM learning_schema_migrations ORDER BY version"
+                ).fetchall()
+                existing_by_version = {int(r["version"]): dict(r) for r in existing_rows}
+
+                for version, name, sql in LEARNING_PROGRESS_MIGRATIONS:
+                    expected_checksum = self._checksum(sql)
+                    if version in existing_by_version:
+                        recorded = existing_by_version[version]
+                        if recorded["checksum"] != expected_checksum or recorded["name"] != name:
+                            raise PlatformValidationError(
+                                "MIGRATION_CHECKSUM_MISMATCH",
+                                f"Learning progress migration v{version} ({name}) checksum mismatch.",
+                                {"version": version, "name": name},
+                            )
+                        continue
+                    conn.executescript(sql)
+                    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    conn.execute(
+                        "INSERT INTO learning_schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+                        (version, name, expected_checksum, now_iso),
+                    )
+            return self.list_migrations()
+        finally:
+            conn.close()
+
+    def list_migrations(self) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT version, name, checksum, applied_at FROM learning_schema_migrations ORDER BY version"
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def save_curriculum(self, plan: CurriculumPlan) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO persisted_curricula (
+                        curriculum_id, run_id, status, learner_goal, title, created_at, plan_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(curriculum_id) DO UPDATE SET
+                        run_id = excluded.run_id,
+                        status = excluded.status,
+                        learner_goal = excluded.learner_goal,
+                        title = excluded.title,
+                        plan_json = excluded.plan_json
+                    """,
+                    (
+                        plan.curriculum_id,
+                        plan.run_id,
+                        plan.status.value,
+                        plan.learner_goal,
+                        plan.title,
+                        plan.created_at,
+                        json.dumps(plan.to_dict(), ensure_ascii=False),
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def load_curriculum(self, curriculum_id: str) -> Optional[CurriculumPlan]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT plan_json FROM persisted_curricula WHERE curriculum_id = ?",
+                (curriculum_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return _curriculum_plan_from_dict(json.loads(str(row["plan_json"])))
+        finally:
+            conn.close()
+
+    def list_persisted_curricula(self) -> List[CurriculumPlan]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT plan_json FROM persisted_curricula ORDER BY created_at ASC, curriculum_id ASC"
+            ).fetchall()
+            return [_curriculum_plan_from_dict(json.loads(str(r["plan_json"]))) for r in rows]
+        finally:
+            conn.close()
+
+    def get_lesson_row(
+        self,
+        *,
+        learner_id: str,
+        curriculum_id: str,
+        lesson_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT * FROM learner_lesson_progress
+                WHERE learner_id = ? AND curriculum_id = ? AND lesson_id = ?
+                """,
+                (learner_id, curriculum_id, lesson_id),
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def upsert_lesson_progress(
+        self,
+        *,
+        learner_id: str,
+        curriculum_id: str,
+        lesson_id: str,
+        concept_id: str,
+        status: LessonProgressStatus,
+        teaching_questions_count: int,
+        assessment_attempts_count: int,
+        best_score: float,
+        latest_score: Optional[float],
+        demonstrated_objectives: Sequence[str],
+        knowledge_gaps: Sequence[str],
+        completed_exercise_ids: Sequence[str],
+        last_activity_at: str,
+    ) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO learner_lesson_progress (
+                        learner_id, curriculum_id, lesson_id, concept_id, status,
+                        teaching_questions_count, assessment_attempts_count,
+                        best_score, latest_score,
+                        demonstrated_objectives_json, knowledge_gaps_json,
+                        completed_exercise_ids_json, last_activity_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(learner_id, curriculum_id, lesson_id) DO UPDATE SET
+                        concept_id = excluded.concept_id,
+                        status = excluded.status,
+                        teaching_questions_count = excluded.teaching_questions_count,
+                        assessment_attempts_count = excluded.assessment_attempts_count,
+                        best_score = excluded.best_score,
+                        latest_score = excluded.latest_score,
+                        demonstrated_objectives_json = excluded.demonstrated_objectives_json,
+                        knowledge_gaps_json = excluded.knowledge_gaps_json,
+                        completed_exercise_ids_json = excluded.completed_exercise_ids_json,
+                        last_activity_at = excluded.last_activity_at
+                    """,
+                    (
+                        learner_id,
+                        curriculum_id,
+                        lesson_id,
+                        concept_id,
+                        status.value,
+                        teaching_questions_count,
+                        assessment_attempts_count,
+                        round(float(best_score), 4),
+                        round(float(latest_score), 4) if latest_score is not None else None,
+                        json.dumps(list(demonstrated_objectives), ensure_ascii=False),
+                        json.dumps(list(knowledge_gaps), ensure_ascii=False),
+                        json.dumps(list(completed_exercise_ids), ensure_ascii=False),
+                        last_activity_at,
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def record_teaching_interaction(self, response: TeachingResponse) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO learner_teaching_interactions (
+                        interaction_id, learner_id, curriculum_id, lesson_id,
+                        learner_question, explanation_depth, response_status,
+                        response_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        response.interaction_id,
+                        response.learner_id,
+                        response.curriculum_id,
+                        response.lesson_id,
+                        response.learner_question,
+                        response.explanation_depth.value,
+                        response.status,
+                        json.dumps(response.to_dict(), ensure_ascii=False),
+                        response.created_at,
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def list_teaching_interactions(
+        self,
+        *,
+        learner_id: str,
+        curriculum_id: str,
+        lesson_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            if lesson_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT response_json FROM learner_teaching_interactions
+                    WHERE learner_id = ? AND curriculum_id = ? AND lesson_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (learner_id, curriculum_id, lesson_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT response_json FROM learner_teaching_interactions
+                    WHERE learner_id = ? AND curriculum_id = ?
+                    ORDER BY created_at ASC
+                    """,
+                    (learner_id, curriculum_id),
+                ).fetchall()
+            return [json.loads(str(r["response_json"])) for r in rows]
+        finally:
+            conn.close()
+
+    def record_assessment_attempt(self, evaluation: AssessmentEvaluation) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO learner_assessment_attempts (
+                        attempt_id, learner_id, curriculum_id, lesson_id, exercise_id,
+                        category, submitted_answer, score, score_band, passed,
+                        rubric_feedback_json, misconceptions_json,
+                        demonstrated_objectives_json, objectives_needing_practice_json,
+                        attempted_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        evaluation.attempt_id,
+                        evaluation.learner_id,
+                        evaluation.curriculum_id,
+                        evaluation.lesson_id,
+                        evaluation.exercise_id,
+                        evaluation.category.value,
+                        evaluation.submitted_answer,
+                        evaluation.score,
+                        evaluation.score_band,
+                        1 if evaluation.passed else 0,
+                        json.dumps([c.to_dict() for c in evaluation.criterion_evaluations], ensure_ascii=False),
+                        json.dumps(list(evaluation.detected_misconceptions), ensure_ascii=False),
+                        json.dumps(list(evaluation.demonstrated_objectives), ensure_ascii=False),
+                        json.dumps(list(evaluation.objectives_needing_practice), ensure_ascii=False),
+                        evaluation.evaluated_at,
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def list_assessment_attempts(
+        self,
+        *,
+        learner_id: str,
+        curriculum_id: str,
+        lesson_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            if lesson_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM learner_assessment_attempts
+                    WHERE learner_id = ? AND curriculum_id = ? AND lesson_id = ?
+                    ORDER BY attempted_at DESC
+                    """,
+                    (learner_id, curriculum_id, lesson_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM learner_assessment_attempts
+                    WHERE learner_id = ? AND curriculum_id = ?
+                    ORDER BY attempted_at DESC
+                    """,
+                    (learner_id, curriculum_id),
+                ).fetchall()
+            results: List[Dict[str, Any]] = []
+            for r in rows:
+                results.append(
+                    {
+                        "attempt_id": r["attempt_id"],
+                        "learner_id": r["learner_id"],
+                        "curriculum_id": r["curriculum_id"],
+                        "lesson_id": r["lesson_id"],
+                        "exercise_id": r["exercise_id"],
+                        "category": r["category"],
+                        "submitted_answer": r["submitted_answer"],
+                        "score": float(r["score"]),
+                        "score_band": r["score_band"],
+                        "passed": bool(r["passed"]),
+                        "criterion_evaluations": json.loads(str(r["rubric_feedback_json"])),
+                        "detected_misconceptions": json.loads(str(r["misconceptions_json"])),
+                        "demonstrated_objectives": json.loads(str(r["demonstrated_objectives_json"])),
+                        "objectives_needing_practice": json.loads(str(r["objectives_needing_practice_json"])),
+                        "attempted_at": r["attempted_at"],
+                    }
+                )
+            return results
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Teaching Agent
+# ---------------------------------------------------------------------------
+
+
+_CONCEPT_EXAMPLES_AND_ANALOGIES: Dict[str, Tuple[str, str]] = {
+    "math_linear_algebra_calculus": (
+        "Analogy (Geometric Transformations & Altimeter): Think of a weight matrix W as a lens that rotates and stretches input coordinates x into a new feature space, while the gradient nabla_theta L is a 3D compass needle on a mountain terrain pointing uphill—stepping in -nabla_theta L walks down into the valley of minimum loss.",
+        "Concrete Example: For a 2-dim input x = [1.0, 2.0]^T and weight matrix W, the Jacobian of f(W, x, b) = tanh(Wx + b) scales upstream sensitivities by (1 - tanh^2(Wx + b)) and matches finite-difference approximations within 1e-6.",
+    ),
+    "backpropagation_and_gradient_descent": (
+        "Analogy (Assembly-Line Credit Assignment): Imagine a multi-stage manufacturing pipeline where a final quality defect E is measured at the output; backpropagation works backward station-by-station using the chain rule so each hidden station receives its exact responsibility delta_j for the final error.",
+        "Concrete Example: In the classic XOR problem ([0,0]->0, [0,1]->1, [1,0]->1, [1,1]->0), a single linear layer cannot separate the classes, but a 2-unit hidden layer trained via delta_j = (dE/do_j) f'(net_j) learns one hidden feature for OR and one for NAND, making XOR linearly separable.",
+    ),
+    "regularization_and_dropout": (
+        "Analogy (Cross-Trained Engineering Team): If an engineering team always relies on one specific pair of specialists working together, the team fails when one is absent (co-adaptation). Dropout randomly benches half the units on every training step (p = 0.5), forcing every hidden unit to become independently useful with random teammates.",
+        "Concrete Example: With inverted dropout at drop rate p = 0.5, an active hidden activation h_i = 0.8 is scaled by 1/(1 - 0.5) = 2.0 to 1.6 during training so its expected value E[h_i] = 0.5 * 1.6 + 0.5 * 0 = 0.8 matches evaluation mode with no test-time sampling needed.",
+    ),
+    "energy_based_and_boltzmann_models": (
+        "Analogy (Magnetic Spin Crystallization): Like physical atoms settling into low-energy magnetic alignments as metal cools, a Boltzmann machine assigns lower energy E(s) to plausible data patterns and uses thermal noise T to escape shallow local traps.",
+        "Concrete Example: In a Restricted Boltzmann Machine (RBM) with 3 visible binary pixels v and 2 hidden feature detectors h, removing hidden-to-hidden edges means P(h_1=1, h_2=1 | v) factors cleanly into P(h_1=1 | v) * P(h_2=1 | v), turning an exponential sum into parallel sigmoid evaluations.",
+    ),
+    "deep_residual_networks": (
+        "Analogy (Delta Editing vs. Rewriting from Scratch): Asking a stack of nonlinear layers to learn H(x) = x from scratch is like retyping an entire manuscript just to fix one sentence; a residual block y = x + F(x) passes the original manuscript x along an identity highway so the layers only learn the diff F(x) = H(x) - x.",
+        "Concrete Example: If a deep layer is already near-optimal, driving residual weights toward zero sets F(x) = 0 and preserves y = x exactly, while the backward Jacobian dy/dx = I + dF/dx guarantees the identity term I carries gradients back to layer 1 without vanishing.",
+    ),
+    "sequence_alignment_and_bahdanau_attention": (
+        "Analogy (Open-Book Translation vs. Closed-Book Memorization): A fixed-vector encoder-decoder forces a translator to read a 50-word paragraph once, close the book, and translate from memory; Bahdanau attention keeps the source sentence open so the decoder points a soft spotlight alpha_{ij} at the relevant source words for each target word.",
+        "Concrete Example: When translating 'The agreement on the European Economic Area' into French ('L'accord sur la zone économique européenne'), decoding 'européenne' assigns high alignment weight alpha_{i,j} (e.g. 0.78) to 'European' and near-zero weight to 'agreement', forming context vector c_i = sum_j alpha_{ij} h_j.",
+    ),
+    "transformer_self_attention_architecture": (
+        "Analogy (Simultaneous Round-Table Broadcast): Whereas an RNN passes a message sequentially down a whisper line one token at a time (O(n) steps), Transformer Multi-Head Self-Attention lets every token broadcast a Query to all other tokens' Keys simultaneously in O(1) sequential steps.",
+        "Concrete Example: For query/key dimension d_k = 64, unscaled dot products Q K^T have variance 64, pushing softmax into flat saturation where gradients vanish; dividing by sqrt(64) = 8 restores unit variance before multiplying by Values V.",
+    ),
+    "ai_research_methodology_and_safety_frontiers": (
+        "Analogy (Watershed River Network vs. Single Fastest Canal): Standard reward-maximizing RL builds a single canal to the highest-reward peak, whereas a GFlowNet routes probability flow through a branching river delta so terminal states x receive water proportional to their reward R(x), discovering diverse scientific candidates.",
+        "Concrete Example: In an ablation study of a new attention variant, holding parameter count, optimizer schedule, and random seeds fixed while toggling only the positional encoding isolates whether accuracy gains come from the mechanism itself or extra capacity.",
+    ),
+}
+
+
+def validate_teaching_request(
+    *,
+    curriculum_id: Any,
+    lesson_id: Any,
+    learner_question: Any,
+    explanation_depth: Any = "intermediate",
+    learner_id: Any = DEFAULT_LEARNER_ID,
+) -> TeachingRequest:
+    """Deterministically validate inputs for the Teaching Agent."""
+    if not isinstance(curriculum_id, str) or not curriculum_id.strip():
+        raise PlatformValidationError("INVALID_CURRICULUM_ID", "curriculum_id must be a non-empty string.")
+    if not isinstance(lesson_id, str) or not lesson_id.strip():
+        raise PlatformValidationError("INVALID_LESSON_ID", "lesson_id must be a non-empty string.")
+    if not isinstance(learner_question, str):
+        raise PlatformValidationError("INVALID_QUESTION_TYPE", "learner_question must be a string.")
+    cleaned_q = " ".join(learner_question.strip().split())
+    if len(cleaned_q) < 4:
+        raise PlatformValidationError(
+            "QUESTION_TOO_SHORT",
+            "learner_question must be at least 4 characters long.",
+            {"min_length": 4, "actual_length": len(cleaned_q)},
+        )
+    if len(cleaned_q) > 2000:
+        raise PlatformValidationError(
+            "QUESTION_TOO_LONG",
+            "learner_question must not exceed 2000 characters.",
+            {"max_length": 2000, "actual_length": len(cleaned_q)},
+        )
+    depth_str = str(explanation_depth or "intermediate").strip().lower()
+    try:
+        depth_enum = ExplanationDepth(depth_str)
+    except ValueError as exc:
+        valid_depths = [d.value for d in ExplanationDepth]
+        raise PlatformValidationError(
+            "INVALID_EXPLANATION_DEPTH",
+            f"explanation_depth must be one of {valid_depths}, got '{explanation_depth}'.",
+            {"valid_explanation_depths": valid_depths},
+        ) from exc
+    cleaned_learner = str(learner_id or DEFAULT_LEARNER_ID).strip() or DEFAULT_LEARNER_ID
+    return TeachingRequest(
+        curriculum_id=curriculum_id.strip(),
+        lesson_id=lesson_id.strip(),
+        learner_question=cleaned_q,
+        explanation_depth=depth_enum,
+        learner_id=cleaned_learner,
+    )
+
+
+class TeachingAgent:
+    """Interactive Teaching Agent delivering evidence-grounded, depth-adapted explanations."""
+
+    capability = AgentCapability.TEACHING
+
+    def __init__(
+        self,
+        *,
+        tool_registry: ToolRegistry,
+        ecosystem_service: SourceEcosystemService,
+        concept_graph: Optional[ConceptGraph] = None,
+    ) -> None:
+        self.tool_registry = tool_registry
+        self.ecosystem_service = ecosystem_service
+        self.concept_graph = concept_graph or build_default_concept_graph()
+
+    def _build_prerequisite_bridges(
+        self,
+        plan: CurriculumPlan,
+        lesson: CurriculumLesson,
+    ) -> Tuple[PrerequisiteExplanation, ...]:
+        bridges: List[PrerequisiteExplanation] = []
+        for prereq_cid in lesson.prerequisites:
+            node = self.concept_graph.get_node(prereq_cid)
+            prereq_lesson: Optional[CurriculumLesson] = None
+            for stage in plan.stages:
+                for cand in stage.lessons:
+                    if cand.concept_id == prereq_cid:
+                        prereq_lesson = cand
+                        break
+            title = prereq_lesson.title if prereq_lesson else node.title
+            lid = prereq_lesson.lesson_id if prereq_lesson else node.lesson_id
+            bridges.append(
+                PrerequisiteExplanation(
+                    concept_id=prereq_cid,
+                    lesson_id=lid,
+                    title=title,
+                    why_needed=(
+                        f"`{lesson.title}` builds directly on `{title}` (`{prereq_cid}`). "
+                        f"Rationale: {lesson.rationale_for_ordering}"
+                    ),
+                    intuitive_summary=node.explanation_template,
+                )
+            )
+        return tuple(bridges)
+
+    def _format_depth_framing(
+        self,
+        depth: ExplanationDepth,
+        lesson: CurriculumLesson,
+        learner_question: str,
+        grounded_snippets: List[str],
+    ) -> str:
+        depth_intros: Dict[ExplanationDepth, str] = {
+            ExplanationDepth.FOUNDATIONAL_INTUITION: (
+                f"**[Foundational Intuition View]** Before diving into heavy notation, let's build the core mental model for "
+                f"**{lesson.title}** in response to your question (*\"{learner_question}\"*): "
+                f"{lesson.explanation}"
+            ),
+            ExplanationDepth.BEGINNER: (
+                f"**[Beginner Step-by-Step View]** Let's break **{lesson.title}** down step by step for your question "
+                f"(*\"{learner_question}\"*). The primary goal is to understand: {lesson.learning_objectives[0]} "
+                f"{lesson.explanation}"
+            ),
+            ExplanationDepth.INTERMEDIATE: (
+                f"**[Intermediate Technical View]** Connecting the theory and implementation of **{lesson.title}** "
+                f"for your question (*\"{learner_question}\"*): {lesson.explanation} "
+                f"Key mechanism to master: {lesson.learning_objectives[min(1, len(lesson.learning_objectives) - 1)]}"
+            ),
+            ExplanationDepth.ADVANCED: (
+                f"**[Advanced Mathematical & Architectural View]** Analyzing the formal structure and optimization dynamics "
+                f"of **{lesson.title}** regarding *\"{learner_question}\"*: {lesson.explanation} "
+                f"Specifically, we enforce: {'; '.join(lesson.learning_objectives)}"
+            ),
+            ExplanationDepth.RESEARCH_LEVEL: (
+                f"**[Research-Level Epistemic & Frontier View]** Examining **{lesson.title}** from a primary-literature "
+                f"and experimental-methodology perspective (*\"{learner_question}\"*): {lesson.explanation} "
+                f"Research design focus: {lesson.learning_objectives[-1]}"
+            ),
+        }
+        parts = [depth_intros[depth]]
+        if grounded_snippets:
+            parts.append(
+                "**Directly Retrieved Primary Evidence:** " + " ".join(grounded_snippets)
+            )
+        else:
+            parts.append(
+                "**Epistemic Provenance Note:** No additional full-text chunk excerpt matched this specific query beyond the lesson's approved resource metadata; the conceptual walkthrough above is pedagogical synthesis aligned with the lesson syllabus rather than a verbatim primary-chunk quotation."
+            )
+        return "\n\n".join(parts)
+
+    def execute(
+        self,
+        *,
+        run_state: WorkflowRunState,
+        request: TeachingRequest,
+        record_step: Callable[[str, str, Dict[str, Any], Callable[[], Any]], Any],
+    ) -> TeachingResponse:
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Step 1: Load curriculum and target lesson via ToolRegistry
+        def _step_load_lesson() -> Tuple[CurriculumPlan, CurriculumLesson]:
+            plan = self.tool_registry.invoke(
+                run_state=run_state,
+                capability=self.capability,
+                tool_name="read_curriculum_plan",
+                curriculum_id=request.curriculum_id,
+            )
+            if plan is None:
+                raise PlatformValidationError(
+                    "CURRICULUM_NOT_FOUND",
+                    f"Curriculum '{request.curriculum_id}' was not found.",
+                    {"curriculum_id": request.curriculum_id},
+                )
+            if plan.status != CurriculumStatus.VALIDATED:
+                raise PlatformValidationError(
+                    "CURRICULUM_NOT_VALIDATED",
+                    f"Curriculum '{request.curriculum_id}' has status '{plan.status.value}' and cannot be used for teaching.",
+                    {"curriculum_id": request.curriculum_id, "status": plan.status.value},
+                )
+            lesson = _find_lesson_in_plan(plan, request.lesson_id)
+            if lesson is None:
+                raise PlatformValidationError(
+                    "LESSON_NOT_FOUND",
+                    f"Lesson '{request.lesson_id}' does not exist in curriculum '{request.curriculum_id}'.",
+                    {"curriculum_id": request.curriculum_id, "lesson_id": request.lesson_id},
+                )
+            return plan, lesson
+
+        plan, lesson = record_step(
+            "load_curriculum_and_lesson",
+            "TeachingAgent",
+            {"curriculum_id": request.curriculum_id, "lesson_id": request.lesson_id},
+            _step_load_lesson,
+        )
+
+        # Step 2: Inspect concept graph & prerequisite bridges
+        def _step_prereq_bridges() -> Tuple[PrerequisiteExplanation, ...]:
+            self.tool_registry.invoke(
+                run_state=run_state,
+                capability=self.capability,
+                tool_name="query_concept_graph",
+                learner_goal=lesson.title,
+            )
+            return self._build_prerequisite_bridges(plan, lesson)
+
+        prereq_bridges = record_step(
+            "resolve_prerequisite_bridges",
+            "TeachingAgent",
+            {"lesson_id": lesson.lesson_id, "prerequisites": list(lesson.prerequisites)},
+            _step_prereq_bridges,
+        )
+
+        # Step 3: Check domain relevance & retrieve lesson-specific evidence chunks
+        q_lower = request.learner_question.lower()
+        is_off_domain = any(kw in q_lower for kw in _OFF_DOMAIN_KEYWORDS) and not any(
+            akw in q_lower for akw in _AI_DOMAIN_KEYWORDS
+        )
+        asks_about_the_batch = "the batch" in q_lower or "src-the-batch" in q_lower.replace("_", "-")
+
+        def _step_retrieve_evidence() -> List[RetrievedChunk]:
+            if is_off_domain:
+                return []
+            search_query = f"{lesson.title} {lesson.concept_id.replace('_', ' ')} {request.learner_question}"
+            raw_chunks: List[RetrievedChunk] = self.tool_registry.invoke(
+                run_state=run_state,
+                capability=self.capability,
+                tool_name="search_knowledge_chunks",
+                query_text=search_query,
+                top_k=run_state.execution_policy.top_k_per_query,
+            )
+            return [c for c in raw_chunks if c.source_id != THE_BATCH_SOURCE_ID]
+
+        retrieved_chunks = record_step(
+            "retrieve_lesson_evidence",
+            "TeachingAgent",
+            {"lesson_id": lesson.lesson_id, "is_off_domain": is_off_domain},
+            _step_retrieve_evidence,
+        )
+
+        # Step 4: Synthesize grounded explanation, examples, Socratic prompts, and verify citations
+        def _step_synthesize_and_verify() -> TeachingResponse:
+            ihash = hashlib.sha256(
+                f"{run_state.run_id}:{request.curriculum_id}:{lesson.lesson_id}:{request.explanation_depth.value}:{request.learner_question}:{now_iso}".encode("utf-8")
+            ).hexdigest()[:12]
+            interaction_id = f"teach_{ihash}"
+
+            if is_off_domain:
+                return TeachingResponse(
+                    interaction_id=interaction_id,
+                    run_id=run_state.run_id,
+                    curriculum_id=plan.curriculum_id,
+                    lesson_id=lesson.lesson_id,
+                    concept_id=lesson.concept_id,
+                    lesson_title=lesson.title,
+                    learner_id=request.learner_id,
+                    learner_question=request.learner_question,
+                    explanation_depth=request.explanation_depth,
+                    depth_disclaimer=TEACHING_DEPTH_DISCLAIMER,
+                    status="INSUFFICIENT_EVIDENCE",
+                    core_explanation=(
+                        "I must abstain from answering this question because it falls outside the AI/ML domain "
+                        f"and the scope of `{lesson.title}`. No verified evidence exists in the local knowledge store "
+                        "for this off-domain topic, and I will not fabricate unsupported claims or citations."
+                    ),
+                    prerequisite_explanations=prereq_bridges,
+                    examples_and_analogies=(),
+                    socratic_questions=(
+                        f"Would you like to refocus on `{lesson.title}`—for instance: {lesson.mastery_check.prompts[0]}",
+                    ),
+                    uncertainty_and_limits=(
+                        "Insufficient evidence: query is unrelated to the indexed AI research library and lesson objectives."
+                    ),
+                    source_citations=(),
+                    created_at=now_iso,
+                )
+
+            # Filter chunks that are relevant to the lesson or question
+            node = self.concept_graph.get_node(lesson.concept_id)
+            preferred_set = set(node.preferred_resource_ids)
+            prioritized_chunks = [c for c in retrieved_chunks if c.resource_id in preferred_set]
+            if not prioritized_chunks:
+                prioritized_chunks = retrieved_chunks[:2]
+            else:
+                prioritized_chunks = prioritized_chunks[:2]
+
+            citations: List[CurriculumCitation] = list(lesson.source_citations)
+            seen_chunk_ids = {c.chunk_id for c in citations if c.chunk_id}
+            grounded_snippets: List[str] = []
+
+            for idx, ch in enumerate(prioritized_chunks, start=1):
+                snippet = " ".join(ch.chunk_text.strip().split())
+                if len(snippet) > 220:
+                    snippet = snippet[:217].rstrip() + "..."
+                grounded_snippets.append(f"From *{ch.title}*: \"{snippet}\" [{ch.chunk_id}].")
+                if ch.chunk_id not in seen_chunk_ids:
+                    citations.append(
+                        CurriculumCitation(
+                            citation_id=f"cit_teach_{lesson.lesson_id}_{idx:02d}",
+                            evidence_tier=EvidenceTier.CURRICULUM_READY_EVIDENCE,
+                            source_id=ch.source_id,
+                            resource_id=ch.resource_id,
+                            title=ch.title,
+                            canonical_url=ch.canonical_url,
+                            chunk_id=ch.chunk_id,
+                            epistemic_layer=ch.epistemic_layer,
+                            locator=f"chunk_index={ch.chunk_index} ({ch.char_start}..{ch.char_end})",
+                            excerpt_summary=snippet,
+                            relevance_score=round(float(ch.similarity_score), 4),
+                        )
+                    )
+                    seen_chunk_ids.add(ch.chunk_id)
+
+            valid_chunk_ids = {c.chunk_id for c in citations if c.chunk_id is not None}
+            raw_explanation = self._format_depth_framing(
+                request.explanation_depth,
+                lesson,
+                request.learner_question,
+                grounded_snippets,
+            )
+            sanitized_explanation = _sanitize_answer_citations(raw_explanation, valid_chunk_ids)
+
+            # Verify all citations against SQLite knowledge store
+            cit_ok, cit_errors = self.ecosystem_service.verify_citation_records(citations)
+            if not cit_ok:
+                raise PlatformValidationError(
+                    "TEACHING_CITATION_VERIFICATION_FAILED",
+                    f"Teaching Agent citation verification failed: {'; '.join(cit_errors)}",
+                    {"errors": cit_errors},
+                )
+
+            examples_pair = _CONCEPT_EXAMPLES_AND_ANALOGIES.get(
+                lesson.concept_id,
+                (
+                    f"Analogy: Think of `{lesson.title}` as a modular building block that transforms representations while preserving prerequisite invariants.",
+                    f"Concrete Example: Apply `{lesson.learning_objectives[0]}` on a small synthetic tensor to inspect inputs, outputs, and gradients.",
+                ),
+            )
+            socratic_prompts = list(lesson.mastery_check.prompts)
+            socratic_prompts.append(
+                f"How does mastering '{lesson.learning_objectives[0]}' prepare you for the next stage of the curriculum?"
+            )
+
+            uncertainty_notes: List[str] = []
+            if asks_about_the_batch:
+                uncertainty_notes.append(
+                    f"Governance boundary: `{THE_BATCH_SOURCE_ID}` (`CANDIDATE_PENDING_REVIEW`) is a weekly AI news radar only and is never cited as authoritative lesson evidence."
+                )
+            if lesson.evidence_gaps:
+                uncertainty_notes.extend(lesson.evidence_gaps)
+            has_chunk_evidence = any(
+                c.evidence_tier == EvidenceTier.CURRICULUM_READY_EVIDENCE and c.chunk_id is not None
+                for c in citations
+            )
+            if not has_chunk_evidence:
+                status = "PEDAGOGICAL_SYNTHESIS_WITH_METADATA"
+                uncertainty_notes.append(
+                    "This lesson currently references approved seed resource metadata (`APPROVED_UNCOLLECTED_RESOURCE`) without full-text extracted chunks in Chroma; mathematical derivations are presented as explicit pedagogical synthesis."
+                )
+            else:
+                status = "GROUNDED_EXPLANATION"
+                if not uncertainty_notes:
+                    uncertainty_notes.append(
+                        "Primary chunk citations (`[chk_...]`) verify the core architectural/theoretical claims; analogies and Socratic prompts are pedagogical scaffolding built on top of those cited sources."
+                    )
+
+            return TeachingResponse(
+                interaction_id=interaction_id,
+                run_id=run_state.run_id,
+                curriculum_id=plan.curriculum_id,
+                lesson_id=lesson.lesson_id,
+                concept_id=lesson.concept_id,
+                lesson_title=lesson.title,
+                learner_id=request.learner_id,
+                learner_question=request.learner_question,
+                explanation_depth=request.explanation_depth,
+                depth_disclaimer=TEACHING_DEPTH_DISCLAIMER,
+                status=status,
+                core_explanation=sanitized_explanation,
+                prerequisite_explanations=prereq_bridges,
+                examples_and_analogies=examples_pair,
+                socratic_questions=tuple(socratic_prompts),
+                uncertainty_and_limits=" ".join(uncertainty_notes),
+                source_citations=tuple(citations),
+                created_at=now_iso,
+            )
+
+        return record_step(
+            "synthesize_and_verify_teaching_response",
+            "TeachingAgent",
+            {"lesson_id": lesson.lesson_id, "explanation_depth": request.explanation_depth.value},
+            _step_synthesize_and_verify,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Assessment Agent
+# ---------------------------------------------------------------------------
+
+
+_CONCEPT_ASSESSMENT_BLUEPRINTS: Dict[str, Dict[str, Any]] = {
+    "math_linear_algebra_calculus": {
+        "conceptual_terms": (("vector", "matrix", "tensor", "linear"), ("transformation", "shape", "transpose", "geometric")),
+        "mathematical_terms": (("gradient", "jacobian", "partial derivative"), ("chain rule", "directional", "transpose")),
+        "practical_terms": (("jacobian", "tanh", "matrix"), ("numerical", "gradient check", "finite difference")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_math_commutative_matrices",
+                trigger_phrases=("matrix multiplication is always commutative", "ab always equals ba", "a*b == b*a for all matrices"),
+                explanation="Matrix multiplication is generally non-commutative (AB != BA), and inner dimensions must match.",
+                remediation_objective="Represent inputs, parameters, and activations as vectors, matrices, and tensors.",
+            ),
+            MisconceptionPattern(
+                pattern_id="misc_math_gradient_direction",
+                trigger_phrases=("gradient points toward steepest descent", "add the gradient to minimize loss"),
+                explanation="The gradient nabla_theta L points in the direction of steepest ascent; minimizing loss requires stepping in the negative gradient direction (-nabla_theta L).",
+                remediation_objective="Compute Jacobians, directional derivatives, and multivariable chain-rule expansions.",
+            ),
+        ),
+    },
+    "backpropagation_and_gradient_descent": {
+        "conceptual_terms": (("reverse-mode", "forward-mode", "chain rule", "graph"), ("scalar", "sensitivity", "backward", "layer")),
+        "mathematical_terms": (("chain rule", "reverse-mode", "delta"), ("derivative", "weight", "activation", "gradient")),
+        "practical_terms": (("forward", "backward", "activation"), ("update", "learning rate", "weight", "gradient")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_backprop_linear_depth",
+                trigger_phrases=("stacking linear layers without nonlinearities increases expressivity", "no activation function is needed for deep representations"),
+                explanation="Without nonlinear activations, any stack of linear layers W_2(W_1 x) collapses algebraically into a single linear transformation W' x.",
+                remediation_objective="Formulate reverse-mode automatic differentiation over a computational graph using the chain rule.",
+            ),
+            MisconceptionPattern(
+                pattern_id="misc_backprop_zero_init",
+                trigger_phrases=("initialize all weights to zero", "zero initialization breaks symmetry"),
+                explanation="Initializing all weights to zero causes all hidden units in a layer to compute identical activations and receive identical gradients (symmetry lock).",
+                remediation_objective="Implement forward and backward passes for a multilayer perceptron trained via stochastic gradient descent.",
+            ),
+        ),
+    },
+    "regularization_and_dropout": {
+        "conceptual_terms": (("co-adaptation", "overfitting", "random", "subset"), ("ensemble", "sub-network", "generalization")),
+        "mathematical_terms": (("1/(1-p)", "1-p", "expected", "expectation"), ("scale", "scaling", "probability", "mask")),
+        "practical_terms": (("train", "eval", "inference", "test"), ("mask", "bernoulli", "inverted", "scale")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_dropout_active_at_eval",
+                trigger_phrases=("keep dropping units at test time", "apply random dropout masks during standard evaluation", "dropout is only used at inference"),
+                explanation="Standard evaluation disables random dropout masking and relies on training-time inverted scaling 1/(1-p) (or test-time (1-p) weight scaling) so predictions are deterministic.",
+                remediation_objective="Implement inverted dropout during training and deterministic weight scaling at inference time.",
+            ),
+            MisconceptionPattern(
+                pattern_id="misc_dropout_increases_coadaptation",
+                trigger_phrases=("dropout encourages units to co-adapt", "increases co-adaptation between hidden units"),
+                explanation="Dropout prevents complex co-adaptation by randomly removing units so no feature detector can rely on fixed partner units.",
+                remediation_objective="Diagnose overfitting and complex feature co-adaptation in overparameterized feedforward networks.",
+            ),
+        ),
+    },
+    "energy_based_and_boltzmann_models": {
+        "conceptual_terms": (("energy", "boltzmann", "stochastic", "symmetric"), ("equilibrium", "temperature", "partition")),
+        "mathematical_terms": (("bipartite", "conditional", "independent", "factor"), ("visible", "hidden", "within-layer", "intra-layer")),
+        "practical_terms": (("gibbs", "contrastive divergence", "sample", "sampling"), ("energy", "probability", "rbm", "hidden")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_rbm_intralayer_edges",
+                trigger_phrases=("rbm has hidden-to-hidden connections", "within-layer connections in an rbm", "intra-layer connections are kept in rbm"),
+                explanation="A Restricted Boltzmann Machine (RBM) explicitly removes all intra-layer (visible-visible and hidden-to-hidden) connections to make P(h|v) and P(v|h) conditionally independent.",
+                remediation_objective="Explain why unrestricted partition function intractability motivates Restricted Boltzmann Machines (RBMs) and Contrastive Divergence.",
+            ),
+            MisconceptionPattern(
+                pattern_id="misc_boltzmann_high_energy_prob",
+                trigger_phrases=("higher energy means higher probability", "states with maximum energy are most probable"),
+                explanation="In the Boltzmann-Gibbs distribution P(s) proportional to exp(-E(s)/T), lower energy E(s) corresponds to exponentially higher probability.",
+                remediation_objective="Relate the Boltzmann-Gibbs equilibrium probability distribution to thermal temperature T and energy gaps.",
+            ),
+        ),
+    },
+    "deep_residual_networks": {
+        "conceptual_terms": (("degradation", "training error", "training accuracy"), ("overfitting", "identity", "optimize", "optimization")),
+        "mathematical_terms": (("f(x) + x", "h(x) - x", "residual"), ("identity", "jacobian", "gradient", "i +")),
+        "practical_terms": (("shortcut", "skip", "residual"), ("gradient", "norm", "vanishing", "layer")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_resnet_degradation_is_overfitting",
+                trigger_phrases=("degradation is caused by overfitting", "degradation problem is just overfitting", "training error increases because of overfitting"),
+                explanation="He et al. (2015) demonstrate that degradation is NOT caused by overfitting: overfitting yields lower training error with higher test error, whereas degradation causes higher training error itself as plain networks grow deeper.",
+                remediation_objective="Distinguish the deep network training degradation problem from classical overfitting.",
+            ),
+        ),
+    },
+    "sequence_alignment_and_bahdanau_attention": {
+        "conceptual_terms": (("fixed-length", "bottleneck", "compress", "long"), ("encoder", "decoder", "search", "annotation")),
+        "mathematical_terms": (("softmax", "alignment", "alpha", "score"), ("context vector", "weighted sum", "differentiable")),
+        "practical_terms": (("attention", "softmax", "weights", "sum to 1"), ("context", "encoder", "decoder", "step")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_bahdanau_nondifferentiable",
+                trigger_phrases=("soft attention is not differentiable", "requires reinforcement learning because softmax is discrete"),
+                explanation="Soft alignment computes a continuous softmax-weighted sum over encoder annotations, which is fully differentiable with standard backpropagation.",
+                remediation_objective="Formulate additive (Bahdanau) soft alignment scores e_{ij}, attention weights alpha_{ij}, and dynamic context vectors c_i.",
+            ),
+        ),
+    },
+    "transformer_self_attention_architecture": {
+        "conceptual_terms": (("recurrence", "parallel", "sequential", "o(1)"), ("self-attention", "long-range", "path length")),
+        "mathematical_terms": (("sqrt(d_k)", "dot-product", "softmax", "variance"), ("query", "key", "value", "multi-head")),
+        "practical_terms": (("mask", "causal", "multi-head", "attention"), ("residual", "layer norm", "projection", "head")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_transformer_uses_rnn",
+                trigger_phrases=("transformer relies on recurrent hidden states", "processes tokens sequentially with an rnn"),
+                explanation="Vaswani et al. (2017) dispense entirely with recurrence and convolutions, computing sequence representations via self-attention in O(1) sequential operations.",
+                remediation_objective="Contrast recurrent/convolutional sequence transduction with the recurrence-free Transformer architecture.",
+            ),
+            MisconceptionPattern(
+                pattern_id="misc_transformer_scaling_reason",
+                trigger_phrases=("scale by sqrt(d_k) because dot products become too small", "divide by sqrt(d_k) to increase softmax saturation"),
+                explanation="For large d_k, dot products grow large in magnitude (variance d_k), pushing softmax into regions with tiny gradients; scaling by 1/sqrt(d_k) prevents saturation.",
+                remediation_objective="Implement Scaled Dot-Product Attention, Multi-Head Attention projections, and residual layer-normalized sub-layers.",
+            ),
+        ),
+    },
+    "ai_research_methodology_and_safety_frontiers": {
+        "conceptual_terms": (("ablation", "baseline", "control", "hypothesis"), ("reproducible", "confound", "seed", "isolate")),
+        "mathematical_terms": (("gflownet", "proportional", "reward", "r(x)"), ("flow", "diversity", "mode", "policy")),
+        "practical_terms": (("governance", "the batch", "candidate", "evidence"), ("safety", "alignment", "ablation", "verification")),
+        "misconceptions": (
+            MisconceptionPattern(
+                pattern_id="misc_gflownet_greedy_rl",
+                trigger_phrases=("gflownet only maximizes cumulative return on a single mode", "identical objective to greedy q-learning"),
+                explanation="Unlike standard reward-maximizing RL that concentrates on a single highest-reward mode, GFlowNets train a policy so terminal state sampling probability P(x) is proportional to R(x).",
+                remediation_objective="Survey frontier research directions in our curated catalog, including Generative Flow Networks (GFlowNets) and honest/cautious scientist AI safety frameworks.",
+            ),
+            MisconceptionPattern(
+                pattern_id="misc_the_batch_primary_proof",
+                trigger_phrases=("the batch is an approved primary peer-reviewed source", "cite src-the-batch as ground-truth chunk evidence"),
+                explanation="SRC-THE-BATCH has status CANDIDATE_PENDING_REVIEW and is restricted to discovery radar only; it must never be cited as authoritative lesson evidence.",
+                remediation_objective="Maintain strict epistemic hygiene: separate primary empirical evidence from metadata-only research seeds and candidate news feeds (`SRC-THE-BATCH`).",
+            ),
+        ),
+    },
+}
+
+
+class AssessmentAgent:
+    """Interactive Assessment Agent generating objective-aligned exercises and evaluating against deterministic rubrics."""
+
+    capability = AgentCapability.ASSESSMENT
+
+    def __init__(
+        self,
+        *,
+        tool_registry: ToolRegistry,
+        concept_graph: Optional[ConceptGraph] = None,
+    ) -> None:
+        self.tool_registry = tool_registry
+        self.concept_graph = concept_graph or build_default_concept_graph()
+
+    def build_exercises_for_lesson(
+        self,
+        plan: CurriculumPlan,
+        lesson: CurriculumLesson,
+    ) -> Tuple[AssessmentExercise, ...]:
+        """Deterministically construct conceptual, mathematical, and practical exercises for a lesson."""
+        objs = list(lesson.learning_objectives)
+        obj_conceptual = objs[0]
+        obj_math = objs[1] if len(objs) > 1 else objs[0]
+        obj_practical = objs[2] if len(objs) > 2 else objs[-1]
+
+        bp = _CONCEPT_ASSESSMENT_BLUEPRINTS.get(lesson.concept_id, {})
+        c_terms_1, c_terms_2 = bp.get(
+            "conceptual_terms",
+            (("concept", "architecture", "representation"), ("objective", "mechanism", "model")),
+        )
+        m_terms_1, m_terms_2 = bp.get(
+            "mathematical_terms",
+            (("equation", "derivative", "function"), ("parameter", "scale", "distribution")),
+        )
+        p_terms_1, p_terms_2 = bp.get(
+            "practical_terms",
+            (("implement", "verify", "test"), ("training", "evaluation", "diagnostic")),
+        )
+        misconceptions: Tuple[MisconceptionPattern, ...] = tuple(bp.get("misconceptions", ()))
+
+        mc_prompt_0 = lesson.mastery_check.prompts[0] if lesson.mastery_check.prompts else f"Explain the core mechanism of {lesson.title}."
+        mc_prompt_1 = (
+            lesson.mastery_check.prompts[1]
+            if len(lesson.mastery_check.prompts) > 1
+            else f"Formulate the mathematical structure underlying: {obj_math}"
+        )
+        prac_spec = lesson.exercises[0] if lesson.exercises else {
+            "exercise_id": f"{lesson.lesson_id}_ex_01",
+            "title": f"Practical Implementation: {lesson.title}",
+            "description": obj_practical,
+            "deliverable": "Structured verification summary.",
+        }
+        native_ex_id = str(prac_spec.get("exercise_id", f"{lesson.lesson_id}_ex_01"))
+
+        ex_conceptual = AssessmentExercise(
+            exercise_id=f"{lesson.lesson_id}_ex_conceptual",
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+            concept_id=lesson.concept_id,
+            category=AssessmentQuestionCategory.CONCEPTUAL,
+            title=f"Conceptual Analysis: {lesson.title}",
+            prompt=f"{mc_prompt_0} Address the lesson objective: {obj_conceptual}",
+            targeted_objectives=(obj_conceptual,),
+            starter_hint=(
+                f"Include key concepts ({', '.join(c_terms_1[:3])}) and explain the causal mechanism ({', '.join(c_terms_2[:3])})."
+            ),
+            rubric=(
+                RubricCriterion(
+                    criterion_id=f"{lesson.lesson_id}_crit_conc_01",
+                    description="Identifies core domain primitives and structural mechanism.",
+                    target_objective=obj_conceptual,
+                    required_concepts=tuple(c_terms_1),
+                    weight=0.5,
+                ),
+                RubricCriterion(
+                    criterion_id=f"{lesson.lesson_id}_crit_conc_02",
+                    description="Explains causal role and contrast against naive alternatives.",
+                    target_objective=obj_conceptual,
+                    required_concepts=tuple(c_terms_2),
+                    weight=0.5,
+                ),
+            ),
+            misconception_patterns=misconceptions,
+            alias_exercise_ids=("conceptual",),
+        )
+
+        ex_mathematical = AssessmentExercise(
+            exercise_id=f"{lesson.lesson_id}_ex_mathematical",
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+            concept_id=lesson.concept_id,
+            category=AssessmentQuestionCategory.MATHEMATICAL,
+            title=f"Mathematical Formulation & Derivation: {lesson.title}",
+            prompt=f"{mc_prompt_1} Target objective: {obj_math}",
+            targeted_objectives=(obj_math,),
+            starter_hint=(
+                f"State the formal terms ({', '.join(m_terms_1[:3])}) and explain how they interact ({', '.join(m_terms_2[:3])})."
+            ),
+            rubric=(
+                RubricCriterion(
+                    criterion_id=f"{lesson.lesson_id}_crit_math_01",
+                    description="States accurate mathematical operators, variables, or equations.",
+                    target_objective=obj_math,
+                    required_concepts=tuple(m_terms_1),
+                    weight=0.5,
+                ),
+                RubricCriterion(
+                    criterion_id=f"{lesson.lesson_id}_crit_math_02",
+                    description="Connects the mathematical derivation to optimization or probabilistic behavior.",
+                    target_objective=obj_math,
+                    required_concepts=tuple(m_terms_2),
+                    weight=0.5,
+                ),
+            ),
+            misconception_patterns=misconceptions,
+            alias_exercise_ids=("mathematical",),
+        )
+
+        ex_practical = AssessmentExercise(
+            exercise_id=f"{lesson.lesson_id}_ex_practical",
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+            concept_id=lesson.concept_id,
+            category=AssessmentQuestionCategory.PRACTICAL,
+            title=f"Practical Engineering Exercise: {prac_spec.get('title', lesson.title)}",
+            prompt=(
+                f"{prac_spec.get('description', obj_practical)} "
+                f"Describe your implementation design and verification checks for deliverable: {prac_spec.get('deliverable', '')}"
+            ),
+            targeted_objectives=(obj_practical,),
+            starter_hint=(
+                f"Describe the implementation steps ({', '.join(p_terms_1[:3])}) and verification diagnostics ({', '.join(p_terms_2[:3])})."
+            ),
+            rubric=(
+                RubricCriterion(
+                    criterion_id=f"{lesson.lesson_id}_crit_prac_01",
+                    description="Specifies concrete implementation mechanics and tensor/algorithmic flow.",
+                    target_objective=obj_practical,
+                    required_concepts=tuple(p_terms_1),
+                    weight=0.5,
+                ),
+                RubricCriterion(
+                    criterion_id=f"{lesson.lesson_id}_crit_prac_02",
+                    description="Defines verification tests, invariants, or ablation diagnostics.",
+                    target_objective=obj_practical,
+                    required_concepts=tuple(p_terms_2),
+                    weight=0.5,
+                ),
+            ),
+            misconception_patterns=misconceptions,
+            alias_exercise_ids=(native_ex_id, "practical"),
+        )
+
+        return (ex_conceptual, ex_mathematical, ex_practical)
+
+    def generate_exercises(
+        self,
+        *,
+        run_state: WorkflowRunState,
+        curriculum_id: str,
+        lesson_id: str,
+        record_step: Callable[[str, str, Dict[str, Any], Callable[[], Any]], Any],
+    ) -> Tuple[AssessmentExercise, ...]:
+        def _step_generate() -> Tuple[AssessmentExercise, ...]:
+            plan = self.tool_registry.invoke(
+                run_state=run_state,
+                capability=self.capability,
+                tool_name="read_curriculum_plan",
+                curriculum_id=curriculum_id,
+            )
+            if plan is None:
+                raise PlatformValidationError(
+                    "CURRICULUM_NOT_FOUND",
+                    f"Curriculum '{curriculum_id}' was not found.",
+                    {"curriculum_id": curriculum_id},
+                )
+            if plan.status != CurriculumStatus.VALIDATED:
+                raise PlatformValidationError(
+                    "CURRICULUM_NOT_VALIDATED",
+                    f"Curriculum '{curriculum_id}' is not validated.",
+                    {"curriculum_id": curriculum_id, "status": plan.status.value},
+                )
+            lesson = _find_lesson_in_plan(plan, lesson_id)
+            if lesson is None:
+                raise PlatformValidationError(
+                    "LESSON_NOT_FOUND",
+                    f"Lesson '{lesson_id}' does not exist in curriculum '{curriculum_id}'.",
+                    {"curriculum_id": curriculum_id, "lesson_id": lesson_id},
+                )
+            return self.build_exercises_for_lesson(plan, lesson)
+
+        return record_step(
+            "generate_lesson_exercises",
+            "AssessmentAgent",
+            {"curriculum_id": curriculum_id, "lesson_id": lesson_id},
+            _step_generate,
+        )
+
+    @staticmethod
+    def _term_matches(term: str, answer_lower: str) -> bool:
+        t = term.lower().strip()
+        if t in answer_lower:
+            return True
+        # Match root stems for longer words (e.g. "nonlinear" / "non-linear", "differentiable" / "differentiation")
+        t_alnum = re.sub(r"[^a-z0-9]+", "", t)
+        ans_alnum = re.sub(r"[^a-z0-9]+", "", answer_lower)
+        if len(t_alnum) >= 5 and t_alnum[:6] in ans_alnum:
+            return True
+        return False
+
+    def evaluate_submission(
+        self,
+        *,
+        run_state: WorkflowRunState,
+        curriculum_id: str,
+        lesson_id: str,
+        exercise_id: str,
+        submitted_answer: Any,
+        learner_id: str = DEFAULT_LEARNER_ID,
+        record_step: Callable[[str, str, Dict[str, Any], Callable[[], Any]], Any],
+    ) -> AssessmentEvaluation:
+        if not isinstance(curriculum_id, str) or not curriculum_id.strip():
+            raise PlatformValidationError("INVALID_CURRICULUM_ID", "curriculum_id must be a non-empty string.")
+        if not isinstance(lesson_id, str) or not lesson_id.strip():
+            raise PlatformValidationError("INVALID_LESSON_ID", "lesson_id must be a non-empty string.")
+        if not isinstance(exercise_id, str) or not exercise_id.strip():
+            raise PlatformValidationError("INVALID_EXERCISE_ID", "exercise_id must be a non-empty string.")
+        if not isinstance(submitted_answer, str):
+            raise PlatformValidationError("INVALID_SUBMISSION_TYPE", "submitted_answer must be a string.")
+        cleaned_answer = " ".join(submitted_answer.strip().split())
+        if not cleaned_answer:
+            raise PlatformValidationError("EMPTY_SUBMISSION", "submitted_answer must not be empty.")
+        if len(cleaned_answer) < 12:
+            raise PlatformValidationError(
+                "SUBMISSION_TOO_SHORT",
+                "submitted_answer must be at least 12 characters long to allow rubric evaluation.",
+                {"min_length": 12, "actual_length": len(cleaned_answer)},
+            )
+        if len(cleaned_answer) > 8000:
+            raise PlatformValidationError(
+                "SUBMISSION_TOO_LONG",
+                "submitted_answer must not exceed 8000 characters.",
+                {"max_length": 8000, "actual_length": len(cleaned_answer)},
+            )
+
+        exercises = self.generate_exercises(
+            run_state=run_state,
+            curriculum_id=curriculum_id.strip(),
+            lesson_id=lesson_id.strip(),
+            record_step=record_step,
+        )
+
+        target_ex: Optional[AssessmentExercise] = None
+        ex_id_clean = exercise_id.strip()
+        for ex in exercises:
+            if ex.exercise_id == ex_id_clean or ex_id_clean in ex.alias_exercise_ids:
+                target_ex = ex
+                break
+        if target_ex is None:
+            raise PlatformValidationError(
+                "EXERCISE_NOT_FOUND",
+                f"Exercise '{exercise_id}' was not found for lesson '{lesson_id}'.",
+                {
+                    "lesson_id": lesson_id,
+                    "exercise_id": exercise_id,
+                    "available_exercise_ids": [e.exercise_id for e in exercises],
+                },
+            )
+
+        def _step_evaluate() -> AssessmentEvaluation:
+            now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ans_lower = cleaned_answer.lower()
+            word_count = len(cleaned_answer.split())
+
+            # 1. Check misconception patterns deterministically
+            detected_misconceptions: List[Dict[str, str]] = []
+            for mp in target_ex.misconception_patterns:
+                for phrase in mp.trigger_phrases:
+                    if phrase.lower() in ans_lower:
+                        detected_misconceptions.append(
+                            {
+                                "pattern_id": mp.pattern_id,
+                                "triggered_by": phrase,
+                                "explanation": mp.explanation,
+                                "remediation_objective": mp.remediation_objective,
+                            }
+                        )
+                        break
+
+            # 2. Evaluate each rubric criterion deterministically
+            crit_evals: List[CriterionEvaluation] = []
+            raw_score = 0.0
+            for crit in target_ex.rubric:
+                matched: List[str] = []
+                missing: List[str] = []
+                for req in crit.required_concepts:
+                    if self._term_matches(req, ans_lower):
+                        matched.append(req)
+                    else:
+                        missing.append(req)
+
+                if len(matched) >= 2 and word_count >= 8:
+                    crit_passed = True
+                    awarded = crit.weight
+                    fb = f"Criterion '{crit.criterion_id}' satisfied: matched concepts {matched}."
+                elif len(matched) == 1 and word_count >= 5:
+                    crit_passed = False
+                    awarded = round(crit.weight * 0.5, 4)
+                    fb = (
+                        f"Criterion '{crit.criterion_id}' partially satisfied: matched {matched}, "
+                        f"but needs deeper discussion of {missing[:2]}."
+                    )
+                else:
+                    crit_passed = False
+                    awarded = 0.0
+                    fb = (
+                        f"Criterion '{crit.criterion_id}' not yet demonstrated: address key concepts "
+                        f"such as {missing[:3]}."
+                    )
+
+                raw_score += awarded
+                crit_evals.append(
+                    CriterionEvaluation(
+                        criterion_id=crit.criterion_id,
+                        description=crit.description,
+                        target_objective=crit.target_objective,
+                        passed=crit_passed,
+                        score_awarded=awarded,
+                        max_weight=crit.weight,
+                        matched_concepts=tuple(matched),
+                        missing_concepts=tuple(missing),
+                        feedback=fb,
+                    )
+                )
+
+            # Penalize if misconceptions were detected so a flawed answer cannot pass as DEMONSTRATED
+            if detected_misconceptions:
+                final_score = round(min(raw_score, 0.55), 4)
+            else:
+                final_score = round(min(1.0, raw_score), 4)
+
+            if final_score >= 0.75 and not detected_misconceptions:
+                score_band = "DEMONSTRATED"
+                passed = True
+            elif final_score >= 0.40:
+                score_band = "PARTIAL"
+                passed = False
+            else:
+                score_band = "NEEDS_PRACTICE"
+                passed = False
+
+            demonstrated_objs: List[str] = []
+            needs_practice_objs: List[str] = []
+            misconception_objs = {m["remediation_objective"] for m in detected_misconceptions}
+
+            for obj in target_ex.targeted_objectives:
+                obj_crits = [c for c in crit_evals if c.target_objective == obj]
+                if obj not in misconception_objs and obj_crits and all(c.passed for c in obj_crits) and passed:
+                    demonstrated_objs.append(obj)
+                else:
+                    needs_practice_objs.append(obj)
+
+            for m_obj in misconception_objs:
+                if m_obj not in needs_practice_objs:
+                    needs_practice_objs.append(m_obj)
+
+            feedback_lines: List[str] = [
+                f"Deterministic Rubric Score: {final_score:.2f} ({score_band}) on `{target_ex.title}` [{target_ex.category.value}]."
+            ]
+            for ce in crit_evals:
+                feedback_lines.append(f"- {ce.feedback}")
+            if detected_misconceptions:
+                feedback_lines.append(
+                    "Misconceptions Detected: "
+                    + " | ".join(f"[{m['pattern_id']}] {m['explanation']}" for m in detected_misconceptions)
+                )
+            feedback_lines.append(f"Mastery Boundary Note: {SINGLE_EXERCISE_MASTERY_DISCLAIMER}")
+
+            ahash = hashlib.sha256(
+                f"{run_state.run_id}:{learner_id}:{curriculum_id}:{target_ex.exercise_id}:{cleaned_answer}:{now_iso}".encode("utf-8")
+            ).hexdigest()[:12]
+
+            return AssessmentEvaluation(
+                attempt_id=f"att_{ahash}",
+                run_id=run_state.run_id,
+                learner_id=learner_id,
+                curriculum_id=curriculum_id.strip(),
+                lesson_id=target_ex.lesson_id,
+                concept_id=target_ex.concept_id,
+                exercise_id=target_ex.exercise_id,
+                category=target_ex.category,
+                submitted_answer=cleaned_answer,
+                score=final_score,
+                score_band=score_band,
+                passed=passed,
+                complete_lesson_mastery_claimed=False,
+                mastery_disclaimer=SINGLE_EXERCISE_MASTERY_DISCLAIMER,
+                evaluation_mode="DETERMINISTIC_RUBRIC_ONLY",
+                deterministic_feedback="\n".join(feedback_lines),
+                optional_llm_feedback=None,
+                criterion_evaluations=tuple(crit_evals),
+                detected_misconceptions=tuple(detected_misconceptions),
+                demonstrated_objectives=tuple(demonstrated_objs),
+                objectives_needing_practice=tuple(needs_practice_objs),
+                evaluated_at=now_iso,
+            )
+
+        return record_step(
+            "evaluate_exercise_submission",
+            "AssessmentAgent",
+            {
+                "curriculum_id": curriculum_id,
+                "lesson_id": lesson_id,
+                "exercise_id": target_ex.exercise_id,
+                "category": target_ex.category.value,
+            },
+            _step_evaluate,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Learning Progress Agent
+# ---------------------------------------------------------------------------
+
+
+class LearningProgressAgent:
+    """Manages persistent learner progress states and prerequisite-aware next lesson recommendations."""
+
+    capability = AgentCapability.LEARNING_PROGRESS
+
+    def __init__(
+        self,
+        *,
+        tool_registry: ToolRegistry,
+        progress_store: LearningProgressStore,
+        assessment_agent: AssessmentAgent,
+        concept_graph: Optional[ConceptGraph] = None,
+    ) -> None:
+        self.tool_registry = tool_registry
+        self.progress_store = progress_store
+        self.assessment_agent = assessment_agent
+        self.concept_graph = concept_graph or build_default_concept_graph()
+
+    def record_lesson_opened(
+        self,
+        *,
+        learner_id: str,
+        plan: CurriculumPlan,
+        lesson: CurriculumLesson,
+    ) -> LearnerLessonProgress:
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        existing = self.progress_store.get_lesson_row(
+            learner_id=learner_id,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+        )
+        if existing is None:
+            self.progress_store.upsert_lesson_progress(
+                learner_id=learner_id,
+                curriculum_id=plan.curriculum_id,
+                lesson_id=lesson.lesson_id,
+                concept_id=lesson.concept_id,
+                status=LessonProgressStatus.IN_PROGRESS,
+                teaching_questions_count=0,
+                assessment_attempts_count=0,
+                best_score=0.0,
+                latest_score=None,
+                demonstrated_objectives=(),
+                knowledge_gaps=(),
+                completed_exercise_ids=(),
+                last_activity_at=now_iso,
+            )
+        else:
+            current_status = LessonProgressStatus(str(existing["status"]))
+            new_status = (
+                LessonProgressStatus.IN_PROGRESS
+                if current_status == LessonProgressStatus.NOT_STARTED
+                else current_status
+            )
+            self.progress_store.upsert_lesson_progress(
+                learner_id=learner_id,
+                curriculum_id=plan.curriculum_id,
+                lesson_id=lesson.lesson_id,
+                concept_id=lesson.concept_id,
+                status=new_status,
+                teaching_questions_count=int(existing["teaching_questions_count"]),
+                assessment_attempts_count=int(existing["assessment_attempts_count"]),
+                best_score=float(existing["best_score"]),
+                latest_score=float(existing["latest_score"]) if existing["latest_score"] is not None else None,
+                demonstrated_objectives=json.loads(str(existing["demonstrated_objectives_json"])),
+                knowledge_gaps=json.loads(str(existing["knowledge_gaps_json"])),
+                completed_exercise_ids=json.loads(str(existing["completed_exercise_ids_json"])),
+                last_activity_at=now_iso,
+            )
+        return self.get_lesson_progress(learner_id=learner_id, plan=plan, lesson=lesson)
+
+    def record_teaching_turn(
+        self,
+        *,
+        plan: CurriculumPlan,
+        lesson: CurriculumLesson,
+        response: TeachingResponse,
+    ) -> LearnerLessonProgress:
+        self.progress_store.record_teaching_interaction(response)
+        existing = self.progress_store.get_lesson_row(
+            learner_id=response.learner_id,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+        )
+        if existing is None:
+            self.progress_store.upsert_lesson_progress(
+                learner_id=response.learner_id,
+                curriculum_id=plan.curriculum_id,
+                lesson_id=lesson.lesson_id,
+                concept_id=lesson.concept_id,
+                status=LessonProgressStatus.IN_PROGRESS,
+                teaching_questions_count=1,
+                assessment_attempts_count=0,
+                best_score=0.0,
+                latest_score=None,
+                demonstrated_objectives=(),
+                knowledge_gaps=(),
+                completed_exercise_ids=(),
+                last_activity_at=response.created_at,
+            )
+        else:
+            current_status = LessonProgressStatus(str(existing["status"]))
+            new_status = (
+                LessonProgressStatus.IN_PROGRESS
+                if current_status == LessonProgressStatus.NOT_STARTED
+                else current_status
+            )
+            self.progress_store.upsert_lesson_progress(
+                learner_id=response.learner_id,
+                curriculum_id=plan.curriculum_id,
+                lesson_id=lesson.lesson_id,
+                concept_id=lesson.concept_id,
+                status=new_status,
+                teaching_questions_count=int(existing["teaching_questions_count"]) + 1,
+                assessment_attempts_count=int(existing["assessment_attempts_count"]),
+                best_score=float(existing["best_score"]),
+                latest_score=float(existing["latest_score"]) if existing["latest_score"] is not None else None,
+                demonstrated_objectives=json.loads(str(existing["demonstrated_objectives_json"])),
+                knowledge_gaps=json.loads(str(existing["knowledge_gaps_json"])),
+                completed_exercise_ids=json.loads(str(existing["completed_exercise_ids_json"])),
+                last_activity_at=response.created_at,
+            )
+        return self.get_lesson_progress(learner_id=response.learner_id, plan=plan, lesson=lesson)
+
+    def record_assessment_evaluation(
+        self,
+        *,
+        plan: CurriculumPlan,
+        lesson: CurriculumLesson,
+        evaluation: AssessmentEvaluation,
+    ) -> LearnerLessonProgress:
+        """Update persistent lesson progress from an AssessmentEvaluation.
+
+        Enforces the mastery rule: a single correct answer never equates to complete
+        lesson mastery (`COMPLETED`). Transitioning to `COMPLETED` requires demonstrating
+        all lesson objectives across multiple exercises (all 3 exercise categories).
+        """
+        self.progress_store.record_assessment_attempt(evaluation)
+        existing = self.progress_store.get_lesson_row(
+            learner_id=evaluation.learner_id,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+        )
+        exercises = self.assessment_agent.build_exercises_for_lesson(plan, lesson)
+        required_exercise_count = len(exercises)
+
+        if existing is None:
+            q_count = 0
+            att_count = 1
+            best_score = evaluation.score
+            dem_objs: List[str] = []
+            gaps: List[str] = []
+            comp_ex_ids: List[str] = []
+        else:
+            q_count = int(existing["teaching_questions_count"])
+            att_count = int(existing["assessment_attempts_count"]) + 1
+            best_score = max(float(existing["best_score"]), evaluation.score)
+            dem_objs = list(json.loads(str(existing["demonstrated_objectives_json"])))
+            gaps = list(json.loads(str(existing["knowledge_gaps_json"])))
+            comp_ex_ids = list(json.loads(str(existing["completed_exercise_ids_json"])))
+
+        if evaluation.passed:
+            if evaluation.exercise_id not in comp_ex_ids:
+                comp_ex_ids.append(evaluation.exercise_id)
+            for obj in evaluation.demonstrated_objectives:
+                if obj not in dem_objs:
+                    dem_objs.append(obj)
+                if obj in gaps:
+                    gaps.remove(obj)
+            # Clear misconception notes associated with demonstrated objectives
+            gaps = [
+                g for g in gaps
+                if not any(obj in g for obj in evaluation.demonstrated_objectives)
+            ]
+        else:
+            for obj in evaluation.objectives_needing_practice:
+                if obj not in gaps:
+                    gaps.append(obj)
+                if obj in dem_objs and evaluation.detected_misconceptions:
+                    dem_objs.remove(obj)
+            for m in evaluation.detected_misconceptions:
+                m_note = f"Misconception ({m['pattern_id']}): {m['explanation']}"
+                if m_note not in gaps:
+                    gaps.append(m_note)
+
+        # Mastery gate: never equate a single correct answer with complete mastery!
+        all_lesson_objs_demonstrated = all(
+            obj in dem_objs for obj in lesson.learning_objectives
+        )
+        all_exercises_completed = len(comp_ex_ids) >= max(2, required_exercise_count)
+
+        if all_lesson_objs_demonstrated and all_exercises_completed and len(gaps) == 0:
+            new_status = LessonProgressStatus.COMPLETED
+        else:
+            new_status = LessonProgressStatus.PRACTICING
+
+        self.progress_store.upsert_lesson_progress(
+            learner_id=evaluation.learner_id,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+            concept_id=lesson.concept_id,
+            status=new_status,
+            teaching_questions_count=q_count,
+            assessment_attempts_count=att_count,
+            best_score=best_score,
+            latest_score=evaluation.score,
+            demonstrated_objectives=dem_objs,
+            knowledge_gaps=gaps,
+            completed_exercise_ids=comp_ex_ids,
+            last_activity_at=evaluation.evaluated_at,
+        )
+        return self.get_lesson_progress(learner_id=evaluation.learner_id, plan=plan, lesson=lesson)
+
+    def _completed_lesson_ids(self, learner_id: str, plan: CurriculumPlan) -> Set[str]:
+        completed: Set[str] = set()
+        for stage in plan.stages:
+            for lesson in stage.lessons:
+                row = self.progress_store.get_lesson_row(
+                    learner_id=learner_id,
+                    curriculum_id=plan.curriculum_id,
+                    lesson_id=lesson.lesson_id,
+                )
+                if row and str(row["status"]) == LessonProgressStatus.COMPLETED.value:
+                    completed.add(lesson.lesson_id)
+        return completed
+
+    def get_lesson_progress(
+        self,
+        *,
+        learner_id: str,
+        plan: CurriculumPlan,
+        lesson: CurriculumLesson,
+    ) -> LearnerLessonProgress:
+        completed_ids = self._completed_lesson_ids(learner_id, plan)
+        unmet = tuple(
+            prereq_lid for prereq_lid in lesson.prerequisite_lesson_ids if prereq_lid not in completed_ids
+        )
+        row = self.progress_store.get_lesson_row(
+            learner_id=learner_id,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+        )
+        exercises = self.assessment_agent.build_exercises_for_lesson(plan, lesson)
+        attempts = self.progress_store.list_assessment_attempts(
+            learner_id=learner_id,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+        )
+        if row is None:
+            return LearnerLessonProgress(
+                learner_id=learner_id,
+                curriculum_id=plan.curriculum_id,
+                lesson_id=lesson.lesson_id,
+                concept_id=lesson.concept_id,
+                lesson_order=lesson.lesson_order,
+                title=lesson.title,
+                status=LessonProgressStatus.NOT_STARTED,
+                prerequisites_met=len(unmet) == 0,
+                unmet_prerequisite_lesson_ids=unmet,
+                teaching_questions_count=0,
+                assessment_attempts_count=0,
+                best_score=0.0,
+                latest_score=None,
+                completed_exercise_ids=(),
+                total_exercises_count=len(exercises),
+                demonstrated_objectives=(),
+                total_objectives_count=len(lesson.learning_objectives),
+                knowledge_gaps=(),
+                last_activity_at=None,
+                recent_attempts=tuple(attempts[:5]),
+            )
+        return LearnerLessonProgress(
+            learner_id=learner_id,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+            concept_id=lesson.concept_id,
+            lesson_order=lesson.lesson_order,
+            title=lesson.title,
+            status=LessonProgressStatus(str(row["status"])),
+            prerequisites_met=len(unmet) == 0,
+            unmet_prerequisite_lesson_ids=unmet,
+            teaching_questions_count=int(row["teaching_questions_count"]),
+            assessment_attempts_count=int(row["assessment_attempts_count"]),
+            best_score=float(row["best_score"]),
+            latest_score=float(row["latest_score"]) if row["latest_score"] is not None else None,
+            completed_exercise_ids=tuple(json.loads(str(row["completed_exercise_ids_json"]))),
+            total_exercises_count=len(exercises),
+            demonstrated_objectives=tuple(json.loads(str(row["demonstrated_objectives_json"]))),
+            total_objectives_count=len(lesson.learning_objectives),
+            knowledge_gaps=tuple(json.loads(str(row["knowledge_gaps_json"]))),
+            last_activity_at=str(row["last_activity_at"]),
+            recent_attempts=tuple(attempts[:5]),
+        )
+
+    def compute_curriculum_progress(
+        self,
+        *,
+        learner_id: str,
+        plan: CurriculumPlan,
+        target_lesson_id: Optional[str] = None,
+    ) -> CurriculumProgressSummary:
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        all_lessons: List[CurriculumLesson] = [
+            lesson for stage in plan.stages for lesson in stage.lessons
+        ]
+        progress_list = [
+            self.get_lesson_progress(learner_id=learner_id, plan=plan, lesson=lesson)
+            for lesson in all_lessons
+        ]
+        by_id = {lp.lesson_id: lp for lp in progress_list}
+        lesson_by_id = {l.lesson_id: l for l in all_lessons}
+
+        not_started = sum(1 for lp in progress_list if lp.status == LessonProgressStatus.NOT_STARTED)
+        in_progress = sum(1 for lp in progress_list if lp.status == LessonProgressStatus.IN_PROGRESS)
+        practicing = sum(1 for lp in progress_list if lp.status == LessonProgressStatus.PRACTICING)
+        completed = sum(1 for lp in progress_list if lp.status == LessonProgressStatus.COMPLETED)
+        total = len(progress_list)
+        ratio = round(completed / total, 4) if total > 0 else 0.0
+
+        total_dem_objs = sum(len(lp.demonstrated_objectives) for lp in progress_list)
+        total_curr_objs = sum(lp.total_objectives_count for lp in progress_list)
+        all_gaps: List[str] = []
+        for lp in progress_list:
+            for g in lp.knowledge_gaps:
+                if g not in all_gaps:
+                    all_gaps.append(g)
+
+        recommendation = self._compute_next_recommendation(
+            learner_id=learner_id,
+            plan=plan,
+            progress_list=progress_list,
+            by_id=by_id,
+            lesson_by_id=lesson_by_id,
+            target_lesson_id=target_lesson_id,
+        )
+
+        return CurriculumProgressSummary(
+            learner_id=learner_id,
+            curriculum_id=plan.curriculum_id,
+            curriculum_title=plan.title,
+            total_lessons=total,
+            not_started_count=not_started,
+            in_progress_count=in_progress,
+            practicing_count=practicing,
+            completed_count=completed,
+            overall_completion_ratio=ratio,
+            total_demonstrated_objectives=total_dem_objs,
+            total_curriculum_objectives=total_curr_objs,
+            active_knowledge_gaps=tuple(all_gaps),
+            lesson_progress=tuple(progress_list),
+            next_recommendation=recommendation,
+            updated_at=now_iso,
+        )
+
+    def _compute_next_recommendation(
+        self,
+        *,
+        learner_id: str,
+        plan: CurriculumPlan,
+        progress_list: Sequence[LearnerLessonProgress],
+        by_id: Mapping[str, LearnerLessonProgress],
+        lesson_by_id: Mapping[str, CurriculumLesson],
+        target_lesson_id: Optional[str] = None,
+    ) -> NextLessonRecommendation:
+        # Case 0: If the caller asked about a specific target lesson with unmet prerequisites,
+        # guide them to the earliest unmet prerequisite first.
+        if target_lesson_id is not None:
+            target_lesson = _find_lesson_in_plan(plan, target_lesson_id)
+            if target_lesson is not None:
+                target_lp = by_id[target_lesson.lesson_id]
+                if not target_lp.prerequisites_met and target_lp.unmet_prerequisite_lesson_ids:
+                    first_unmet_id = target_lp.unmet_prerequisite_lesson_ids[0]
+                    first_unmet_lesson = lesson_by_id[first_unmet_id]
+                    return NextLessonRecommendation(
+                        learner_id=learner_id,
+                        curriculum_id=plan.curriculum_id,
+                        recommendation_type="COMPLETE_PREREQUISITE_FIRST",
+                        recommended_lesson_id=first_unmet_lesson.lesson_id,
+                        recommended_concept_id=first_unmet_lesson.concept_id,
+                        recommended_lesson_title=first_unmet_lesson.title,
+                        rationale=(
+                            f"Lesson `{target_lesson.title}` (`{target_lesson.lesson_id}`) has unmet prerequisites "
+                            f"{list(target_lp.unmet_prerequisite_lesson_ids)}. Complete `{first_unmet_lesson.title}` first."
+                        ),
+                        unmet_prerequisite_lesson_ids=target_lp.unmet_prerequisite_lesson_ids,
+                        focus_objectives=first_unmet_lesson.learning_objectives,
+                        recommended_action=f"Complete prerequisite lesson `{first_unmet_lesson.lesson_id}` before starting `{target_lesson.lesson_id}`.",
+                    )
+
+        # Case 1: Active lesson with knowledge gaps that needs remediation
+        for lp in progress_list:
+            if lp.status in (LessonProgressStatus.PRACTICING, LessonProgressStatus.IN_PROGRESS) and lp.knowledge_gaps:
+                if not lp.prerequisites_met and lp.unmet_prerequisite_lesson_ids:
+                    prereq_id = lp.unmet_prerequisite_lesson_ids[0]
+                    prereq_lesson = lesson_by_id[prereq_id]
+                    return NextLessonRecommendation(
+                        learner_id=learner_id,
+                        curriculum_id=plan.curriculum_id,
+                        recommendation_type="COMPLETE_PREREQUISITE_FIRST",
+                        recommended_lesson_id=prereq_lesson.lesson_id,
+                        recommended_concept_id=prereq_lesson.concept_id,
+                        recommended_lesson_title=prereq_lesson.title,
+                        rationale=(
+                            f"You encountered knowledge gaps in `{lp.title}` while prerequisite `{prereq_lesson.title}` "
+                            "is still incomplete. Solidify the prerequisite foundation first."
+                        ),
+                        unmet_prerequisite_lesson_ids=lp.unmet_prerequisite_lesson_ids,
+                        focus_objectives=prereq_lesson.learning_objectives,
+                        recommended_action=f"Master prerequisite `{prereq_lesson.lesson_id}` and then retry `{lp.lesson_id}`.",
+                    )
+                lesson = lesson_by_id[lp.lesson_id]
+                remaining_objs = tuple(
+                    obj for obj in lesson.learning_objectives if obj not in lp.demonstrated_objectives
+                ) or lesson.learning_objectives
+                return NextLessonRecommendation(
+                    learner_id=learner_id,
+                    curriculum_id=plan.curriculum_id,
+                    recommendation_type="REMEDIATE_KNOWLEDGE_GAPS",
+                    recommended_lesson_id=lp.lesson_id,
+                    recommended_concept_id=lp.concept_id,
+                    recommended_lesson_title=lp.title,
+                    rationale=(
+                        f"Lesson `{lp.title}` is in `{lp.status.value}` with {len(lp.knowledge_gaps)} active knowledge gap(s). "
+                        "Use the Teaching Agent to review the flagged concepts and re-submit the exercise."
+                    ),
+                    unmet_prerequisite_lesson_ids=lp.unmet_prerequisite_lesson_ids,
+                    focus_objectives=remaining_objs,
+                    recommended_action=f"Review `{lp.lesson_id}` with the Teaching Agent and resolve remaining exercises.",
+                )
+
+        # Case 2: Active lesson in PRACTICING or IN_PROGRESS with prerequisites met
+        for lp in progress_list:
+            if lp.status in (LessonProgressStatus.PRACTICING, LessonProgressStatus.IN_PROGRESS) and lp.prerequisites_met:
+                lesson = lesson_by_id[lp.lesson_id]
+                remaining_objs = tuple(
+                    obj for obj in lesson.learning_objectives if obj not in lp.demonstrated_objectives
+                ) or lesson.learning_objectives
+                return NextLessonRecommendation(
+                    learner_id=learner_id,
+                    curriculum_id=plan.curriculum_id,
+                    recommendation_type="CONTINUE_ACTIVE_LESSON",
+                    recommended_lesson_id=lp.lesson_id,
+                    recommended_concept_id=lp.concept_id,
+                    recommended_lesson_title=lp.title,
+                    rationale=(
+                        f"Lesson `{lp.title}` is currently `{lp.status.value}` ({len(lp.completed_exercise_ids)}/{lp.total_exercises_count} "
+                        f"exercises passed, {len(lp.demonstrated_objectives)}/{lp.total_objectives_count} objectives demonstrated). "
+                        "Complete the remaining exercises to demonstrate full lesson mastery."
+                    ),
+                    unmet_prerequisite_lesson_ids=(),
+                    focus_objectives=remaining_objs,
+                    recommended_action=f"Complete remaining exercises in `{lp.lesson_id}`.",
+                )
+
+        # Case 3: Next unlocked NOT_STARTED lesson in topological prerequisite order
+        for lp in progress_list:
+            if lp.status == LessonProgressStatus.NOT_STARTED and lp.prerequisites_met:
+                lesson = lesson_by_id[lp.lesson_id]
+                return NextLessonRecommendation(
+                    learner_id=learner_id,
+                    curriculum_id=plan.curriculum_id,
+                    recommendation_type="START_NEXT_UNLOCKED_LESSON",
+                    recommended_lesson_id=lp.lesson_id,
+                    recommended_concept_id=lp.concept_id,
+                    recommended_lesson_title=lp.title,
+                    rationale=(
+                        f"All prerequisites for `{lp.title}` are satisfied. "
+                        f"Ordering rationale: {lesson.rationale_for_ordering}"
+                    ),
+                    unmet_prerequisite_lesson_ids=(),
+                    focus_objectives=lesson.learning_objectives,
+                    recommended_action=f"Open `{lp.lesson_id}`, ask the Teaching Agent for an overview, and complete its exercises.",
+                )
+
+        # Case 4: All lessons COMPLETED
+        return NextLessonRecommendation(
+            learner_id=learner_id,
+            curriculum_id=plan.curriculum_id,
+            recommendation_type="CURRICULUM_COMPLETED",
+            recommended_lesson_id=None,
+            recommended_concept_id=None,
+            recommended_lesson_title=None,
+            rationale="Congratulations—all lessons and learning objectives across this curriculum have been demonstrated and completed.",
+            unmet_prerequisite_lesson_ids=(),
+            focus_objectives=(),
+            recommended_action="Review completed projects or generate a specialized frontier curriculum.",
+        )
+
+
 class PlatformOrchestrator:
     """Controlled orchestrator managing workflow state, step tracing, and tool permissions."""
 
@@ -2286,6 +4771,7 @@ class PlatformOrchestrator:
         *,
         db_path: Optional[Path] = None,
         chroma_dir: Optional[Path] = None,
+        progress_db_path: Optional[Path | str] = None,
         execution_policy: Optional[ExecutionPolicy] = None,
     ) -> None:
         self.db_path = Path(db_path or DEFAULT_RUNTIME_DB_PATH).resolve()
@@ -2295,14 +4781,32 @@ class PlatformOrchestrator:
         self.ecosystem_service = SourceEcosystemService(self.db_path)
         self.concept_graph = build_default_concept_graph()
         self.validator = CurriculumValidator(self.ecosystem_service)
+        self.progress_store = LearningProgressStore(progress_db_path)
         self.tool_registry = ToolRegistry()
         self._runs: Dict[str, WorkflowRunState] = {}
         self._curricula: Dict[str, CurriculumPlan] = {}
+        for persisted_plan in self.progress_store.list_persisted_curricula():
+            self._curricula[persisted_plan.curriculum_id] = persisted_plan
         self._register_default_tools()
 
         self.learning_planner_agent = LearningPlannerAgent(
             tool_registry=self.tool_registry,
             validator=self.validator,
+            concept_graph=self.concept_graph,
+        )
+        self.teaching_agent = TeachingAgent(
+            tool_registry=self.tool_registry,
+            ecosystem_service=self.ecosystem_service,
+            concept_graph=self.concept_graph,
+        )
+        self.assessment_agent = AssessmentAgent(
+            tool_registry=self.tool_registry,
+            concept_graph=self.concept_graph,
+        )
+        self.learning_progress_agent = LearningProgressAgent(
+            tool_registry=self.tool_registry,
+            progress_store=self.progress_store,
+            assessment_agent=self.assessment_agent,
             concept_graph=self.concept_graph,
         )
 
@@ -2370,6 +4874,7 @@ class PlatformOrchestrator:
                 description="Select prerequisite-ordered concepts from the platform ConceptGraph.",
                 allowed_capabilities=(
                     AgentCapability.LEARNING_PLANNER,
+                    AgentCapability.TEACHING,
                     AgentCapability.LEARNING_PROGRESS,
                 ),
                 read_only=True,
@@ -2400,33 +4905,34 @@ class PlatformOrchestrator:
                     AgentCapability.LEARNING_PROGRESS,
                 ),
                 read_only=True,
-                handler=lambda curriculum_id: self._curricula.get(curriculum_id),
+                handler=self.get_curriculum,
             )
         )
 
-    def run_learning_planner(
+    def _create_run_state(
         self,
-        learner_goal: str,
         *,
+        capability: AgentCapability,
+        goal_or_context: str,
+        curriculum_id: Optional[str] = None,
         policy_override: Optional[ExecutionPolicy] = None,
-    ) -> Tuple[WorkflowRunState, Optional[CurriculumPlan]]:
-        """Execute a controlled Learning Planner workflow run and store its state."""
+    ) -> Tuple[WorkflowRunState, Callable[[str, str, Dict[str, Any], Callable[[], Any]], Any]]:
         policy = policy_override or self.execution_policy
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        goal_preview = str(learner_goal) if isinstance(learner_goal, str) else ""
         run_hash = hashlib.sha256(
-            f"{goal_preview}:{len(self._runs)}:{now_iso}".encode("utf-8")
+            f"{capability.value}:{goal_or_context}:{len(self._runs)}:{now_iso}".encode("utf-8")
         ).hexdigest()[:12]
         run_id = f"run_{run_hash}"
 
         run_state = WorkflowRunState(
             run_id=run_id,
-            capability=AgentCapability.LEARNING_PLANNER,
+            capability=capability,
             status=WorkflowStatus.RUNNING,
-            learner_goal=goal_preview,
+            learner_goal=goal_or_context,
             created_at=now_iso,
             updated_at=now_iso,
             execution_policy=policy,
+            curriculum_id=curriculum_id,
         )
         self._runs[run_id] = run_state
 
@@ -2477,14 +4983,33 @@ class PlatformOrchestrator:
                 run_state.updated_at = completed_iso
                 raise
 
+        return run_state, _record_step
+
+    def run_learning_planner(
+        self,
+        learner_goal: str,
+        *,
+        policy_override: Optional[ExecutionPolicy] = None,
+    ) -> Tuple[WorkflowRunState, Optional[CurriculumPlan]]:
+        """Execute a controlled Learning Planner workflow run and store its state."""
+        goal_preview = str(learner_goal) if isinstance(learner_goal, str) else ""
+        run_state, _record_step = self._create_run_state(
+            capability=AgentCapability.LEARNING_PLANNER,
+            goal_or_context=goal_preview,
+            policy_override=policy_override,
+        )
+
         try:
             plan = self.learning_planner_agent.execute(
                 run_state=run_state,
                 record_step=_record_step,
             )
             self._curricula[plan.curriculum_id] = plan
+            self.progress_store.save_curriculum(plan)
             run_state.curriculum_id = plan.curriculum_id
-            run_state.validation_summary = plan.validation_summary if hasattr(plan, "validation_summary") else plan.validation_report.to_dict()
+            run_state.validation_summary = (
+                plan.validation_summary if hasattr(plan, "validation_summary") else plan.validation_report.to_dict()
+            )
             if plan.status == CurriculumStatus.ABSTAINED_INSUFFICIENT_EVIDENCE:
                 run_state.status = WorkflowStatus.ABSTAINED
             else:
@@ -2504,30 +5029,256 @@ class PlatformOrchestrator:
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             raise
 
+    def open_lesson(
+        self,
+        *,
+        curriculum_id: str,
+        lesson_id: str,
+        learner_id: str = DEFAULT_LEARNER_ID,
+    ) -> Dict[str, Any]:
+        """Open a lesson in the interactive workspace and transition NOT_STARTED -> IN_PROGRESS."""
+        plan = self.get_curriculum(curriculum_id)
+        if plan is None:
+            raise PlatformValidationError(
+                "CURRICULUM_NOT_FOUND",
+                f"Curriculum '{curriculum_id}' was not found.",
+                {"curriculum_id": curriculum_id},
+            )
+        if plan.status != CurriculumStatus.VALIDATED:
+            raise PlatformValidationError(
+                "CURRICULUM_NOT_VALIDATED",
+                f"Curriculum '{curriculum_id}' has status '{plan.status.value}' and cannot be opened.",
+                {"curriculum_id": curriculum_id, "status": plan.status.value},
+            )
+        lesson = _find_lesson_in_plan(plan, lesson_id)
+        if lesson is None:
+            raise PlatformValidationError(
+                "LESSON_NOT_FOUND",
+                f"Lesson '{lesson_id}' does not exist in curriculum '{curriculum_id}'.",
+                {"curriculum_id": curriculum_id, "lesson_id": lesson_id},
+            )
+        cleaned_learner = str(learner_id or DEFAULT_LEARNER_ID).strip() or DEFAULT_LEARNER_ID
+        lesson_progress = self.learning_progress_agent.record_lesson_opened(
+            learner_id=cleaned_learner,
+            plan=plan,
+            lesson=lesson,
+        )
+        exercises = self.assessment_agent.build_exercises_for_lesson(plan, lesson)
+        summary = self.learning_progress_agent.compute_curriculum_progress(
+            learner_id=cleaned_learner,
+            plan=plan,
+            target_lesson_id=lesson.lesson_id,
+        )
+        return {
+            "curriculum_id": curriculum_id,
+            "lesson": lesson.to_dict(),
+            "exercises": [e.to_dict() for e in exercises],
+            "progress": lesson_progress.to_dict(),
+            "next_recommendation": summary.next_recommendation.to_dict(),
+        }
+
+    def run_teaching_session(
+        self,
+        *,
+        curriculum_id: Any,
+        lesson_id: Any,
+        learner_question: Any,
+        explanation_depth: Any = "intermediate",
+        learner_id: Any = DEFAULT_LEARNER_ID,
+    ) -> Tuple[WorkflowRunState, TeachingResponse]:
+        """Execute a controlled Teaching Agent interaction and update persistent lesson progress."""
+        request = validate_teaching_request(
+            curriculum_id=curriculum_id,
+            lesson_id=lesson_id,
+            learner_question=learner_question,
+            explanation_depth=explanation_depth,
+            learner_id=learner_id,
+        )
+        run_state, _record_step = self._create_run_state(
+            capability=AgentCapability.TEACHING,
+            goal_or_context=f"{request.lesson_id}: {request.learner_question}",
+            curriculum_id=request.curriculum_id,
+        )
+        try:
+            response = self.teaching_agent.execute(
+                run_state=run_state,
+                request=request,
+                record_step=_record_step,
+            )
+            plan = self.get_curriculum(request.curriculum_id)
+            assert plan is not None
+            lesson = _find_lesson_in_plan(plan, request.lesson_id)
+            assert lesson is not None
+            self.learning_progress_agent.record_teaching_turn(
+                plan=plan,
+                lesson=lesson,
+                response=response,
+            )
+            run_state.status = (
+                WorkflowStatus.ABSTAINED
+                if response.status == "INSUFFICIENT_EVIDENCE"
+                else WorkflowStatus.COMPLETED
+            )
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return run_state, response
+        except PlatformValidationError as exc:
+            run_state.status = WorkflowStatus.FAILED
+            run_state.error_code = exc.code
+            run_state.error_message = exc.message
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            raise
+        except Exception as exc:
+            run_state.status = WorkflowStatus.FAILED
+            run_state.error_code = "WORKFLOW_EXECUTION_ERROR"
+            run_state.error_message = str(exc)
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            raise
+
+    def get_lesson_exercises(
+        self,
+        *,
+        curriculum_id: str,
+        lesson_id: str,
+    ) -> Tuple[AssessmentExercise, ...]:
+        run_state, _record_step = self._create_run_state(
+            capability=AgentCapability.ASSESSMENT,
+            goal_or_context=f"generate_exercises:{lesson_id}",
+            curriculum_id=curriculum_id,
+        )
+        try:
+            exercises = self.assessment_agent.generate_exercises(
+                run_state=run_state,
+                curriculum_id=curriculum_id,
+                lesson_id=lesson_id,
+                record_step=_record_step,
+            )
+            run_state.status = WorkflowStatus.COMPLETED
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return exercises
+        except PlatformValidationError as exc:
+            run_state.status = WorkflowStatus.FAILED
+            run_state.error_code = exc.code
+            run_state.error_message = exc.message
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            raise
+
+    def run_assessment_evaluation(
+        self,
+        *,
+        curriculum_id: Any,
+        lesson_id: Any,
+        exercise_id: Any,
+        submitted_answer: Any,
+        learner_id: Any = DEFAULT_LEARNER_ID,
+    ) -> Tuple[WorkflowRunState, AssessmentEvaluation, CurriculumProgressSummary]:
+        """Evaluate an exercise submission with AssessmentAgent and update LearningProgressAgent."""
+        cleaned_learner = str(learner_id or DEFAULT_LEARNER_ID).strip() or DEFAULT_LEARNER_ID
+        run_state, _record_step = self._create_run_state(
+            capability=AgentCapability.ASSESSMENT,
+            goal_or_context=f"assess:{lesson_id}:{exercise_id}",
+            curriculum_id=str(curriculum_id) if isinstance(curriculum_id, str) else None,
+        )
+        try:
+            evaluation = self.assessment_agent.evaluate_submission(
+                run_state=run_state,
+                curriculum_id=curriculum_id,
+                lesson_id=lesson_id,
+                exercise_id=exercise_id,
+                submitted_answer=submitted_answer,
+                learner_id=cleaned_learner,
+                record_step=_record_step,
+            )
+            plan = self.get_curriculum(evaluation.curriculum_id)
+            assert plan is not None
+            lesson = _find_lesson_in_plan(plan, evaluation.lesson_id)
+            assert lesson is not None
+            self.learning_progress_agent.record_assessment_evaluation(
+                plan=plan,
+                lesson=lesson,
+                evaluation=evaluation,
+            )
+            summary = self.learning_progress_agent.compute_curriculum_progress(
+                learner_id=cleaned_learner,
+                plan=plan,
+            )
+            run_state.status = WorkflowStatus.COMPLETED
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return run_state, evaluation, summary
+        except PlatformValidationError as exc:
+            run_state.status = WorkflowStatus.FAILED
+            run_state.error_code = exc.code
+            run_state.error_message = exc.message
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            raise
+        except Exception as exc:
+            run_state.status = WorkflowStatus.FAILED
+            run_state.error_code = "WORKFLOW_EXECUTION_ERROR"
+            run_state.error_message = str(exc)
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            raise
+
+    def get_curriculum_progress(
+        self,
+        *,
+        curriculum_id: str,
+        learner_id: str = DEFAULT_LEARNER_ID,
+        target_lesson_id: Optional[str] = None,
+    ) -> CurriculumProgressSummary:
+        plan = self.get_curriculum(curriculum_id)
+        if plan is None:
+            raise PlatformValidationError(
+                "CURRICULUM_NOT_FOUND",
+                f"Curriculum '{curriculum_id}' was not found.",
+                {"curriculum_id": curriculum_id},
+            )
+        cleaned_learner = str(learner_id or DEFAULT_LEARNER_ID).strip() or DEFAULT_LEARNER_ID
+        return self.learning_progress_agent.compute_curriculum_progress(
+            learner_id=cleaned_learner,
+            plan=plan,
+            target_lesson_id=target_lesson_id,
+        )
+
     def get_run(self, run_id: str) -> Optional[WorkflowRunState]:
         return self._runs.get(run_id)
 
     def get_curriculum(self, curriculum_id: str) -> Optional[CurriculumPlan]:
-        return self._curricula.get(curriculum_id)
+        if curriculum_id in self._curricula:
+            return self._curricula[curriculum_id]
+        loaded = self.progress_store.load_curriculum(curriculum_id)
+        if loaded is not None:
+            self._curricula[curriculum_id] = loaded
+        return loaded
 
     def list_curricula(self) -> List[CurriculumPlan]:
+        for persisted_plan in self.progress_store.list_persisted_curricula():
+            if persisted_plan.curriculum_id not in self._curricula:
+                self._curricula[persisted_plan.curriculum_id] = persisted_plan
         return list(self._curricula.values())
 
 
 class CurriculumManagementService:
-    """Application service used by both the HTTP API (`api.py`) and CLI (`platform.py`)."""
+    """Application service used by the Web Application, HTTP API (`api.py`), and CLI (`platform.py`)."""
 
     def __init__(
         self,
         *,
         db_path: Optional[Path] = None,
         chroma_dir: Optional[Path] = None,
+        progress_db_path: Optional[Path | str] = None,
         orchestrator: Optional[PlatformOrchestrator] = None,
     ) -> None:
         self.orchestrator = orchestrator or PlatformOrchestrator(
             db_path=db_path,
             chroma_dir=chroma_dir,
+            progress_db_path=progress_db_path,
         )
+
+    def list_agents(self) -> Dict[str, Any]:
+        catalog = get_logical_agent_catalog()
+        return {
+            "total": len(catalog),
+            "agents": [spec.to_dict() for spec in catalog],
+        }
 
     def generate_curriculum(self, learner_goal: str) -> Dict[str, Any]:
         run_state, plan = self.orchestrator.run_learning_planner(learner_goal)
@@ -2586,6 +5337,168 @@ class CurriculumManagementService:
             "source_citations": [c.to_dict() for c in plan.source_citations],
             "evidence_gaps": [g.to_dict() for g in plan.evidence_gaps],
         }
+
+    def get_lesson_detail(
+        self,
+        curriculum_id: str,
+        lesson_id: str,
+        *,
+        learner_id: str = DEFAULT_LEARNER_ID,
+    ) -> Dict[str, Any]:
+        plan = self.orchestrator.get_curriculum(curriculum_id)
+        if plan is None:
+            raise PlatformValidationError(
+                "CURRICULUM_NOT_FOUND",
+                f"Curriculum '{curriculum_id}' was not found.",
+                {"curriculum_id": curriculum_id},
+            )
+        lesson = _find_lesson_in_plan(plan, lesson_id)
+        if lesson is None:
+            raise PlatformValidationError(
+                "LESSON_NOT_FOUND",
+                f"Lesson '{lesson_id}' does not exist in curriculum '{curriculum_id}'.",
+                {"curriculum_id": curriculum_id, "lesson_id": lesson_id},
+            )
+        cleaned_learner = str(learner_id or DEFAULT_LEARNER_ID).strip() or DEFAULT_LEARNER_ID
+        exercises = self.orchestrator.assessment_agent.build_exercises_for_lesson(plan, lesson)
+        progress = self.orchestrator.learning_progress_agent.get_lesson_progress(
+            learner_id=cleaned_learner,
+            plan=plan,
+            lesson=lesson,
+        )
+        interactions = self.orchestrator.progress_store.list_teaching_interactions(
+            learner_id=cleaned_learner,
+            curriculum_id=plan.curriculum_id,
+            lesson_id=lesson.lesson_id,
+        )
+        summary = self.orchestrator.learning_progress_agent.compute_curriculum_progress(
+            learner_id=cleaned_learner,
+            plan=plan,
+            target_lesson_id=lesson.lesson_id,
+        )
+        return {
+            "curriculum_id": plan.curriculum_id,
+            "curriculum_title": plan.title,
+            "lesson": lesson.to_dict(),
+            "exercises": [e.to_dict() for e in exercises],
+            "progress": progress.to_dict(),
+            "teaching_history": interactions,
+            "next_recommendation": summary.next_recommendation.to_dict(),
+        }
+
+    def open_lesson(
+        self,
+        curriculum_id: str,
+        lesson_id: str,
+        *,
+        learner_id: str = DEFAULT_LEARNER_ID,
+    ) -> Dict[str, Any]:
+        return self.orchestrator.open_lesson(
+            curriculum_id=curriculum_id,
+            lesson_id=lesson_id,
+            learner_id=learner_id,
+        )
+
+    def teach_lesson(
+        self,
+        curriculum_id: str,
+        lesson_id: str,
+        *,
+        learner_question: Any,
+        explanation_depth: Any = "intermediate",
+        learner_id: str = DEFAULT_LEARNER_ID,
+    ) -> Dict[str, Any]:
+        run_state, response = self.orchestrator.run_teaching_session(
+            curriculum_id=curriculum_id,
+            lesson_id=lesson_id,
+            learner_question=learner_question,
+            explanation_depth=explanation_depth,
+            learner_id=learner_id,
+        )
+        summary = self.orchestrator.get_curriculum_progress(
+            curriculum_id=curriculum_id,
+            learner_id=response.learner_id,
+            target_lesson_id=response.lesson_id,
+        )
+        lesson_prog = next(
+            lp for lp in summary.lesson_progress if lp.lesson_id == response.lesson_id
+        )
+        return {
+            "run": run_state.to_dict(),
+            "teaching_response": response.to_dict(),
+            "lesson_progress": lesson_prog.to_dict(),
+            "progress": summary.to_dict(),
+            "next_recommendation": summary.next_recommendation.to_dict(),
+        }
+
+    def list_lesson_exercises(self, curriculum_id: str, lesson_id: str) -> Dict[str, Any]:
+        exercises = self.orchestrator.get_lesson_exercises(
+            curriculum_id=curriculum_id,
+            lesson_id=lesson_id,
+        )
+        return {
+            "curriculum_id": curriculum_id,
+            "lesson_id": exercises[0].lesson_id if exercises else lesson_id,
+            "total": len(exercises),
+            "exercises": [e.to_dict() for e in exercises],
+        }
+
+    def assess_lesson_exercise(
+        self,
+        curriculum_id: str,
+        lesson_id: str,
+        *,
+        exercise_id: Any,
+        submitted_answer: Any,
+        learner_id: str = DEFAULT_LEARNER_ID,
+    ) -> Dict[str, Any]:
+        run_state, evaluation, summary = self.orchestrator.run_assessment_evaluation(
+            curriculum_id=curriculum_id,
+            lesson_id=lesson_id,
+            exercise_id=exercise_id,
+            submitted_answer=submitted_answer,
+            learner_id=learner_id,
+        )
+        lesson_prog = next(
+            lp for lp in summary.lesson_progress if lp.lesson_id == evaluation.lesson_id
+        )
+        return {
+            "run": run_state.to_dict(),
+            "evaluation": evaluation.to_dict(),
+            "lesson_progress": lesson_prog.to_dict(),
+            "progress": summary.to_dict(),
+            "next_recommendation": summary.next_recommendation.to_dict(),
+        }
+
+    def get_curriculum_progress(
+        self,
+        curriculum_id: str,
+        *,
+        learner_id: str = DEFAULT_LEARNER_ID,
+        target_lesson_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        summary = self.orchestrator.get_curriculum_progress(
+            curriculum_id=curriculum_id,
+            learner_id=learner_id,
+            target_lesson_id=target_lesson_id,
+        )
+        d = summary.to_dict()
+        return {"progress": dict(d), **d}
+
+    def get_next_recommendation(
+        self,
+        curriculum_id: str,
+        *,
+        learner_id: str = DEFAULT_LEARNER_ID,
+        target_lesson_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        summary = self.orchestrator.get_curriculum_progress(
+            curriculum_id=curriculum_id,
+            learner_id=learner_id,
+            target_lesson_id=target_lesson_id,
+        )
+        rec = summary.next_recommendation.to_dict()
+        return {"recommendation": dict(rec), **rec}
 
 
 # ---------------------------------------------------------------------------
@@ -2760,7 +5673,7 @@ def format_curriculum_plan(plan: CurriculumPlan, output_format: str = "markdown"
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ai-learning-platform",
-        description="Agent-First AI Learning Platform CLI (Curriculum Planner & Ecosystem Inspector).",
+        description="Agent-First AI Learning Platform CLI (Curriculum Planner, Teaching, Assessment & Progress).",
     )
     parser.add_argument(
         "--goal",
@@ -2787,6 +5700,60 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Path to Chroma vector store directory (defaults to data/runtime/chroma).",
     )
     parser.add_argument(
+        "--progress-db",
+        type=Path,
+        default=None,
+        help="Optional SQLite path for persistent learner progress and curricula.",
+    )
+    parser.add_argument(
+        "--learner-id",
+        type=str,
+        default=DEFAULT_LEARNER_ID,
+        help="Learner identifier for progress tracking.",
+    )
+    parser.add_argument(
+        "--curriculum-id",
+        type=str,
+        default=None,
+        help="Existing curriculum ID for teaching, assessment, or progress commands.",
+    )
+    parser.add_argument(
+        "--lesson-id",
+        type=str,
+        default=None,
+        help="Lesson ID for teaching or assessment commands.",
+    )
+    parser.add_argument(
+        "--teach-question",
+        type=str,
+        default=None,
+        help="Ask the Teaching Agent a question about the specified lesson.",
+    )
+    parser.add_argument(
+        "--explanation-depth",
+        type=str,
+        default=ExplanationDepth.INTERMEDIATE.value,
+        choices=[d.value for d in ExplanationDepth],
+        help="Teaching explanation depth preference (does not imply learner mastery).",
+    )
+    parser.add_argument(
+        "--exercise-id",
+        type=str,
+        default=None,
+        help="Exercise ID to submit an answer for.",
+    )
+    parser.add_argument(
+        "--submit-answer",
+        type=str,
+        default=None,
+        help="Submitted answer text for the specified lesson exercise.",
+    )
+    parser.add_argument(
+        "--show-progress",
+        action="store_true",
+        help="Display curriculum learning progress and next lesson recommendation.",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -2808,9 +5775,68 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         orchestrator = PlatformOrchestrator(
             db_path=args.db_path,
             chroma_dir=args.chroma_dir,
+            progress_db_path=args.progress_db,
         )
-        _, plan = orchestrator.run_learning_planner(args.goal)
-        assert plan is not None
+        curriculum_id = args.curriculum_id
+        plan: Optional[CurriculumPlan] = None
+        if not curriculum_id:
+            _, plan = orchestrator.run_learning_planner(args.goal)
+            assert plan is not None
+            curriculum_id = plan.curriculum_id
+
+        if args.teach_question is not None:
+            if not args.lesson_id:
+                raise PlatformValidationError(
+                    "missing_lesson_id",
+                    "--lesson-id is required when using --teach-question.",
+                )
+            _, teach_resp = orchestrator.run_teaching_session(
+                curriculum_id=curriculum_id,
+                lesson_id=args.lesson_id,
+                learner_question=args.teach_question,
+                explanation_depth=args.explanation_depth,
+                learner_id=args.learner_id,
+            )
+            assert teach_resp is not None
+            sys.stdout.write(json.dumps(teach_resp.to_dict(), indent=2, ensure_ascii=False) + "\n")
+            return 0
+
+        if args.submit_answer is not None:
+            if not args.lesson_id or not args.exercise_id:
+                raise PlatformValidationError(
+                    "missing_assessment_args",
+                    "--lesson-id and --exercise-id are required when using --submit-answer.",
+                )
+            _, eval_resp, progress_summary = orchestrator.run_assessment_evaluation(
+                curriculum_id=curriculum_id,
+                lesson_id=args.lesson_id,
+                exercise_id=args.exercise_id,
+                submitted_answer=args.submit_answer,
+                learner_id=args.learner_id,
+            )
+            assert eval_resp is not None and progress_summary is not None
+            payload = {
+                "evaluation": eval_resp.to_dict(),
+                "progress": progress_summary.to_dict(),
+            }
+            sys.stdout.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            return 0
+
+        if args.show_progress:
+            progress_summary = orchestrator.get_curriculum_progress(
+                curriculum_id=curriculum_id,
+                learner_id=args.learner_id,
+            )
+            sys.stdout.write(json.dumps(progress_summary.to_dict(), indent=2, ensure_ascii=False) + "\n")
+            return 0
+
+        if plan is None:
+            plan = orchestrator.get_curriculum(curriculum_id)
+            if plan is None:
+                raise PlatformValidationError(
+                    "curriculum_not_found",
+                    f"Curriculum '{curriculum_id}' was not found.",
+                )
         if args.output_json:
             args.output_json.parent.mkdir(parents=True, exist_ok=True)
             args.output_json.write_text(

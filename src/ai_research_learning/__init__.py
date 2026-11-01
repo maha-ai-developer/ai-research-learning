@@ -81,30 +81,51 @@ _PLATFORM_EXPORTS = frozenset(
     {
         "AgentCapability",
         "AgentCapabilitySpec",
+        "AssessmentAgent",
+        "AssessmentEvaluation",
+        "AssessmentExercise",
+        "AssessmentQuestionCategory",
         "CURRICULUM_SCHEMA_VERSION",
         "ConceptGraph",
         "ConceptNode",
+        "CriterionEvaluation",
         "CurriculumCitation",
         "CurriculumLesson",
         "CurriculumManagementService",
         "CurriculumPlan",
+        "CurriculumProgressSummary",
         "CurriculumStage",
         "CurriculumStatus",
         "CurriculumValidationReport",
         "CurriculumValidator",
         "DEFAULT_CONCEPT_NODES",
+        "DEFAULT_LEARNER_ID",
         "EvidenceGap",
         "EvidenceTier",
         "ExecutionPolicy",
+        "ExplanationDepth",
+        "LearnerLessonProgress",
         "LearningPlannerAgent",
+        "LearningProgressAgent",
+        "LearningProgressStore",
+        "LessonProgressStatus",
         "MASTERY_ASSESSMENT_DISCLAIMER",
         "MasteryCheckDesign",
+        "MisconceptionPattern",
+        "NextLessonRecommendation",
         "PlatformOrchestrator",
         "PlatformValidationError",
+        "PrerequisiteExplanation",
+        "RubricCriterion",
+        "SINGLE_EXERCISE_MASTERY_DISCLAIMER",
         "SourceEcosystemService",
         "SourceEcosystemSummary",
+        "TEACHING_DEPTH_DISCLAIMER",
         "THE_BATCH_CANONICAL_URL",
         "THE_BATCH_SOURCE_ID",
+        "TeachingAgent",
+        "TeachingRequest",
+        "TeachingResponse",
         "ToolDefinition",
         "ToolRegistry",
         "WorkflowRunState",
@@ -117,6 +138,8 @@ _PLATFORM_EXPORTS = frozenset(
     }
 )
 
+_WEBAPP_EXPORTS = frozenset({"render_learning_web_app_html"})
+
 __all__ = [
     "APIError",
     "APIResponse",
@@ -125,7 +148,7 @@ __all__ = [
     "LocalResearchLibraryAPI",
     "__version__",
     "create_http_server",
-    *sorted(_RAG_EXPORTS | _PLATFORM_EXPORTS),
+    *sorted(_RAG_EXPORTS | _PLATFORM_EXPORTS | _WEBAPP_EXPORTS),
 ]
 __version__ = "0.1.0"
 
@@ -139,4 +162,8 @@ def __getattr__(name: str) -> Any:
         from . import platform
 
         return getattr(platform, name)
+    if name in _WEBAPP_EXPORTS:
+        from . import webapp
+
+        return getattr(webapp, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
