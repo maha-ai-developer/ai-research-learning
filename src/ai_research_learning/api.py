@@ -184,9 +184,16 @@ class APIResponse:
     status: int
     body: dict[str, Any]
     headers: dict[str, str]
+    content_type: str = "application/json; charset=utf-8"
+    raw_bytes: bytes | None = None
 
     def to_json_bytes(self) -> bytes:
         return (json.dumps(self.body, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+    def to_payload_bytes(self) -> bytes:
+        if self.raw_bytes is not None:
+            return self.raw_bytes
+        return self.to_json_bytes()
 
 
 def _escape_like_term(value: str) -> str:
@@ -227,11 +234,13 @@ class LocalResearchLibraryAPI:
         db_path: Path | str = DEFAULT_DB_PATH,
         *,
         chroma_dir: Path | str | None = None,
+        progress_db_path: Path | str | None = None,
         connection: sqlite3.Connection | None = None,
         clock: Callable[[], str] | None = None,
     ) -> None:
         self.db_path = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
         self.chroma_dir = Path(chroma_dir) if chroma_dir is not None else None
+        self.progress_db_path = Path(progress_db_path) if progress_db_path is not None else None
         self._shared_conn = connection
         self._clock: Callable[[], str] = clock or utc_now
         self._curriculum_service: Any = None
@@ -246,6 +255,7 @@ class LocalResearchLibraryAPI:
             self._curriculum_service = CurriculumManagementService(
                 db_path=self.db_path,
                 chroma_dir=self.chroma_dir,
+                progress_db_path=self.progress_db_path,
             )
         return self._curriculum_service
 
@@ -1435,8 +1445,102 @@ class LocalResearchLibraryAPI:
                 conn.close()
 
     # ------------------------------------------------------------------
-    # Curriculum & Learning Planner Endpoints (Task 034)
+    # Curriculum, Teaching, Assessment & Progress Endpoints (Task 034 & 035)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_json_object_body(
+        body: bytes | str | Mapping[str, Any] | None,
+        *,
+        required_hint: str,
+        allow_empty: bool = False,
+    ) -> dict[str, Any]:
+        if body is None:
+            if allow_empty:
+                return {}
+            raise APIError(
+                status=HTTPStatus.BAD_REQUEST,
+                error_code="INVALID_JSON_BODY",
+                title="Missing Request Body",
+                detail=f"Request body must be a JSON object ({required_hint}).",
+            )
+        if isinstance(body, Mapping):
+            return dict(body)
+        raw_text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+        if not raw_text.strip():
+            if allow_empty:
+                return {}
+            raise APIError(
+                status=HTTPStatus.BAD_REQUEST,
+                error_code="INVALID_JSON_BODY",
+                title="Empty Request Body",
+                detail=f"Request body must be a non-empty JSON object ({required_hint}).",
+            )
+        try:
+            parsed = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise APIError(
+                status=HTTPStatus.BAD_REQUEST,
+                error_code="INVALID_JSON_BODY",
+                title="Malformed JSON Body",
+                detail=f"Could not parse request JSON body: {exc}",
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise APIError(
+                status=HTTPStatus.BAD_REQUEST,
+                error_code="INVALID_JSON_BODY",
+                title="Invalid JSON Body Type",
+                detail="Request body must be a JSON object.",
+            )
+        return parsed
+
+    @staticmethod
+    def _validate_curriculum_id(raw_curriculum_id: str) -> str:
+        curriculum_id = (raw_curriculum_id or "").strip()
+        if not re.fullmatch(r"curr_[0-9a-f]{12}", curriculum_id):
+            raise APIError(
+                status=HTTPStatus.BAD_REQUEST,
+                error_code="INVALID_CURRICULUM_ID",
+                title="Invalid Curriculum Identifier",
+                detail=f"Curriculum identifier {raw_curriculum_id!r} must match 'curr_<12 lowercase hex chars>'.",
+            )
+        return curriculum_id
+
+    @staticmethod
+    def _validate_lesson_id(raw_lesson_id: str) -> str:
+        lesson_id = (raw_lesson_id or "").strip()
+        if not lesson_id or not re.fullmatch(r"lesson_[a-zA-Z0-9_ ]{2,100}", lesson_id):
+            raise APIError(
+                status=HTTPStatus.BAD_REQUEST,
+                error_code="INVALID_LESSON_ID",
+                title="Invalid Lesson Identifier",
+                detail=f"Lesson identifier {raw_lesson_id!r} is malformed.",
+            )
+        return lesson_id
+
+    def get_web_app_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /` or `GET /app`: Serve the interactive Agent-First AI Learning Platform Web UI."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        from .webapp import render_learning_web_app_html
+
+        html = render_learning_web_app_html()
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body={"app": "ai-learning-platform-webapp", "version": "v1"},
+            headers={},
+            content_type="text/html; charset=utf-8",
+            raw_bytes=html.encode("utf-8"),
+        )
+
+    def list_agents_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /api/v1/agents`: Return the platform logical agent catalog and capability status."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        service = self._get_curriculum_service()
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body=service.list_agents(),
+            headers={},
+        )
 
     def generate_curriculum_endpoint(
         self,
@@ -1445,43 +1549,11 @@ class LocalResearchLibraryAPI:
     ) -> APIResponse:
         """`POST /api/v1/curricula/generate`: Validate learner goal and generate a validated curriculum."""
         self._extract_single_params(query_string, allowed_keys=set())
-        if body is None:
-            raise APIError(
-                status=HTTPStatus.BAD_REQUEST,
-                error_code="INVALID_JSON_BODY",
-                title="Missing Request Body",
-                detail="Request body must be a JSON object containing 'learner_goal'.",
-            )
-        if isinstance(body, Mapping):
-            payload = dict(body)
-        else:
-            raw_text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
-            if not raw_text.strip():
-                raise APIError(
-                    status=HTTPStatus.BAD_REQUEST,
-                    error_code="INVALID_JSON_BODY",
-                    title="Empty Request Body",
-                    detail="Request body must be a non-empty JSON object containing 'learner_goal'.",
-                )
-            try:
-                parsed = json.loads(raw_text)
-            except json.JSONDecodeError as exc:
-                raise APIError(
-                    status=HTTPStatus.BAD_REQUEST,
-                    error_code="INVALID_JSON_BODY",
-                    title="Malformed JSON Body",
-                    detail=f"Could not parse request JSON body: {exc}",
-                ) from exc
-            if not isinstance(parsed, dict):
-                raise APIError(
-                    status=HTTPStatus.BAD_REQUEST,
-                    error_code="INVALID_JSON_BODY",
-                    title="Invalid JSON Body Type",
-                    detail="Request body must be a JSON object.",
-                )
-            payload = parsed
-
-        learner_goal = payload.get("learner_goal")
+        payload = self._parse_json_object_body(
+            body,
+            required_hint="containing 'learner_goal'",
+        )
+        learner_goal = payload.get("learner_goal") if "learner_goal" in payload else payload.get("goal")
         from .platform import PlatformValidationError
 
         try:
@@ -1547,14 +1619,7 @@ class LocalResearchLibraryAPI:
     def get_curriculum_endpoint(self, raw_curriculum_id: str, query_string: str = "") -> APIResponse:
         """`GET /api/v1/curricula/{curriculum_id}`: Return a complete validated curriculum plan."""
         self._extract_single_params(query_string, allowed_keys=set())
-        curriculum_id = (raw_curriculum_id or "").strip()
-        if not re.fullmatch(r"curr_[0-9a-f]{12}", curriculum_id):
-            raise APIError(
-                status=HTTPStatus.BAD_REQUEST,
-                error_code="INVALID_CURRICULUM_ID",
-                title="Invalid Curriculum Identifier",
-                detail=f"Curriculum identifier {raw_curriculum_id!r} must match 'curr_<12 lowercase hex chars>'.",
-            )
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
         service = self._get_curriculum_service()
         curriculum = service.get_curriculum(curriculum_id)
         if curriculum is None:
@@ -1573,14 +1638,7 @@ class LocalResearchLibraryAPI:
     def get_curriculum_sources_endpoint(self, raw_curriculum_id: str, query_string: str = "") -> APIResponse:
         """`GET /api/v1/curricula/{curriculum_id}/sources`: Return source citations and epistemic tier summary."""
         self._extract_single_params(query_string, allowed_keys=set())
-        curriculum_id = (raw_curriculum_id or "").strip()
-        if not re.fullmatch(r"curr_[0-9a-f]{12}", curriculum_id):
-            raise APIError(
-                status=HTTPStatus.BAD_REQUEST,
-                error_code="INVALID_CURRICULUM_ID",
-                title="Invalid Curriculum Identifier",
-                detail=f"Curriculum identifier {raw_curriculum_id!r} must match 'curr_<12 lowercase hex chars>'.",
-            )
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
         service = self._get_curriculum_service()
         sources_payload = service.get_curriculum_sources(curriculum_id)
         if sources_payload is None:
@@ -1596,6 +1654,239 @@ class LocalResearchLibraryAPI:
             headers={},
         )
 
+    def get_lesson_detail_endpoint(
+        self,
+        raw_curriculum_id: str,
+        raw_lesson_id: str,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`GET /api/v1/curricula/{curriculum_id}/lessons/{lesson_id}`: Return lesson detail, exercises, and learner progress."""
+        params = self._extract_single_params(query_string, allowed_keys={"learner_id"})
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
+        lesson_id = self._validate_lesson_id(raw_lesson_id)
+        learner_id = params.get("learner_id", "default_learner")
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            detail = service.get_lesson_detail(
+                curriculum_id=curriculum_id,
+                lesson_id=lesson_id,
+                learner_id=learner_id,
+            )
+            return APIResponse(status=HTTPStatus.OK, body=detail, headers={})
+        except PlatformValidationError as exc:
+            status = HTTPStatus.NOT_FOUND if exc.code.lower() in ("curriculum_not_found", "lesson_not_found") else HTTPStatus.BAD_REQUEST
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Lesson Lookup Failed",
+                detail=exc.message,
+            ) from exc
+
+    def open_lesson_endpoint(
+        self,
+        raw_curriculum_id: str,
+        raw_lesson_id: str,
+        *,
+        body: bytes | str | Mapping[str, Any] | None = None,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`POST /api/v1/curricula/{curriculum_id}/lessons/{lesson_id}/open`: Open lesson and initialize progress."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
+        lesson_id = self._validate_lesson_id(raw_lesson_id)
+        payload = self._parse_json_object_body(body, required_hint="optional 'learner_id'", allow_empty=True)
+        learner_id = payload.get("learner_id", "default_learner")
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            result = service.open_lesson(
+                curriculum_id=curriculum_id,
+                lesson_id=lesson_id,
+                learner_id=learner_id,
+            )
+            return APIResponse(status=HTTPStatus.OK, body=result, headers={})
+        except PlatformValidationError as exc:
+            status = HTTPStatus.NOT_FOUND if exc.code.lower() in ("curriculum_not_found", "lesson_not_found") else HTTPStatus.BAD_REQUEST
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Open Lesson Failed",
+                detail=exc.message,
+            ) from exc
+
+    def teach_lesson_endpoint(
+        self,
+        raw_curriculum_id: str,
+        raw_lesson_id: str,
+        *,
+        body: bytes | str | Mapping[str, Any] | None = None,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`POST /api/v1/curricula/{curriculum_id}/lessons/{lesson_id}/teach`: Invoke Teaching Agent."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
+        lesson_id = self._validate_lesson_id(raw_lesson_id)
+        payload = self._parse_json_object_body(
+            body,
+            required_hint="containing 'learner_question' or 'question'",
+        )
+        question = (
+            payload.get("learner_question")
+            if "learner_question" in payload
+            else payload.get("question")
+        )
+        explanation_depth = payload.get("explanation_depth", "intermediate")
+        learner_id = payload.get("learner_id", "default_learner")
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            result = service.teach_lesson(
+                curriculum_id=curriculum_id,
+                lesson_id=lesson_id,
+                learner_question=str(question or ""),
+                explanation_depth=explanation_depth,
+                learner_id=learner_id,
+            )
+            return APIResponse(status=HTTPStatus.OK, body=result, headers={})
+        except PlatformValidationError as exc:
+            status = HTTPStatus.NOT_FOUND if exc.code.lower() in ("curriculum_not_found", "lesson_not_found") else HTTPStatus.BAD_REQUEST
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Teaching Session Failed",
+                detail=exc.message,
+            ) from exc
+
+    def list_lesson_exercises_endpoint(
+        self,
+        raw_curriculum_id: str,
+        raw_lesson_id: str,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`GET /api/v1/curricula/{curriculum_id}/lessons/{lesson_id}/exercises`: List lesson exercises and rubrics."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
+        lesson_id = self._validate_lesson_id(raw_lesson_id)
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            result = service.list_lesson_exercises(
+                curriculum_id=curriculum_id,
+                lesson_id=lesson_id,
+            )
+            return APIResponse(status=HTTPStatus.OK, body=result, headers={})
+        except PlatformValidationError as exc:
+            status = HTTPStatus.NOT_FOUND if exc.code.lower() in ("curriculum_not_found", "lesson_not_found") else HTTPStatus.BAD_REQUEST
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Exercise Listing Failed",
+                detail=exc.message,
+            ) from exc
+
+    def assess_lesson_endpoint(
+        self,
+        raw_curriculum_id: str,
+        raw_lesson_id: str,
+        *,
+        body: bytes | str | Mapping[str, Any] | None = None,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`POST /api/v1/curricula/{curriculum_id}/lessons/{lesson_id}/assess`: Evaluate answer with Assessment Agent and update progress."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
+        lesson_id = self._validate_lesson_id(raw_lesson_id)
+        payload = self._parse_json_object_body(
+            body,
+            required_hint="containing 'exercise_id' and 'submitted_answer'",
+        )
+        exercise_id = payload.get("exercise_id", "")
+        submitted_answer = (
+            payload.get("submitted_answer")
+            if "submitted_answer" in payload
+            else payload.get("answer", "")
+        )
+        learner_id = payload.get("learner_id", "default_learner")
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            result = service.assess_lesson_exercise(
+                curriculum_id=curriculum_id,
+                lesson_id=lesson_id,
+                exercise_id=str(exercise_id or ""),
+                submitted_answer=str(submitted_answer or ""),
+                learner_id=learner_id,
+            )
+            return APIResponse(status=HTTPStatus.OK, body=result, headers={})
+        except PlatformValidationError as exc:
+            status = HTTPStatus.NOT_FOUND if exc.code.lower() in ("curriculum_not_found", "lesson_not_found", "exercise_not_found") else HTTPStatus.BAD_REQUEST
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Assessment Evaluation Failed",
+                detail=exc.message,
+            ) from exc
+
+    def get_curriculum_progress_endpoint(
+        self,
+        raw_curriculum_id: str,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`GET /api/v1/curricula/{curriculum_id}/progress`: Return learner curriculum progress summary."""
+        params = self._extract_single_params(query_string, allowed_keys={"learner_id"})
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
+        learner_id = params.get("learner_id", "default_learner")
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            result = service.get_curriculum_progress(
+                curriculum_id=curriculum_id,
+                learner_id=learner_id,
+            )
+            return APIResponse(status=HTTPStatus.OK, body=result, headers={})
+        except PlatformValidationError as exc:
+            status = HTTPStatus.NOT_FOUND if exc.code.lower() == "curriculum_not_found" else HTTPStatus.BAD_REQUEST
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Curriculum Progress Lookup Failed",
+                detail=exc.message,
+            ) from exc
+
+    def get_curriculum_recommendations_endpoint(
+        self,
+        raw_curriculum_id: str,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`GET /api/v1/curricula/{curriculum_id}/recommendations`: Return prerequisite-aware next lesson recommendation."""
+        params = self._extract_single_params(query_string, allowed_keys={"learner_id"})
+        curriculum_id = self._validate_curriculum_id(raw_curriculum_id)
+        learner_id = params.get("learner_id", "default_learner")
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            result = service.get_next_recommendation(
+                curriculum_id=curriculum_id,
+                learner_id=learner_id,
+            )
+            return APIResponse(status=HTTPStatus.OK, body=result, headers={})
+        except PlatformValidationError as exc:
+            status = HTTPStatus.NOT_FOUND if exc.code.lower() == "curriculum_not_found" else HTTPStatus.BAD_REQUEST
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Recommendation Lookup Failed",
+                detail=exc.message,
+            ) from exc
+
     # ------------------------------------------------------------------
     # Request Dispatcher (HTTP & in-process testing)
     # ------------------------------------------------------------------
@@ -1609,7 +1900,8 @@ class LocalResearchLibraryAPI:
         """Dispatch an HTTP request (`method`, `raw_target`, optional `body`) and return an `APIResponse`.
 
         Guarantees consistent JSON responses, RFC 9457 error envelopes on failure,
-        strictly read-only `GET` handling on library routes, and `POST` on `/api/v1/curricula/generate`.
+        strictly read-only `GET` handling on library routes, and controlled `POST`
+        handling on interactive platform workflow endpoints.
         """
         parsed = urlsplit(raw_target or "/")
         path = parsed.path or "/"
@@ -1631,6 +1923,29 @@ class LocalResearchLibraryAPI:
                     )
                 return self.generate_curriculum_endpoint(body=body, query_string=query_string)
 
+            # Interactive lesson POST endpoints: /api/v1/curricula/{cid}/lessons/{lid}/{open|teach|assess}
+            lesson_action_match = re.fullmatch(
+                r"/api/v1/curricula/([^/]+)/lessons/([^/]+)/(open|teach|assess)",
+                path,
+            )
+            if lesson_action_match:
+                if upper_method != "POST":
+                    raise APIError(
+                        status=HTTPStatus.METHOD_NOT_ALLOWED,
+                        error_code="METHOD_NOT_ALLOWED",
+                        title="Method Not Allowed",
+                        detail=f"Method {upper_method!r} is not allowed on {path!r}; only 'POST' is supported.",
+                        headers={"Allow": "POST"},
+                    )
+                cid = unquote(lesson_action_match.group(1))
+                lid = unquote(lesson_action_match.group(2))
+                action = lesson_action_match.group(3)
+                if action == "open":
+                    return self.open_lesson_endpoint(cid, lid, body=body, query_string=query_string)
+                if action == "teach":
+                    return self.teach_lesson_endpoint(cid, lid, body=body, query_string=query_string)
+                return self.assess_lesson_endpoint(cid, lid, body=body, query_string=query_string)
+
             if upper_method != "GET":
                 raise APIError(
                     status=HTTPStatus.METHOD_NOT_ALLOWED,
@@ -1640,9 +1955,15 @@ class LocalResearchLibraryAPI:
                     headers={"Allow": "GET"},
                 )
 
+            if path in ("/", "/app"):
+                return self.get_web_app_endpoint(query_string)
+
             if path == "/healthz":
                 self._extract_single_params(query_string, allowed_keys=set())
                 return self.get_healthz(instance=path)
+
+            if path == "/api/v1/agents":
+                return self.list_agents_endpoint(query_string)
 
             if path == "/api/v1/sources":
                 return self.list_sources_endpoint(query_string)
@@ -1692,6 +2013,24 @@ class LocalResearchLibraryAPI:
                     )
                 return self.get_curriculum_run_endpoint(remainder, query_string)
 
+            lesson_exercises_match = re.fullmatch(
+                r"/api/v1/curricula/([^/]+)/lessons/([^/]+)/exercises",
+                path,
+            )
+            if lesson_exercises_match:
+                cid = unquote(lesson_exercises_match.group(1))
+                lid = unquote(lesson_exercises_match.group(2))
+                return self.list_lesson_exercises_endpoint(cid, lid, query_string)
+
+            lesson_detail_match = re.fullmatch(
+                r"/api/v1/curricula/([^/]+)/lessons/([^/]+)",
+                path,
+            )
+            if lesson_detail_match:
+                cid = unquote(lesson_detail_match.group(1))
+                lid = unquote(lesson_detail_match.group(2))
+                return self.get_lesson_detail_endpoint(cid, lid, query_string)
+
             if path.startswith("/api/v1/curricula/"):
                 remainder = unquote(path[len("/api/v1/curricula/") :])
                 if remainder.endswith("/sources"):
@@ -1704,6 +2043,26 @@ class LocalResearchLibraryAPI:
                             detail=f"No API route matches {path!r}.",
                         )
                     return self.get_curriculum_sources_endpoint(cid, query_string)
+                if remainder.endswith("/progress"):
+                    cid = remainder[: -len("/progress")]
+                    if "/" in cid or not cid:
+                        raise APIError(
+                            status=HTTPStatus.NOT_FOUND,
+                            error_code="ENDPOINT_NOT_FOUND",
+                            title="Endpoint Not Found",
+                            detail=f"No API route matches {path!r}.",
+                        )
+                    return self.get_curriculum_progress_endpoint(cid, query_string)
+                if remainder.endswith("/recommendations"):
+                    cid = remainder[: -len("/recommendations")]
+                    if "/" in cid or not cid:
+                        raise APIError(
+                            status=HTTPStatus.NOT_FOUND,
+                            error_code="ENDPOINT_NOT_FOUND",
+                            title="Endpoint Not Found",
+                            detail=f"No API route matches {path!r}.",
+                        )
+                    return self.get_curriculum_recommendations_endpoint(cid, query_string)
                 if "/" in remainder or not remainder:
                     raise APIError(
                         status=HTTPStatus.NOT_FOUND,
@@ -1769,9 +2128,9 @@ def _make_http_handler(api: LocalResearchLibraryAPI) -> type[BaseHTTPRequestHand
                 except ValueError:
                     raw_body = None
             response = api.handle_request(method, self.path, body=raw_body)
-            payload = response.to_json_bytes()
+            payload = response.to_payload_bytes()
             self.send_response(response.status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", response.content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
@@ -1811,28 +2170,40 @@ def _make_http_handler(api: LocalResearchLibraryAPI) -> type[BaseHTTPRequestHand
 def create_http_server(
     *,
     db_path: Path | str = DEFAULT_DB_PATH,
+    progress_db_path: Path | str | None = None,
     host: str = DEFAULT_API_HOST,
     port: int = DEFAULT_API_PORT,
     connection: sqlite3.Connection | None = None,
     clock: Callable[[], str] | None = None,
 ) -> tuple[ThreadingHTTPServer, LocalResearchLibraryAPI]:
     """Create a `ThreadingHTTPServer` and `LocalResearchLibraryAPI` bound to `127.0.0.1` by default."""
-    api = LocalResearchLibraryAPI(db_path=db_path, connection=connection, clock=clock)
+    api = LocalResearchLibraryAPI(
+        db_path=db_path,
+        progress_db_path=progress_db_path,
+        connection=connection,
+        clock=clock,
+    )
     handler_cls = _make_http_handler(api)
     server = ThreadingHTTPServer((host, int(port)), handler_cls)
     return server, api
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the local read-only Research Library HTTP API server."""
+    """Run the local Research Library & Interactive AI Learning Platform HTTP server."""
     parser = argparse.ArgumentParser(
-        description="Run the local read-only AI Research & Learning Library HTTP API (binds to 127.0.0.1 by default)."
+        description="Run the local AI Research & Learning Platform HTTP API & Web App (binds to 127.0.0.1 by default)."
     )
     parser.add_argument(
         "--db",
         type=Path,
         default=DEFAULT_DB_PATH,
         help=f"Path to local SQLite knowledge store (default: {DEFAULT_DB_PATH})",
+    )
+    parser.add_argument(
+        "--progress-db",
+        type=Path,
+        default=None,
+        help="Optional path to SQLite learning progress store.",
     )
     parser.add_argument(
         "--host",
@@ -1847,10 +2218,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    server, _ = create_http_server(db_path=args.db, host=args.host, port=args.port)
+    server, _ = create_http_server(
+        db_path=args.db,
+        progress_db_path=args.progress_db,
+        host=args.host,
+        port=args.port,
+    )
     bound_host, bound_port = server.server_address[:2]
     print(
-        f"Local Research Library API (read-only) listening on http://{bound_host}:{bound_port} "
+        f"AI Learning Platform API & Web App listening on http://{bound_host}:{bound_port} "
         f"(db={args.db})"
     )
     try:

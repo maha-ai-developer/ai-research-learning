@@ -48,12 +48,12 @@ Store chunks in a related table with `document_id`, `chunk_index`, `text`, `page
 
 ## Platform architecture and decision records
 
-The repository implements a five-layer **Agent-First AI Learning Platform** (`src/ai_research_learning/platform.py`, `src/ai_research_learning/rag.py`, `src/ai_research_learning/api.py`, and `knowledge_store.py`):
+The repository implements a five-layer **Agent-First AI Learning Platform** (`src/ai_research_learning/platform.py`, `src/ai_research_learning/rag.py`, `src/ai_research_learning/api.py`, `src/ai_research_learning/webapp.py`, and `knowledge_store.py`):
 
-1. **Experience Layer:** Web application & REST HTTP API (`/api/v1/*`) alongside CLI interfaces (`platform.py`, `rag.py`, `api.py`).
-2. **Controlled Agent Runtime:** `PlatformOrchestrator`, capability-scoped `ToolRegistry`, `ExecutionPolicy`, `WorkflowRunState`, and six logical agent capabilities (`RESEARCH`, `KNOWLEDGE_CURATOR`, `LEARNING_PLANNER`, `TEACHING`, `ASSESSMENT`, `LEARNING_PROGRESS`).
-3. **Platform Services:** `SourceEcosystemService` (five-tier epistemic classification), `ChromaKnowledgeRetriever` / `RAGPipeline`, and `CurriculumManagementService` with deterministic `CurriculumValidator` (prerequisite DAG topological verification and citation integrity).
-4. **Data Layer:** Read-only runtime SQLite (`data/runtime/task012_pilot.sqlite`), Chroma vector store (`data/runtime/chroma`), raw transcripts (`data/raw_transcripts/`), and curriculum artifacts (`reports/`).
+1. **Experience Layer:** Single-page interactive Web application (`GET /`, `GET /app` in `webapp.py`) & REST HTTP API (`/api/v1/*` in `api.py`) alongside CLI interfaces (`platform.py`, `rag.py`, `api.py`).
+2. **Controlled Agent Runtime:** `PlatformOrchestrator`, capability-scoped `ToolRegistry`, `ExecutionPolicy`, `WorkflowRunState`, and six logical agent capabilities (`RESEARCH`, `KNOWLEDGE_CURATOR`, `LEARNING_PLANNER`, `TEACHING`, `ASSESSMENT`, `LEARNING_PROGRESS`). Four capabilities (`LEARNING_PLANNER`, `TEACHING`, `ASSESSMENT`, `LEARNING_PROGRESS`) execute active end-to-end learning workflows with full step tracing and tool-budget enforcement.
+3. **Platform Services:** `SourceEcosystemService` (five-tier epistemic classification), `ChromaKnowledgeRetriever` / `RAGPipeline`, `CurriculumManagementService` with deterministic `CurriculumValidator` (prerequisite DAG topological verification and citation integrity), and `LearningProgressStore` (forward-only schema `v9` persistence for lesson state, rubric attempts, teaching interactions, demonstrated objectives, and knowledge gaps).
+4. **Data Layer:** Read-only runtime SQLite (`data/runtime/task012_pilot.sqlite`), isolated learner progress SQLite (`data/runtime/learning_progress.sqlite`), Chroma vector store (`data/runtime/chroma`), raw transcripts (`data/raw_transcripts/`), and curriculum artifacts (`reports/`).
 5. **Infrastructure Layer:** Stage 1 local-first modular monolith designed to evolve through Stages 2–4 toward containerized API services, distributed agent workers, and multi-tenant cloud storage.
 
 See the detailed architecture specifications and Architecture Decision Records (ADRs):

@@ -410,6 +410,80 @@ curl -s http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b | python3 -m js
 curl -s http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/sources | python3 -m json.tool
 ```
 
+## 2.5 Interactive Agentic Learning Experience & Web Application (Task 035)
+
+Task 035 turns the Agent-First AI Learning Platform into an end-to-end interactive learning experience (`src/ai_research_learning/platform.py`, `src/ai_research_learning/api.py`, and `src/ai_research_learning/webapp.py`):
+
+1. **Teaching Agent (`TeachingAgent`, `AgentCapability.TEACHING`):**
+   - Accepts `curriculum_id`, `lesson_id`, `learner_question`, and optional `explanation_depth` (`foundational_intuition`, `beginner`, `intermediate`, `advanced`, `research_level` — strictly treated as teaching-depth preferences rather than claims about learner mastery).
+   - Retrieves lesson-specific evidence via RAG, generates prerequisite bridges from `ConceptGraph`, provides examples and analogies, asks Socratic questions, identifies uncertainty or out-of-scope queries (`INSUFFICIENT_EVIDENCE`), and enforces strict citation verification against the knowledge store (`SRC-THE-BATCH` is never cited as lesson evidence).
+2. **Assessment Agent (`AssessmentAgent`, `AgentCapability.ASSESSMENT`):**
+   - Generates structured `conceptual`, `mathematical`, and `practical` exercises aligned to lesson learning objectives.
+   - Evaluates submitted answers deterministically against explicit weighted rubrics and misconception triggers, returning `score_band` (`DEMONSTRATED`, `PARTIAL`, `NEEDS_PRACTICE`), criterion-level feedback, demonstrated objectives, and objectives needing practice.
+   - Enforces the mastery honesty boundary: `complete_lesson_mastery_claimed` is always `False` on single-exercise evaluations (`SINGLE_EXERCISE_MASTERY_DISCLAIMER`). Complete lesson mastery (`COMPLETED`) requires demonstrating every lesson learning objective across multiple exercises (`>= 2` distinct passed exercises) with zero unresolved knowledge gaps.
+3. **Persistent Learning Progress (`LearningProgressStore` & `LearningProgressAgent`, `AgentCapability.LEARNING_PROGRESS`):**
+   - Persists `learner_lesson_progress`, `learner_assessment_attempts`, and `learner_teaching_interactions` in an isolated SQLite database (default `data/runtime/learning_progress.sqlite` with forward-only schema migration to `v9`), while preserving `data/runtime/task012_pilot.sqlite` untouched (`mode=ro`).
+   - Computes deterministic next-lesson recommendations (`NextLessonRecommendation`) using actual lesson status (`NOT_STARTED`, `IN_PROGRESS`, `PRACTICING`, `COMPLETED`), unresolved knowledge gaps, and `ConceptGraph` prerequisite satisfaction.
+4. **Interactive Web Application (`src/ai_research_learning/webapp.py`):**
+   - Served directly by `LocalResearchLibraryAPI` at `GET /` and `GET /app`, backed by the exact same `CurriculumManagementService` and HTTP JSON contracts as the CLI and REST API.
+   - Provides all six interactive views: (1) Curriculum Overview, (2) Lesson Detail View, (3) Ask Teaching Agent Interface, (4) Exercise & Assessment Submission View, (5) Source Citations & Evidence Tier Inspector, and (6) Learner Progress Summary & Next Lesson Recommendation.
+
+### Running Interactive Learning via CLI
+
+```bash
+# 1. Run an interactive Teaching Agent session on a lesson:
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.platform \
+  --goal "I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations." \
+  --teach-lesson lesson_02_distributed_representations \
+  --question "How does backpropagation train distributed representations across hidden layers?" \
+  --explanation-depth intermediate \
+  --learner-id learner_demo
+
+# 2. Submit an exercise answer for deterministic Assessment Agent rubric evaluation:
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.platform \
+  --goal "I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations." \
+  --assess-lesson lesson_01_math_linear_algebra_calc \
+  --exercise-id ex_lesson_01_math_linear_algebra_calc_conceptual \
+  --answer "The chain rule propagates partial derivatives backward through composed layers using the Jacobian matrix and transpose operations to compute weight gradients efficiently." \
+  --learner-id learner_demo
+
+# 3. Inspect persistent learner progress and next-lesson recommendation:
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.platform \
+  --goal "I want to become an AI engineer and eventually an AI researcher, starting from mathematical and programming foundations." \
+  --show-progress \
+  --learner-id learner_demo \
+  --format json
+```
+
+### Running the Web Application & Interactive HTTP API
+
+```bash
+# Start the local server (serves Web UI at http://127.0.0.1:8000/ and API at /api/v1/*):
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.api \
+  --db data/runtime/task012_pilot.sqlite \
+  --host 127.0.0.1 \
+  --port 8000
+
+# Inspect lesson detail + exercises + learner progress (GET /api/v1/curricula/{id}/lessons/{lesson_id}):
+curl -s "http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/lessons/lesson_01_math_linear_algebra_calc?learner_id=default_learner" | python3 -m json.tool
+
+# Ask the Teaching Agent (POST /api/v1/curricula/{id}/lessons/{lesson_id}/teach):
+curl -s -X POST http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/lessons/lesson_01_math_linear_algebra_calc/teach \
+  -H "Content-Type: application/json" \
+  -d '{"learner_id": "default_learner", "learner_question": "Why is the Jacobian transpose used in reverse-mode automatic differentiation?", "explanation_depth": "intermediate"}' \
+  | python3 -m json.tool
+
+# Submit an exercise answer to the Assessment Agent (POST /api/v1/curricula/{id}/lessons/{lesson_id}/assess):
+curl -s -X POST http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/lessons/lesson_01_math_linear_algebra_calc/assess \
+  -H "Content-Type: application/json" \
+  -d '{"learner_id": "default_learner", "exercise_id": "ex_lesson_01_math_linear_algebra_calc_conceptual", "submitted_answer": "The chain rule composes partial derivatives across layers using the Jacobian matrix transpose so gradients flow backward from loss to parameters."}' \
+  | python3 -m json.tool
+
+# Retrieve curriculum progress and next-lesson recommendation:
+curl -s "http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/progress?learner_id=default_learner" | python3 -m json.tool
+curl -s "http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/next-lesson?learner_id=default_learner" | python3 -m json.tool
+```
+
 ## 3. Before enabling network collection
 
 First read `docs/DATA_AND_REUSE_POLICY.md` and `docs/JUPYTER_LAB_INTEGRATION.md`.
@@ -485,9 +559,9 @@ Official instructions: <https://cli.github.com/manual/gh_repo_create> and <https
 - [ ] Verify robots/sitemap policy live from a network-enabled environment
 - [ ] Collect and review the first small metadata batch
 - [ ] Add source-specific parsers for publication lists and blog pagination
-- [ ] Add Wikipedia and arXiv metadata connectors
-- [ ] Add search and retrieval with source citations
-- [ ] Add a user-facing learning interface
+- [x] Add Wikipedia and arXiv metadata connectors
+- [x] Add search and retrieval with source citations
+- [x] Add a user-facing learning interface
 - [ ] Add an isolated notebook execution service only after authentication and resource limits are designed
 
 ## Source sites
