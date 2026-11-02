@@ -1320,13 +1320,132 @@ class DeterministicHashEmbeddingProvider:
 
 HttpPostJsonFn = Callable[[str, dict[str, str], dict[str, Any]], dict[str, Any]]
 
+DEFAULT_HTTP_MAX_RETRIES = 3
+DEFAULT_HTTP_INITIAL_BACKOFF_SECONDS = 1.0
+DEFAULT_HTTP_MAX_BACKOFF_SECONDS = 16.0
+DEFAULT_HTTP_BACKOFF_MULTIPLIER = 2.0
+DEFAULT_HTTP_JITTER_RATIO = 0.25
+
+
+class ProviderRateLimitError(RuntimeError):
+    """Raised when a model/embedding provider remains throttled (HTTP 429) after bounded retries."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 429,
+        attempts_made: int = 1,
+        max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
+        retry_after_seconds: float | None = None,
+        last_delay_seconds: float = 0.0,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.attempts_made = attempts_made
+        self.max_retries = max_retries
+        self.retry_after_seconds = retry_after_seconds
+        self.last_delay_seconds = last_delay_seconds
+
+
+def parse_retry_after_seconds(
+    header_value: str | Mapping[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    """Parse an HTTP `Retry-After` header (or headers mapping) into non-negative seconds."""
+    if header_value is None:
+        return None
+    if isinstance(header_value, Mapping):
+        extracted: Any = None
+        for k, v in header_value.items():
+            if str(k).lower() in ("retry-after", "x-ratelimit-reset-after"):
+                extracted = v
+                break
+        if extracted is None:
+            return None
+        cleaned = str(extracted).strip()
+    else:
+        cleaned = str(header_value).strip()
+    if not cleaned:
+        return None
+    try:
+        numeric = float(cleaned)
+        if math.isfinite(numeric):
+            return min(60.0, max(0.0, numeric))
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import mktime_tz, parsedate_to_datetime, parsedate_tz
+
+        try:
+            parsed_dt = parsedate_to_datetime(cleaned)
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            tz_tuple = parsedate_tz(cleaned)
+            if tz_tuple is None:
+                return None
+            parsed_dt = datetime.fromtimestamp(mktime_tz(tz_tuple), tz=timezone.utc)
+        reference = now or datetime.now(timezone.utc)
+        return min(60.0, max(0.0, (parsed_dt - reference).total_seconds()))
+    except Exception:
+        return None
+
+
+def compute_truncated_backoff_delay(
+    retry_index: int,
+    *,
+    retry_after_seconds: float | None = None,
+    initial_backoff_seconds: float = DEFAULT_HTTP_INITIAL_BACKOFF_SECONDS,
+    max_backoff_seconds: float = DEFAULT_HTTP_MAX_BACKOFF_SECONDS,
+    initial_delay: float | None = None,
+    max_delay: float | None = None,
+    multiplier: float = DEFAULT_HTTP_BACKOFF_MULTIPLIER,
+    jitter_ratio: float = DEFAULT_HTTP_JITTER_RATIO,
+    rng_uniform_fn: Callable[[float, float], float] | None = None,
+    rng_fn: Callable[[], float] | None = None,
+) -> float:
+    """Compute truncated exponential backoff with bounded jitter, respecting `Retry-After` when supplied."""
+    import random
+
+    eff_initial = float(initial_delay if initial_delay is not None else initial_backoff_seconds)
+    eff_max = float(max_delay if max_delay is not None else max_backoff_seconds)
+    exp_delay = eff_initial * (float(multiplier) ** max(0, int(retry_index)))
+    truncated_delay = min(eff_max, max(0.0, exp_delay))
+    jitter_span = truncated_delay * max(0.0, float(jitter_ratio))
+    if jitter_span > 0.0:
+        if rng_uniform_fn is not None:
+            jitter_add = rng_uniform_fn(0.0, jitter_span)
+        elif rng_fn is not None:
+            jitter_add = float(rng_fn()) * jitter_span
+        else:
+            jitter_add = random.uniform(0.0, jitter_span)
+    else:
+        jitter_add = 0.0
+    jittered_delay = truncated_delay + jitter_add
+    bounded_delay = min(eff_max, jittered_delay)
+    if retry_after_seconds is not None and math.isfinite(retry_after_seconds) and retry_after_seconds > 0.0:
+        effective_cap = max(eff_max, 60.0)
+        return min(effective_cap, max(bounded_delay, float(retry_after_seconds)))
+    return round(bounded_delay, 4)
+
 
 def _default_http_post_json(
     url: str,
     headers: dict[str, str],
     payload: dict[str, Any],
+    *,
+    max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
+    initial_backoff_seconds: float = DEFAULT_HTTP_INITIAL_BACKOFF_SECONDS,
+    max_backoff_seconds: float = DEFAULT_HTTP_MAX_BACKOFF_SECONDS,
+    sleep_fn: Callable[[float], None] | None = None,
+    rng_uniform_fn: Callable[[float, float], float] | None = None,
+    rng_fn: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
-    """Perform an HTTPS JSON POST using `requests` with strict secret redaction on error."""
+    """Perform an HTTPS JSON POST using `requests` with secret redaction and bounded 429 exponential backoff."""
+    import time
     import requests
 
     secret_values: list[str] = []
@@ -1338,29 +1457,103 @@ def _default_http_post_json(
             if str(v).lower().startswith("bearer "):
                 secret_values.append(str(v)[7:].strip())
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
-        status_code = getattr(getattr(exc, "response", None), "status_code", None)
-        body_excerpt = ""
-        resp_obj = getattr(exc, "response", None)
-        if resp_obj is not None:
-            try:
-                err_json = resp_obj.json()
-                if isinstance(err_json, dict) and isinstance(err_json.get("error"), dict):
-                    body_excerpt = str(err_json["error"].get("message") or err_json["error"])
-                else:
-                    body_excerpt = str(err_json)
-            except Exception:
-                body_excerpt = (resp_obj.text or "")[:300]
-        raw_message = (
-            f"Provider HTTP request to {url} failed"
-            + (f" (status={status_code})" if status_code is not None else "")
-            + (f": {body_excerpt}" if body_excerpt else f": {exc}")
-        )
-        raise RuntimeError(redact_secrets(raw_message, secret_values)) from None
+    effective_max_retries = max(0, int(max_retries))
+    effective_sleep = sleep_fn or time.sleep
+    attempts_made = 0
+    last_delay = 0.0
+    last_retry_after: float | None = None
+
+    for retry_idx in range(effective_max_retries + 1):
+        attempts_made += 1
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if getattr(response, "status_code", None) == 429:
+                resp_headers = getattr(response, "headers", None) or {}
+                last_retry_after = parse_retry_after_seconds(resp_headers)
+                if retry_idx < effective_max_retries:
+                    last_delay = compute_truncated_backoff_delay(
+                        retry_idx,
+                        retry_after_seconds=last_retry_after,
+                        initial_backoff_seconds=initial_backoff_seconds,
+                        max_backoff_seconds=max_backoff_seconds,
+                        rng_uniform_fn=rng_uniform_fn,
+                        rng_fn=rng_fn,
+                    )
+                    effective_sleep(last_delay)
+                    continue
+                body_excerpt = (getattr(response, "text", "") or "")[:300]
+                rate_limit_msg = (
+                    f"Provider HTTP request to {url} failed (status=429): "
+                    f"capacity remains unavailable after {attempts_made} attempt(s) "
+                    f"(max_retries={effective_max_retries}, last_backoff={last_delay:.2f}s"
+                    + (f", retry_after={last_retry_after:.2f}s" if last_retry_after is not None else "")
+                    + ")"
+                    + (f": {body_excerpt}" if body_excerpt else "")
+                )
+                raise ProviderRateLimitError(
+                    redact_secrets(rate_limit_msg, secret_values),
+                    status_code=429,
+                    attempts_made=attempts_made,
+                    max_retries=effective_max_retries,
+                    retry_after_seconds=last_retry_after,
+                    last_delay_seconds=last_delay,
+                )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            resp_obj = getattr(exc, "response", None)
+            status_code = getattr(resp_obj, "status_code", None)
+            if status_code == 429 and retry_idx < effective_max_retries:
+                resp_headers = getattr(resp_obj, "headers", None) or {}
+                last_retry_after = parse_retry_after_seconds(resp_headers)
+                last_delay = compute_truncated_backoff_delay(
+                    retry_idx,
+                    retry_after_seconds=last_retry_after,
+                    initial_backoff_seconds=initial_backoff_seconds,
+                    max_backoff_seconds=max_backoff_seconds,
+                    rng_uniform_fn=rng_uniform_fn,
+                    rng_fn=rng_fn,
+                )
+                effective_sleep(last_delay)
+                continue
+
+            body_excerpt = ""
+            if resp_obj is not None:
+                try:
+                    err_json = resp_obj.json()
+                    if isinstance(err_json, dict) and isinstance(err_json.get("error"), dict):
+                        body_excerpt = str(err_json["error"].get("message") or err_json["error"])
+                    else:
+                        body_excerpt = str(err_json)
+                except Exception:
+                    body_excerpt = (getattr(resp_obj, "text", "") or "")[:300]
+
+            if status_code == 429:
+                rate_limit_msg = (
+                    f"Provider HTTP request to {url} failed (status=429): "
+                    f"capacity remains unavailable after {attempts_made} attempt(s) "
+                    f"(max_retries={effective_max_retries}, last_backoff={last_delay:.2f}s"
+                    + (f", retry_after={last_retry_after:.2f}s" if last_retry_after is not None else "")
+                    + ")"
+                    + (f": {body_excerpt}" if body_excerpt else f": {exc}")
+                )
+                raise ProviderRateLimitError(
+                    redact_secrets(rate_limit_msg, secret_values),
+                    status_code=429,
+                    attempts_made=attempts_made,
+                    max_retries=effective_max_retries,
+                    retry_after_seconds=last_retry_after,
+                    last_delay_seconds=last_delay,
+                ) from None
+
+            raw_message = (
+                f"Provider HTTP request to {url} failed"
+                + (f" (status={status_code})" if status_code is not None else "")
+                + (f": {body_excerpt}" if body_excerpt else f": {exc}")
+            )
+            raise RuntimeError(redact_secrets(raw_message, secret_values)) from None
+
+    raise RuntimeError(redact_secrets(f"Provider HTTP request to {url} exhausted retry budget", secret_values))
 
 
 class OpenAIEmbeddingProvider:

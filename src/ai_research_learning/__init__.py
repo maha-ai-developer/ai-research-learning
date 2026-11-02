@@ -21,6 +21,11 @@ _RAG_EXPORTS = frozenset(
         "DEFAULT_CHROMA_COLLECTION",
         "DEFAULT_CHROMA_DIR",
         "DEFAULT_DOTENV_PATH",
+        "DEFAULT_HTTP_BACKOFF_MULTIPLIER",
+        "DEFAULT_HTTP_INITIAL_BACKOFF_SECONDS",
+        "DEFAULT_HTTP_JITTER_RATIO",
+        "DEFAULT_HTTP_MAX_BACKOFF_SECONDS",
+        "DEFAULT_HTTP_MAX_RETRIES",
         "DEFAULT_RAG_EVAL_DATASET_PATH",
         "DEFAULT_RUNTIME_DB_PATH",
         "DEFAULT_VERTEX_LOCATION",
@@ -40,6 +45,7 @@ _RAG_EXPORTS = frozenset(
         "PolicyBlockedIndexingError",
         "ProviderConfig",
         "ProviderNotConfiguredError",
+        "ProviderRateLimitError",
         "RAGEvalCaseResult",
         "RAGEvalSummary",
         "RAGPromptInput",
@@ -56,6 +62,7 @@ _RAG_EXPORTS = frozenset(
         "chunk_text",
         "compute_chunk_id",
         "compute_lexical_claim_groundedness_proxy",
+        "compute_truncated_backoff_delay",
         "create_embedding_provider",
         "create_generation_provider",
         "ensure_knowledge_chunks_schema",
@@ -67,6 +74,7 @@ _RAG_EXPORTS = frozenset(
         "load_dotenv_file",
         "normalize_text_for_chunking",
         "parse_dotenv_content",
+        "parse_retry_after_seconds",
         "redact_secrets",
         "register_candidate_source_the_batch",
         "resolve_adc_credentials_path",
@@ -85,6 +93,7 @@ _PLATFORM_EXPORTS = frozenset(
         "AssessmentEvaluation",
         "AssessmentExercise",
         "AssessmentQuestionCategory",
+        "CANONICAL_SOURCE_ECOSYSTEM_ROLES",
         "CURRICULUM_SCHEMA_VERSION",
         "ConceptGraph",
         "ConceptNode",
@@ -104,6 +113,7 @@ _PLATFORM_EXPORTS = frozenset(
         "EvidenceTier",
         "ExecutionPolicy",
         "ExplanationDepth",
+        "INGESTION_CONTROL_PLANE_STAGES",
         "LearnerLessonProgress",
         "LearningPlannerAgent",
         "LearningProgressAgent",
@@ -113,11 +123,15 @@ _PLATFORM_EXPORTS = frozenset(
         "MasteryCheckDesign",
         "MisconceptionPattern",
         "NextLessonRecommendation",
+        "PlatformContextService",
+        "PlatformIntelligenceAgent",
+        "PlatformIntelligenceResponse",
         "PlatformOrchestrator",
         "PlatformValidationError",
         "PrerequisiteExplanation",
         "RubricCriterion",
         "SINGLE_EXERCISE_MASTERY_DISCLAIMER",
+        "SYLLABUS_DOMAINS",
         "SourceEcosystemService",
         "SourceEcosystemSummary",
         "TEACHING_DEPTH_DISCLAIMER",
@@ -138,7 +152,7 @@ _PLATFORM_EXPORTS = frozenset(
     }
 )
 
-_WEBAPP_EXPORTS = frozenset({"render_learning_web_app_html"})
+_WEBAPP_EXPORTS = frozenset({"DESIGN_SYSTEM_METADATA", "render_learning_web_app_html"})
 
 __all__ = [
     "APIError",

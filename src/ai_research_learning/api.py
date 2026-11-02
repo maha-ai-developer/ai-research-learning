@@ -235,6 +235,7 @@ class LocalResearchLibraryAPI:
         *,
         chroma_dir: Path | str | None = None,
         progress_db_path: Path | str | None = None,
+        curriculum_service: Any = None,
         connection: sqlite3.Connection | None = None,
         clock: Callable[[], str] | None = None,
     ) -> None:
@@ -243,7 +244,7 @@ class LocalResearchLibraryAPI:
         self.progress_db_path = Path(progress_db_path) if progress_db_path is not None else None
         self._shared_conn = connection
         self._clock: Callable[[], str] = clock or utc_now
-        self._curriculum_service: Any = None
+        self._curriculum_service: Any = curriculum_service
         if self._shared_conn is not None:
             self._shared_conn.row_factory = sqlite3.Row
             self._shared_conn.execute("PRAGMA query_only = ON")
@@ -1534,11 +1535,16 @@ class LocalResearchLibraryAPI:
 
     def list_agents_endpoint(self, query_string: str = "") -> APIResponse:
         """`GET /api/v1/agents`: Return the platform logical agent catalog and capability status."""
-        self._extract_single_params(query_string, allowed_keys=set())
+        params = self._extract_single_params(
+            query_string,
+            allowed_keys={"include_platform_intelligence"},
+        )
+        raw_include = params.get("include_platform_intelligence", "false").lower()
+        include_platform_intelligence = raw_include in ("true", "1", "yes")
         service = self._get_curriculum_service()
         return APIResponse(
             status=HTTPStatus.OK,
-            body=service.list_agents(),
+            body=service.list_agents(include_platform_intelligence=include_platform_intelligence),
             headers={},
         )
 
@@ -1888,6 +1894,104 @@ class LocalResearchLibraryAPI:
             ) from exc
 
     # ------------------------------------------------------------------
+    # Platform Context, Source Control Plane, Syllabus & Intelligence (Task 036)
+    # ------------------------------------------------------------------
+
+    def get_platform_context_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /api/v1/platform/context`: Return read-only platform observability and context snapshot."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        service = self._get_curriculum_service()
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body=service.get_platform_context(),
+            headers={},
+        )
+
+    def get_platform_sources_control_plane_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /api/v1/platform/sources-control-plane`: Return governed source control plane & pipeline stages."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        service = self._get_curriculum_service()
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body=service.get_source_control_plane(),
+            headers={},
+        )
+
+    def get_platform_syllabus_coverage_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /api/v1/platform/syllabus-coverage`: Return syllabus domains, depth coverage, and gap matrix."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        service = self._get_curriculum_service()
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body=service.get_syllabus_intelligence(),
+            headers={},
+        )
+
+    def list_platform_runs_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /api/v1/platform/runs`: Return recent workflow execution runs and step traces."""
+        params = self._extract_single_params(query_string, allowed_keys={"limit"})
+        raw_limit = params.get("limit")
+        limit = 25
+        if raw_limit is not None:
+            try:
+                limit = int(raw_limit)
+            except ValueError as exc:
+                raise APIError(
+                    status=HTTPStatus.BAD_REQUEST,
+                    error_code="INVALID_QUERY_PARAMETER",
+                    title="Invalid Query Parameter",
+                    detail=f"Query parameter 'limit' must be an integer between 1 and 100 (got {raw_limit!r}).",
+                ) from exc
+            if limit < 1 or limit > 100:
+                raise APIError(
+                    status=HTTPStatus.BAD_REQUEST,
+                    error_code="INVALID_QUERY_PARAMETER",
+                    title="Invalid Query Parameter",
+                    detail=f"Query parameter 'limit' must be between 1 and 100 (got {limit}).",
+                )
+        service = self._get_curriculum_service()
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body=service.list_runs(limit=limit),
+            headers={},
+        )
+
+    def ask_platform_intelligence_endpoint(
+        self,
+        body: bytes | str | Mapping[str, Any] | None = None,
+        query_string: str = "",
+    ) -> APIResponse:
+        """`POST /api/v1/platform/intelligence/ask`: Ask the read-only Platform Intelligence Agent."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        payload = self._parse_json_object_body(
+            body,
+            required_hint="containing 'question'",
+        )
+        question = payload.get("question") if "question" in payload else payload.get("query")
+        from .platform import PlatformValidationError
+
+        try:
+            service = self._get_curriculum_service()
+            result = service.ask_platform_intelligence(str(question or ""))
+            return APIResponse(
+                status=HTTPStatus.OK,
+                body=result,
+                headers={},
+            )
+        except PlatformValidationError as exc:
+            status = (
+                HTTPStatus.FORBIDDEN
+                if exc.code.upper() == "PLATFORM_MUTATION_FORBIDDEN"
+                else HTTPStatus.BAD_REQUEST
+            )
+            raise APIError(
+                status=status,
+                error_code=exc.code.upper(),
+                title="Platform Intelligence Request Rejected",
+                detail=exc.message,
+            ) from exc
+
+    # ------------------------------------------------------------------
     # Request Dispatcher (HTTP & in-process testing)
     # ------------------------------------------------------------------
 
@@ -1922,6 +2026,17 @@ class LocalResearchLibraryAPI:
                         headers={"Allow": "POST"},
                     )
                 return self.generate_curriculum_endpoint(body=body, query_string=query_string)
+
+            if path == "/api/v1/platform/intelligence/ask":
+                if upper_method != "POST":
+                    raise APIError(
+                        status=HTTPStatus.METHOD_NOT_ALLOWED,
+                        error_code="METHOD_NOT_ALLOWED",
+                        title="Method Not Allowed",
+                        detail=f"Method {upper_method!r} is not allowed on {path!r}; only 'POST' is supported.",
+                        headers={"Allow": "POST"},
+                    )
+                return self.ask_platform_intelligence_endpoint(body=body, query_string=query_string)
 
             # Interactive lesson POST endpoints: /api/v1/curricula/{cid}/lessons/{lid}/{open|teach|assess}
             lesson_action_match = re.fullmatch(
@@ -1964,6 +2079,18 @@ class LocalResearchLibraryAPI:
 
             if path == "/api/v1/agents":
                 return self.list_agents_endpoint(query_string)
+
+            if path == "/api/v1/platform/context":
+                return self.get_platform_context_endpoint(query_string)
+
+            if path == "/api/v1/platform/sources-control-plane":
+                return self.get_platform_sources_control_plane_endpoint(query_string)
+
+            if path == "/api/v1/platform/syllabus-coverage":
+                return self.get_platform_syllabus_coverage_endpoint(query_string)
+
+            if path == "/api/v1/platform/runs":
+                return self.list_platform_runs_endpoint(query_string)
 
             if path == "/api/v1/sources":
                 return self.list_sources_endpoint(query_string)

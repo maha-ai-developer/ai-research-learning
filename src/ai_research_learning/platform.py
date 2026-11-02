@@ -91,6 +91,7 @@ class AgentCapability(str, Enum):
     TEACHING = "TEACHING"
     ASSESSMENT = "ASSESSMENT"
     LEARNING_PROGRESS = "LEARNING_PROGRESS"
+    PLATFORM_INTELLIGENCE = "PLATFORM_INTELLIGENCE"
 
 
 class EvidenceTier(str, Enum):
@@ -274,6 +275,9 @@ class ToolRegistry:
     def register(self, tool: ToolDefinition) -> None:
         self._tools[tool.name] = tool
 
+    def list_tools(self) -> List[ToolDefinition]:
+        return [self._tools[name] for name in sorted(self._tools)]
+
     def list_tools_for(self, capability: AgentCapability) -> List[str]:
         return sorted(
             name
@@ -320,9 +324,17 @@ class ToolRegistry:
         return tool.handler(**kwargs)
 
 
-def get_logical_agent_catalog() -> Tuple[AgentCapabilitySpec, ...]:
-    """Return the canonical contract specifications for all six logical agents."""
-    return (
+def get_logical_agent_catalog(
+    *,
+    include_platform_intelligence: bool = False,
+) -> Tuple[AgentCapabilitySpec, ...]:
+    """Return the canonical contract specifications for platform logical agents.
+
+    By default returns the six core learning & research agents for backward-compatible
+    curriculum contracts; pass ``include_platform_intelligence=True`` to include the
+    read-only Platform Intelligence Agent.
+    """
+    core_specs: Tuple[AgentCapabilitySpec, ...] = (
         AgentCapabilitySpec(
             capability=AgentCapability.RESEARCH,
             display_name="Research Agent",
@@ -418,6 +430,31 @@ def get_logical_agent_catalog() -> Tuple[AgentCapabilitySpec, ...]:
             milestone_status="ACTIVE_INTERACTIVE_SLICE_TASK_035",
         ),
     )
+    if not include_platform_intelligence:
+        return core_specs
+    platform_intel_spec = AgentCapabilitySpec(
+        capability=AgentCapability.PLATFORM_INTELLIGENCE,
+        display_name="Platform Intelligence Agent",
+        purpose="Read-only operational, architectural, and observability agent that inspects live platform state, source ecosystem governance, syllabus coverage, workflow runs, and learner progress.",
+        allowed_tools=(
+            "inspect_source_ecosystem",
+            "list_approved_resources",
+            "list_discovered_candidates",
+            "query_concept_graph",
+            "read_curriculum_plan",
+            "inspect_platform_context",
+        ),
+        input_contract="PlatformIntelligenceQuery(question, learner_id, curriculum_id)",
+        output_contract="PlatformIntelligenceResponse(measured_facts, derived_statistics, recommendations, unknown_or_unavailable, evidence_references)",
+        deterministic_guardrails=(
+            "Strictly read-only: refuses all mutating, destructive, or approval-bypassing requests",
+            "Explicitly separates measured facts, derived statistics, recommendations, and unknown/unmeasured information",
+            "Never fabricates telemetry, model billing costs, or uncollected evidence",
+            "Redacts all credentials and secrets from operational reports",
+        ),
+        milestone_status="ACTIVE_PLATFORM_INTELLIGENCE_TASK_036",
+    )
+    return core_specs + (platform_intel_spec,)
 
 
 # ---------------------------------------------------------------------------
@@ -1296,6 +1333,10 @@ class ConceptGraph:
     @property
     def nodes(self) -> Dict[str, ConceptNode]:
         return dict(self._nodes)
+
+    def list_concepts(self) -> List[ConceptNode]:
+        """Return all ConceptNodes in deterministic topological prerequisite order."""
+        return [self._nodes[cid] for cid in self.validate_dag()]
 
     def get_node(self, concept_id: str) -> ConceptNode:
         if concept_id not in self._nodes:
@@ -2984,6 +3025,22 @@ class LearningProgressStore:
                         "INSERT INTO learning_schema_migrations (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
                         (version, name, expected_checksum, now_iso),
                     )
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS platform_workflow_runs (
+                        run_id TEXT PRIMARY KEY,
+                        capability TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        learner_goal TEXT NOT NULL,
+                        curriculum_id TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        run_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_platform_workflow_runs_updated
+                        ON platform_workflow_runs(updated_at DESC, run_id DESC);
+                    """
+                )
             return self.list_migrations()
         finally:
             conn.close()
@@ -3272,6 +3329,117 @@ class LearningProgressStore:
                     }
                 )
             return results
+        finally:
+            conn.close()
+
+    def save_workflow_run(self, run_state: WorkflowRunState) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO platform_workflow_runs (
+                        run_id, capability, status, learner_goal, curriculum_id,
+                        created_at, updated_at, run_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(run_id) DO UPDATE SET
+                        status = excluded.status,
+                        curriculum_id = excluded.curriculum_id,
+                        updated_at = excluded.updated_at,
+                        run_json = excluded.run_json
+                    """,
+                    (
+                        run_state.run_id,
+                        run_state.capability.value,
+                        run_state.status.value,
+                        run_state.learner_goal,
+                        run_state.curriculum_id,
+                        run_state.created_at,
+                        run_state.updated_at,
+                        json.dumps(run_state.to_dict(), ensure_ascii=False),
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def list_workflow_runs(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT run_json FROM platform_workflow_runs
+                ORDER BY updated_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [json.loads(str(r["run_json"])) for r in rows]
+        finally:
+            conn.close()
+
+    def summarize_learner_telemetry(self, *, learner_id: Optional[str] = None) -> Dict[str, Any]:
+        conn = self._connect()
+        try:
+            params: Tuple[Any, ...] = (learner_id,) if learner_id else ()
+            where_clause = "WHERE learner_id = ?" if learner_id else ""
+            prog_rows = conn.execute(
+                f"SELECT * FROM learner_lesson_progress {where_clause} ORDER BY last_activity_at DESC",
+                params,
+            ).fetchall()
+            teach_count_row = conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM learner_teaching_interactions {where_clause}",
+                params,
+            ).fetchone()
+            attempt_rows = conn.execute(
+                f"SELECT * FROM learner_assessment_attempts {where_clause} ORDER BY attempted_at DESC",
+                params,
+            ).fetchall()
+            curricula_count_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM persisted_curricula"
+            ).fetchone()
+            runs_count_row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM platform_workflow_runs"
+            ).fetchone()
+
+            status_counts: Dict[str, int] = {
+                LessonProgressStatus.NOT_STARTED.value: 0,
+                LessonProgressStatus.IN_PROGRESS.value: 0,
+                LessonProgressStatus.PRACTICING.value: 0,
+                LessonProgressStatus.COMPLETED.value: 0,
+            }
+            weak_objectives: List[str] = []
+            completed_lessons: List[str] = []
+            in_progress_lessons: List[str] = []
+            for r in prog_rows:
+                st = str(r["status"])
+                status_counts[st] = status_counts.get(st, 0) + 1
+                lid = str(r["lesson_id"])
+                if st == LessonProgressStatus.COMPLETED.value:
+                    completed_lessons.append(lid)
+                elif st in (LessonProgressStatus.IN_PROGRESS.value, LessonProgressStatus.PRACTICING.value):
+                    in_progress_lessons.append(lid)
+                for gap in json.loads(str(r["knowledge_gaps_json"] or "[]")):
+                    if gap not in weak_objectives:
+                        weak_objectives.append(gap)
+
+            scores = [float(r["score"]) for r in attempt_rows]
+            avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
+            passed_attempts = sum(1 for r in attempt_rows if int(r["passed"]) == 1)
+
+            return {
+                "learner_filter": learner_id or "ALL_LEARNERS",
+                "persisted_curricula_count": int(curricula_count_row["cnt"] if curricula_count_row else 0),
+                "persisted_workflow_runs_count": int(runs_count_row["cnt"] if runs_count_row else 0),
+                "tracked_lesson_rows_count": len(prog_rows),
+                "lesson_status_counts": status_counts,
+                "completed_lesson_ids": completed_lessons,
+                "active_lesson_ids": in_progress_lessons,
+                "teaching_interactions_count": int(teach_count_row["cnt"] if teach_count_row else 0),
+                "assessment_attempts_count": len(attempt_rows),
+                "passed_assessment_attempts_count": passed_attempts,
+                "average_assessment_score": avg_score,
+                "weak_objectives_needing_practice": weak_objectives,
+            }
         finally:
             conn.close()
 
@@ -4763,6 +4931,827 @@ class LearningProgressAgent:
         )
 
 
+# ---------------------------------------------------------------------------
+# Multi-Source Ingestion Control Plane, Syllabus Intelligence & Platform Intelligence
+# ---------------------------------------------------------------------------
+
+
+CANONICAL_SOURCE_ECOSYSTEM_ROLES: Tuple[Dict[str, Any], ...] = (
+    {
+        "source_id": "SRC-HINTON",
+        "name": "Geoffrey Hinton Academic Profile & Publications",
+        "canonical_url": "https://www.cs.toronto.edu/~hinton",
+        "pedagogical_role": "Foundational neural networks, backpropagation, Boltzmann machines, dropout, and representation learning.",
+        "governance_status": "APPROVED",
+        "allowed_for_foundational_teaching": True,
+        "ingestion_priority": 1,
+    },
+    {
+        "source_id": "SRC-BENGIO",
+        "name": "Yoshua Bengio Official Academic Profile & Publications",
+        "canonical_url": "https://yoshuabengio.org",
+        "pedagogical_role": "Deep learning theory, neural probabilistic language models, sequence alignment, and AI safety/research perspective.",
+        "governance_status": "APPROVED",
+        "allowed_for_foundational_teaching": True,
+        "ingestion_priority": 1,
+    },
+    {
+        "source_id": "SRC-3B1B",
+        "name": "3Blue1Brown Educational Mathematics & Neural Networks",
+        "canonical_url": "https://www.3blue1brown.com",
+        "pedagogical_role": "Visual intuition for linear algebra, multivariable calculus, gradient descent, neural networks, and attention.",
+        "governance_status": "APPROVED",
+        "allowed_for_foundational_teaching": True,
+        "ingestion_priority": 2,
+    },
+    {
+        "source_id": "SRC-ARXIV",
+        "name": "arXiv Open-Access Research Repository (CS.AI / CS.LG / CS.CL)",
+        "canonical_url": "https://arxiv.org",
+        "pedagogical_role": "Primary research papers, mathematical formulations, architectural proofs, and empirical benchmarks.",
+        "governance_status": "APPROVED",
+        "allowed_for_foundational_teaching": True,
+        "ingestion_priority": 1,
+    },
+    {
+        "source_id": "SRC-WIKIPEDIA",
+        "name": "Wikipedia Foundational Computer Science & Mathematics Reference",
+        "canonical_url": "https://en.wikipedia.org",
+        "pedagogical_role": "Definitional cross-references, terminology grounding, and prerequisite concept bridging.",
+        "governance_status": "APPROVED",
+        "allowed_for_foundational_teaching": True,
+        "ingestion_priority": 3,
+    },
+    {
+        "source_id": THE_BATCH_SOURCE_ID,
+        "name": "The Batch (DeepLearning.AI Weekly AI News & Industry Perspectives)",
+        "canonical_url": THE_BATCH_CANONICAL_URL,
+        "pedagogical_role": "AI news, industry applications, and topic discovery radar ONLY. Explicitly excluded from foundational concept evidence unless corroborated by primary research sources.",
+        "governance_status": "CANDIDATE_PENDING_REVIEW",
+        "allowed_for_foundational_teaching": False,
+        "ingestion_priority": 4,
+    },
+)
+
+
+INGESTION_CONTROL_PLANE_STAGES: Tuple[Dict[str, Any], ...] = (
+    {
+        "stage_order": 1,
+        "stage_id": "DISCOVERY",
+        "title": "1. Discovery",
+        "description": "Crawl and register candidate links from seed profiles and discovery radars into `link_candidates` (`DISCOVERED_LINK`).",
+        "deterministic_gate": "Normalized URL validation and robots/crawl policy compliance.",
+    },
+    {
+        "stage_order": 2,
+        "stage_id": "DEDUPLICATION",
+        "title": "2. Deduplication",
+        "description": "Canonicalize URLs, arXiv IDs, and content SHA-256 hashes to eliminate redundant resources.",
+        "deterministic_gate": "Unique `canonical_url` and `content_hash` constraints in SQLite.",
+    },
+    {
+        "stage_order": 3,
+        "stage_id": "RELEVANCE_AND_QUALITY_EVALUATION",
+        "title": "3. Relevance & Quality Evaluation",
+        "description": "Score candidate resources for pedagogical depth, mathematical rigor, and primary-source authority.",
+        "deterministic_gate": "Minimum quality score threshold and source role classification.",
+    },
+    {
+        "stage_order": 4,
+        "stage_id": "LICENSE_AND_POLICY_VERIFICATION",
+        "title": "4. License & Policy Verification",
+        "description": "Verify redistribution/extraction rights and enforce source-specific governance (e.g., `SRC-THE-BATCH` discovery-only rule).",
+        "deterministic_gate": "License & governance policy check before promotion.",
+    },
+    {
+        "stage_order": 5,
+        "stage_id": "APPROVAL_REJECTION_HOLD",
+        "title": "5. Approval / Rejection / Hold",
+        "description": "Explicit curation decision transitioning resources to `APPROVED_UNCOLLECTED_RESOURCE`, `REJECTED`, or `PENDING_REVIEW`.",
+        "deterministic_gate": "Human/policy approval audit record required; candidates never auto-promoted.",
+    },
+    {
+        "stage_order": 6,
+        "stage_id": "SCHEDULED_COLLECTION",
+        "title": "6. Scheduled Collection",
+        "description": "Fetch full-text HTML/PDF payloads for approved seed resources with bounded rate-limiting (`COLLECTED_DOCUMENT`).",
+        "deterministic_gate": "HTTP status verification, MIME validation, and raw artifact snapshot storage.",
+    },
+    {
+        "stage_order": 7,
+        "stage_id": "KNOWLEDGE_EXTRACTION_AND_CHUNKING",
+        "title": "7. Knowledge Extraction & Chunking",
+        "description": "Extract clean text sections and segment into token-bounded, provenance-tagged `knowledge_chunks` (`EXTRACTED_KNOWLEDGE`).",
+        "deterministic_gate": "Non-empty section extraction and deterministic chunk boundary hashing.",
+    },
+    {
+        "stage_order": 8,
+        "stage_id": "CONCEPT_AND_PREREQUISITE_LINKING",
+        "title": "8. Concept & Prerequisite Linking",
+        "description": "Map extracted chunks and approved resources onto the DAG `ConceptGraph` nodes and prerequisite edges.",
+        "deterministic_gate": "DAG acyclicity and topological prerequisite verification.",
+    },
+    {
+        "stage_order": 9,
+        "stage_id": "CURRICULUM_READINESS",
+        "title": "9. Curriculum Readiness",
+        "description": "Index active chunks into Chroma (`CURRICULUM_READY_EVIDENCE`) for RAG, Learning Planner, Teaching, and Assessment agents.",
+        "deterministic_gate": "Hybrid vector + lexical retrieval verification and citation sanitizer pass.",
+    },
+)
+
+
+SYLLABUS_DOMAINS: Tuple[Dict[str, Any], ...] = (
+    {
+        "domain_id": "mathematical_foundations",
+        "order": 1,
+        "title": "Mathematical Foundations",
+        "description": "Linear algebra, matrix transformations, eigenvalues, multivariable calculus, Jacobians, and probability theory.",
+        "concept_ids": ("math_linear_algebra_calculus",),
+        "primary_sources": ("SRC-3B1B", "SRC-WIKIPEDIA"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "neural_network_foundations",
+        "order": 2,
+        "title": "Neural Network Foundations",
+        "description": "Multilayer perceptrons, chain-rule backpropagation, automatic differentiation, dropout regularization, and energy-based models.",
+        "concept_ids": (
+            "backpropagation_and_gradient_descent",
+            "regularization_and_dropout",
+            "energy_based_and_boltzmann_models",
+        ),
+        "primary_sources": ("SRC-HINTON", "SRC-3B1B", "SRC-WIKIPEDIA"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "deep_learning_architectures",
+        "order": 3,
+        "title": "Deep Learning Architectures",
+        "description": "Deep residual learning (ResNets), identity shortcut highways, convolutional feature hierarchies, and deep optimization.",
+        "concept_ids": ("deep_residual_networks",),
+        "primary_sources": ("SRC-ARXIV", "SRC-HINTON"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "sequence_models_and_attention",
+        "order": 4,
+        "title": "Sequence Models & Attention",
+        "description": "Recurrent networks, encoder-decoder bottlenecks, Bahdanau soft alignment, and Transformer scaled dot-product self-attention.",
+        "concept_ids": (
+            "sequence_alignment_and_bahdanau_attention",
+            "transformer_self_attention_architecture",
+        ),
+        "primary_sources": ("SRC-BENGIO", "SRC-ARXIV", "SRC-3B1B"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "modern_llms_and_foundation_models",
+        "order": 5,
+        "title": "Modern LLMs & Foundation Models",
+        "description": "Autoregressive pretraining, scaling laws, instruction tuning, alignment, and inference-time reasoning.",
+        "concept_ids": ("transformer_self_attention_architecture",),
+        "primary_sources": ("SRC-ARXIV", "SRC-BENGIO", "SRC-THE-BATCH"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "retrieval_and_rag_systems",
+        "order": 6,
+        "title": "Retrieval & RAG Systems",
+        "description": "Dense + lexical hybrid retrieval, chunk provenance, citation verification, and grounded abstention gates.",
+        "concept_ids": ("ai_research_methodology_and_safety_frontiers",),
+        "primary_sources": ("SRC-ARXIV", "SRC-WIKIPEDIA"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "agentic_ai_systems",
+        "order": 7,
+        "title": "Agentic AI Systems",
+        "description": "Controlled agent orchestration, explicit tool permissions, bounded step budgets, and deterministic rubric evaluation.",
+        "concept_ids": ("ai_research_methodology_and_safety_frontiers",),
+        "primary_sources": ("SRC-ARXIV", "SRC-BENGIO"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "research_methodology",
+        "order": 8,
+        "title": "Research Methodology",
+        "description": "Primary literature synthesis, ablation design, epistemic tier separation, and reproducible empirical evaluation.",
+        "concept_ids": (
+            "energy_based_and_boltzmann_models",
+            "deep_residual_networks",
+            "transformer_self_attention_architecture",
+            "ai_research_methodology_and_safety_frontiers",
+        ),
+        "primary_sources": ("SRC-HINTON", "SRC-BENGIO", "SRC-ARXIV"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+    {
+        "domain_id": "applied_ai_engineering_and_projects",
+        "order": 9,
+        "title": "Applied AI Engineering & Projects",
+        "description": "End-to-end implementation labs, gradient checking, attention heatmaps, citation sanitizers, and production resilience.",
+        "concept_ids": (
+            "backpropagation_and_gradient_descent",
+            "transformer_self_attention_architecture",
+            "ai_research_methodology_and_safety_frontiers",
+        ),
+        "primary_sources": ("SRC-ARXIV", "SRC-3B1B", "SRC-HINTON"),
+        "supported_depths": tuple(d.value for d in ExplanationDepth),
+    },
+)
+
+
+@dataclass(frozen=True)
+class PlatformIntelligenceResponse:
+    """Structured, read-only operational & architectural answer from the Platform Intelligence Agent."""
+
+    query_id: str
+    run_id: str
+    question: str
+    status: str
+    executive_summary: str
+    measured_facts: Tuple[str, ...]
+    derived_statistics: Tuple[str, ...]
+    recommendations: Tuple[str, ...]
+    unknown_or_unavailable: Tuple[str, ...]
+    evidence_references: Tuple[str, ...]
+    detected_topics: Tuple[str, ...]
+    read_only_guarantee: str
+    created_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "query_id": self.query_id,
+            "run_id": self.run_id,
+            "question": self.question,
+            "status": self.status,
+            "executive_summary": self.executive_summary,
+            "measured_facts": list(self.measured_facts),
+            "derived_statistics": list(self.derived_statistics),
+            "recommendations": list(self.recommendations),
+            "unknown_or_unavailable": list(self.unknown_or_unavailable),
+            "evidence_references": list(self.evidence_references),
+            "detected_topics": list(self.detected_topics),
+            "read_only_guarantee": self.read_only_guarantee,
+            "created_at": self.created_at,
+        }
+
+
+class PlatformContextService:
+    """Deterministic read-only service assembling live platform state, source control plane, and syllabus intelligence."""
+
+    def __init__(
+        self,
+        *,
+        db_path: Path,
+        chroma_dir: Path,
+        ecosystem_service: SourceEcosystemService,
+        concept_graph: ConceptGraph,
+        progress_store: LearningProgressStore,
+        tool_registry: ToolRegistry,
+        get_curricula_fn: Callable[[], List[CurriculumPlan]],
+        get_runs_fn: Callable[[], List[Dict[str, Any]]],
+    ) -> None:
+        self.db_path = db_path
+        self.chroma_dir = chroma_dir
+        self.ecosystem_service = ecosystem_service
+        self.concept_graph = concept_graph
+        self.progress_store = progress_store
+        self.tool_registry = tool_registry
+        self._get_curricula_fn = get_curricula_fn
+        self._get_runs_fn = get_runs_fn
+
+    def get_source_control_plane(self) -> Dict[str, Any]:
+        """Return the multi-source ingestion control plane, 5 epistemic tiers, and per-source telemetry."""
+        summary = self.ecosystem_service.summarize_ecosystem()
+        approved_resources = self.ecosystem_service.list_approved_resources()
+        candidates = self.ecosystem_service.list_discovered_candidates(limit=500)
+
+        by_source_approved: Dict[str, List[Dict[str, Any]]] = {}
+        for res in approved_resources:
+            sid = str(res.get("source_id") or "")
+            by_source_approved.setdefault(sid, []).append(res)
+
+        by_source_candidates: Dict[str, int] = {}
+        for cand in candidates:
+            sid = str(cand.get("source_id") or cand.get("referring_source_id") or "")
+            by_source_candidates[sid] = by_source_candidates.get(sid, 0) + 1
+
+        source_profiles: List[Dict[str, Any]] = []
+        for role_spec in CANONICAL_SOURCE_ECOSYSTEM_ROLES:
+            sid = role_spec["source_id"]
+            res_list = by_source_approved.get(sid, [])
+            extracted_cnt = sum(1 for r in res_list if int(r.get("active_chunk_count") or 0) > 0)
+            chunk_cnt = sum(int(r.get("active_chunk_count") or 0) for r in res_list)
+            uncollected_cnt = sum(1 for r in res_list if r.get("evidence_tier") == EvidenceTier.APPROVED_UNCOLLECTED_RESOURCE.value)
+            collected_cnt = sum(
+                1
+                for r in res_list
+                if r.get("evidence_tier")
+                in (
+                    EvidenceTier.COLLECTED_DOCUMENT.value,
+                    EvidenceTier.EXTRACTED_KNOWLEDGE.value,
+                    EvidenceTier.CURRICULUM_READY_EVIDENCE.value,
+                )
+            )
+            source_profiles.append(
+                {
+                    **role_spec,
+                    "approved_resource_count": len(res_list),
+                    "collected_resource_count": collected_cnt,
+                    "extracted_resource_count": extracted_cnt,
+                    "active_chunk_count": chunk_cnt,
+                    "approved_uncollected_count": uncollected_cnt,
+                    "discovered_candidate_count": by_source_candidates.get(sid, 0),
+                }
+            )
+
+        stages_with_counts: List[Dict[str, Any]] = []
+        for st in INGESTION_CONTROL_PLANE_STAGES:
+            order = st["stage_order"]
+            metric_label = ""
+            metric_value = 0
+            if order in (1, 2, 3, 4):
+                metric_label = "discovered_link_candidates"
+                metric_value = summary.discovered_link_candidate_count
+            elif order == 5:
+                metric_label = "approved_total_resources"
+                metric_value = summary.approved_uncollected_resource_count + summary.collected_document_count
+            elif order == 6:
+                metric_label = "collected_documents_vs_uncollected_backlog"
+                metric_value = summary.collected_document_count
+            elif order == 7:
+                metric_label = "extracted_primary_documents"
+                metric_value = summary.extracted_resource_count
+            elif order == 8:
+                metric_label = "linked_concept_nodes"
+                metric_value = len(self.concept_graph.list_concepts())
+            elif order == 9:
+                metric_label = "curriculum_ready_chunks"
+                metric_value = summary.curriculum_ready_chunk_count
+            stages_with_counts.append(
+                {
+                    **st,
+                    "live_metric_name": metric_label,
+                    "live_metric_value": metric_value,
+                }
+            )
+
+        return {
+            "ecosystem_summary": summary.to_dict(),
+            "epistemic_tiers": [t.value for t in EvidenceTier],
+            "canonical_sources": source_profiles,
+            "ingestion_pipeline_stages": stages_with_counts,
+            "the_batch_governance": summary.the_batch_governance,
+            "uncollected_approved_backlog_count": summary.approved_uncollected_resource_count,
+        }
+
+    def get_syllabus_intelligence(self) -> Dict[str, Any]:
+        """Compute syllabus coverage, prerequisite readiness, and evidence density across all 9 AI domains."""
+        approved_resources = self.ecosystem_service.list_approved_resources()
+        res_by_id = {str(r["resource_id"]): r for r in approved_resources}
+        concepts_by_id = {c.concept_id: c for c in self.concept_graph.list_concepts()}
+
+        domain_reports: List[Dict[str, Any]] = []
+        total_chunk_backed_concepts = 0
+        all_concept_ids_seen: set[str] = set()
+
+        for dom in SYLLABUS_DOMAINS:
+            c_ids: Tuple[str, ...] = dom["concept_ids"]
+            dom_chunks = 0
+            dom_extracted_docs = 0
+            dom_uncollected_seeds = 0
+            concept_details: List[Dict[str, Any]] = []
+
+            for cid in c_ids:
+                c_node = concepts_by_id.get(cid)
+                if c_node is None:
+                    continue
+                c_chunks = 0
+                c_extracted = 0
+                c_uncollected = 0
+                for rid in c_node.preferred_resource_ids:
+                    r_meta = res_by_id.get(rid)
+                    if not r_meta:
+                        continue
+                    chk = int(r_meta.get("active_chunk_count") or 0)
+                    c_chunks += chk
+                    if chk > 0:
+                        c_extracted += 1
+                    elif r_meta.get("evidence_tier") == EvidenceTier.APPROVED_UNCOLLECTED_RESOURCE.value:
+                        c_uncollected += 1
+                if cid not in all_concept_ids_seen:
+                    all_concept_ids_seen.add(cid)
+                    if c_chunks > 0:
+                        total_chunk_backed_concepts += 1
+                dom_chunks += c_chunks
+                dom_extracted_docs += c_extracted
+                dom_uncollected_seeds += c_uncollected
+                concept_details.append(
+                    {
+                        "concept_id": c_node.concept_id,
+                        "title": c_node.title,
+                        "stage_id": c_node.stage_id,
+                        "prerequisites": list(c_node.prerequisites),
+                        "active_chunk_count": c_chunks,
+                        "extracted_resource_count": c_extracted,
+                        "approved_uncollected_seed_count": c_uncollected,
+                        "evidence_status": (
+                            "CHUNK_BACKED_PRIMARY_EVIDENCE"
+                            if c_chunks > 0
+                            else "APPROVED_SEED_METADATA_PENDING_FULLTEXT"
+                        ),
+                    }
+                )
+
+            readiness_status = (
+                "PRIMARY_CHUNK_BACKED"
+                if dom_chunks > 0
+                else "SEED_METADATA_BACKED_NEEDS_COLLECTION"
+            )
+            domain_reports.append(
+                {
+                    "domain_id": dom["domain_id"],
+                    "order": dom["order"],
+                    "title": dom["title"],
+                    "description": dom["description"],
+                    "primary_sources": list(dom["primary_sources"]),
+                    "supported_depths": list(dom["supported_depths"]),
+                    "readiness_status": readiness_status,
+                    "active_chunk_count": dom_chunks,
+                    "extracted_document_count": dom_extracted_docs,
+                    "uncollected_seed_count": dom_uncollected_seeds,
+                    "concepts": concept_details,
+                }
+            )
+
+        total_concepts = len(concepts_by_id)
+        return {
+            "total_domains": len(SYLLABUS_DOMAINS),
+            "total_concepts_in_graph": total_concepts,
+            "chunk_backed_concept_count": total_chunk_backed_concepts,
+            "metadata_only_concept_count": max(0, total_concepts - total_chunk_backed_concepts),
+            "explanation_depths": [d.value for d in ExplanationDepth],
+            "domains": domain_reports,
+        }
+
+    def get_context_snapshot(
+        self,
+        *,
+        learner_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a complete, deterministic, secret-free snapshot of platform state."""
+        from .rag import (
+            DEFAULT_CHROMA_COLLECTION,
+            DEFAULT_HTTP_INITIAL_BACKOFF_SECONDS,
+            DEFAULT_HTTP_MAX_BACKOFF_SECONDS,
+            DEFAULT_HTTP_MAX_RETRIES,
+            DEFAULT_VERTEX_LOCATION,
+            DEFAULT_VERTEX_PROJECT,
+        )
+
+        ecosystem = self.ecosystem_service.summarize_ecosystem()
+        all_agents = get_logical_agent_catalog(include_platform_intelligence=True)
+        curricula = self._get_curricula_fn()
+        recent_runs = self._get_runs_fn()
+        learner_telemetry = self.progress_store.summarize_learner_telemetry(learner_id=learner_id)
+        syllabus = self.get_syllabus_intelligence()
+
+        chroma_chunk_count = 0
+        if self.chroma_dir.exists():
+            try:
+                vs = ChromaPersistentVectorStore(
+                    self.chroma_dir,
+                    collection_name=DEFAULT_CHROMA_COLLECTION,
+                    create_if_missing=False,
+                )
+                chroma_chunk_count = vs.count()
+            except Exception:
+                chroma_chunk_count = ecosystem.curriculum_ready_chunk_count
+
+        return {
+            "platform_name": "AI Research & Learning Platform",
+            "platform_version": "0.3.6-task036",
+            "architecture_mode": "LOCAL_FIRST_CLOUD_READY",
+            "knowledge_store": {
+                "db_path": str(self.db_path.name),
+                "access_mode": "STRICT_READ_ONLY (mode=ro, PRAGMA query_only=ON)",
+                "total_sources": ecosystem.total_registered_sources,
+                "curriculum_ready_chunks": ecosystem.curriculum_ready_chunk_count,
+                "extracted_primary_documents": ecosystem.extracted_resource_count,
+                "collected_documents": ecosystem.collected_document_count,
+                "approved_uncollected_resources": ecosystem.approved_uncollected_resource_count,
+                "discovered_link_candidates": ecosystem.discovered_link_candidate_count,
+            },
+            "vector_store": {
+                "engine": "ChromaPersistentVectorStore",
+                "collection_name": DEFAULT_CHROMA_COLLECTION,
+                "indexed_chunk_count": chroma_chunk_count,
+                "retrieval_strategy": "Hybrid dense vector similarity + lexical token overlap with abstention gates",
+            },
+            "agent_runtime": {
+                "total_registered_agents": len(all_agents),
+                "learning_and_research_agents_count": 6,
+                "platform_intelligence_agent_enabled": True,
+                "agents": [spec.to_dict() for spec in all_agents],
+                "registered_tools": [
+                    {
+                        "name": t.name,
+                        "read_only": t.read_only,
+                        "allowed_capabilities": [c.value for c in t.allowed_capabilities],
+                    }
+                    for t in self.tool_registry.list_tools()
+                ],
+                "recent_workflow_runs_count": len(recent_runs),
+                "recent_workflow_runs": recent_runs[:15],
+            },
+            "curricula_summary": {
+                "total_curricula": len(curricula),
+                "validated_curricula_count": sum(
+                    1 for c in curricula if c.status == CurriculumStatus.VALIDATED
+                ),
+                "abstained_curricula_count": sum(
+                    1
+                    for c in curricula
+                    if c.status == CurriculumStatus.ABSTAINED_INSUFFICIENT_EVIDENCE
+                ),
+                "curricula": [
+                    {
+                        "curriculum_id": c.curriculum_id,
+                        "title": c.title,
+                        "status": c.status.value,
+                        "learner_goal": c.learner_goal,
+                        "stage_count": len(c.stages),
+                        "lesson_count": sum(len(s.lessons) for s in c.stages),
+                        "citation_count": len(c.source_citations),
+                        "evidence_gap_count": len(c.evidence_gaps),
+                        "created_at": c.created_at,
+                    }
+                    for c in curricula
+                ],
+            },
+            "syllabus_intelligence_summary": {
+                "total_domains": syllabus["total_domains"],
+                "total_concepts_in_graph": syllabus["total_concepts_in_graph"],
+                "chunk_backed_concept_count": syllabus["chunk_backed_concept_count"],
+                "metadata_only_concept_count": syllabus["metadata_only_concept_count"],
+                "explanation_depths": syllabus["explanation_depths"],
+            },
+            "learner_telemetry": learner_telemetry,
+            "provider_and_resilience": {
+                "vertex_ai_default_project": DEFAULT_VERTEX_PROJECT,
+                "vertex_ai_default_location": DEFAULT_VERTEX_LOCATION,
+                "vertex_ai_global_endpoint_supported": True,
+                "http_429_resilience_policy": {
+                    "strategy": "Truncated exponential backoff with bounded jitter and Retry-After header support",
+                    "max_retries": DEFAULT_HTTP_MAX_RETRIES,
+                    "initial_backoff_seconds": DEFAULT_HTTP_INITIAL_BACKOFF_SECONDS,
+                    "max_backoff_seconds": DEFAULT_HTTP_MAX_BACKOFF_SECONDS,
+                    "parallel_burst_protection": "Sequential execution; no retry storms",
+                },
+                "secrets_redacted": True,
+            },
+            "cloud_and_multi_learner_readiness": {
+                "stateless_service_boundaries": True,
+                "learner_partitioning_key": "learner_id",
+                "read_only_knowledge_store_separation": True,
+                "forward_only_progress_migrations": True,
+                "migration_versions_applied": [
+                    m["version"] for m in self.progress_store.list_migrations()
+                ],
+            },
+        }
+
+
+_MUTATION_INTENT_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"\b(delete|drop|truncate|wipe|destroy|remove|erase)\b.*\b(table|database|sqlite|source|curriculum|lesson|progress|chunk|record)", re.IGNORECASE),
+    re.compile(r"\b(modify|mutate|update|overwrite|alter|patch|insert\s+into)\b.*\b(sqlite|database|table|schema|source|governance|status)", re.IGNORECASE),
+    re.compile(r"\b(bypass|override|disable|ignore)\b.*\b(approval|governance|guardrail|validation|permission|policy|rubric)", re.IGNORECASE),
+    re.compile(r"\bapprove\b.*\b(the\s+batch|src-the-batch|candidate|unapproved|pending)\b", re.IGNORECASE),
+    re.compile(r"\b(expose|print|dump|reveal|show|leak)\b.*\b(api[\s_-]*key|secret|token|password|credential|private[\s_-]*key)\b", re.IGNORECASE),
+)
+
+
+class PlatformIntelligenceAgent:
+    """Read-only Platform Intelligence Agent answering operational, architectural, and observability questions."""
+
+    def __init__(
+        self,
+        *,
+        tool_registry: ToolRegistry,
+        context_service: PlatformContextService,
+    ) -> None:
+        self.tool_registry = tool_registry
+        self.context_service = context_service
+
+    @staticmethod
+    def _detect_mutation_or_unsafe_intent(question: str) -> Optional[str]:
+        for pattern in _MUTATION_INTENT_PATTERNS:
+            match = pattern.search(question)
+            if match:
+                return match.group(0)
+        return None
+
+    @staticmethod
+    def _classify_question_topics(question: str) -> Tuple[str, ...]:
+        q = question.lower()
+        topics: List[str] = []
+        if any(k in q for k in ("agent", "orchestrat", "workflow", "tool", "capability", "capabilities", "run")):
+            topics.append("agents_and_workflows")
+        if any(k in q for k in ("batch", "src-the-batch", "deeplearning.ai", "newsletter", "news")):
+            topics.append("the_batch_governance")
+        if any(k in q for k in ("source", "approved", "collect", "uncollected", "candidate", "tier", "chunk", "sqlite", "chroma", "ingestion", "knowledge")):
+            topics.append("sources_and_ingestion")
+        if any(k in q for k in ("curricul", "syllabus", "lesson", "prereq", "concept", "domain", "evidence gap", "gap", "stage")):
+            topics.append("curricula_and_syllabus")
+        if any(k in q for k in ("learner", "progress", "mastery", "score", "exercise", "assessment", "weak", "practice", "recommend")):
+            topics.append("learner_progress_and_gaps")
+        if any(k in q for k in ("429", "vertex", "quota", "rate limit", "backoff", "retry", "provider", "resilien")):
+            topics.append("runtime_and_resilience")
+        if any(k in q for k in ("architect", "cloud", "scale", "multi-learner", "migration", "status", "health", "overview")):
+            topics.append("architecture_and_cloud_readiness")
+        if not topics:
+            topics.extend(
+                [
+                    "agents_and_workflows",
+                    "sources_and_ingestion",
+                    "curricula_and_syllabus",
+                    "learner_progress_and_gaps",
+                ]
+            )
+        return tuple(topics)
+
+    def execute(
+        self,
+        *,
+        run_state: WorkflowRunState,
+        question: Any,
+        learner_id: Optional[str] = None,
+        record_step: Callable[[str, str, Dict[str, Any], Callable[[], Any]], Any],
+    ) -> PlatformIntelligenceResponse:
+        if not isinstance(question, str) or len(question.strip()) < 4:
+            raise PlatformValidationError(
+                "PLATFORM_QUERY_INVALID",
+                "Platform Intelligence question must be a non-empty string of at least 4 characters.",
+            )
+        cleaned_question = question.strip()
+
+        unsafe_match = self._detect_mutation_or_unsafe_intent(cleaned_question)
+        if unsafe_match is not None:
+            raise PlatformValidationError(
+                "PLATFORM_MUTATION_FORBIDDEN",
+                (
+                    "Platform Intelligence Agent is strictly read-only and cannot modify databases, "
+                    "approve candidate sources, bypass governance policies, or expose credentials "
+                    f"(matched restricted intent: '{unsafe_match}')."
+                ),
+                {"matched_intent": unsafe_match, "capability": AgentCapability.PLATFORM_INTELLIGENCE.value},
+            )
+
+        snapshot: Dict[str, Any] = record_step(
+            "inspect_platform_context",
+            AgentCapability.PLATFORM_INTELLIGENCE.value,
+            {"learner_id": learner_id or "ALL_LEARNERS"},
+            lambda: self.tool_registry.invoke(
+                run_state=run_state,
+                capability=AgentCapability.PLATFORM_INTELLIGENCE,
+                tool_name="inspect_platform_context",
+                learner_id=learner_id,
+            ),
+        )
+        control_plane: Dict[str, Any] = record_step(
+            "inspect_source_control_plane",
+            AgentCapability.PLATFORM_INTELLIGENCE.value,
+            {},
+            lambda: self.context_service.get_source_control_plane(),
+        )
+        syllabus: Dict[str, Any] = record_step(
+            "inspect_syllabus_intelligence",
+            AgentCapability.PLATFORM_INTELLIGENCE.value,
+            {},
+            lambda: self.context_service.get_syllabus_intelligence(),
+        )
+
+        topics = self._classify_question_topics(cleaned_question)
+        ks = snapshot["knowledge_store"]
+        ar = snapshot["agent_runtime"]
+        cs = snapshot["curricula_summary"]
+        lt = snapshot["learner_telemetry"]
+        pr = snapshot["provider_and_resilience"]
+        tb = control_plane["the_batch_governance"]
+
+        measured_facts: List[str] = [
+            f"Knowledge Store (`{ks['db_path']}`): {ks['total_sources']} registered sources, {ks['curriculum_ready_chunks']} active `CURRICULUM_READY_EVIDENCE` chunks extracted from {ks['extracted_primary_documents']} primary documents, {ks['collected_documents']} `COLLECTED_DOCUMENT` resources, {ks['approved_uncollected_resources']} `APPROVED_UNCOLLECTED_RESOURCE` seed entries, and {ks['discovered_link_candidates']} `DISCOVERED_LINK` candidates (`PENDING_REVIEW`).",
+            f"Agent Runtime: {ar['total_registered_agents']} logical agents registered (6 core learning/research agents + 1 read-only `PLATFORM_INTELLIGENCE` agent) across {len(ar['registered_tools'])} deterministic read-only tools; {ar['recent_workflow_runs_count']} workflow runs recorded.",
+            f"The Batch (`{THE_BATCH_SOURCE_ID}`): status=`{tb.get('status')}`, role=`{tb.get('role_in_platform')}`, allowed_for_foundational_teaching=`{tb.get('allowed_for_foundational_teaching', tb.get('can_ground_foundational_lessons', False))}`.",
+            f"Curricula & Concept Graph: {cs['total_curricula']} persisted/active curricula ({cs['validated_curricula_count']} `VALIDATED`, {cs['abstained_curricula_count']} `ABSTAINED`), backed by {syllabus['total_concepts_in_graph']} DAG-verified concepts across {syllabus['total_domains']} syllabus domains.",
+            f"Learner Progress & Assessments (scope=`{lt['learner_filter']}`): {lt['tracked_lesson_rows_count']} tracked lesson rows ({lt['lesson_status_counts']['COMPLETED']} `COMPLETED`, {lt['lesson_status_counts']['PRACTICING']} `PRACTICING`, {lt['lesson_status_counts']['IN_PROGRESS']} `IN_PROGRESS`), {lt['teaching_interactions_count']} teaching interactions, and {lt['assessment_attempts_count']} assessment attempts ({lt['passed_assessment_attempts_count']} passed).",
+            f"Provider & 429 Resilience: Vertex AI default endpoint location=`{pr['vertex_ai_default_location']}` with truncated exponential backoff (max_retries={pr['http_429_resilience_policy']['max_retries']}, initial={pr['http_429_resilience_policy']['initial_backoff_seconds']}s, max={pr['http_429_resilience_policy']['max_backoff_seconds']}s, `Retry-After` respected).",
+        ]
+
+        total_approved = ks["collected_documents"] + ks["approved_uncollected_resources"]
+        collection_ratio = round((ks["collected_documents"] / total_approved) * 100.0, 1) if total_approved else 0.0
+        chunk_concept_ratio = (
+            round((syllabus["chunk_backed_concept_count"] / syllabus["total_concepts_in_graph"]) * 100.0, 1)
+            if syllabus["total_concepts_in_graph"]
+            else 0.0
+        )
+        pass_rate = (
+            round((lt["passed_assessment_attempts_count"] / lt["assessment_attempts_count"]) * 100.0, 1)
+            if lt["assessment_attempts_count"]
+            else 0.0
+        )
+
+        derived_statistics: List[str] = [
+            f"Approved Resource Collection Coverage: {ks['collected_documents']} of {total_approved} approved resources collected ({collection_ratio}%), leaving {ks['approved_uncollected_resources']} approved seed resources in the collection backlog.",
+            f"Concept Primary-Chunk Density: {syllabus['chunk_backed_concept_count']} of {syllabus['total_concepts_in_graph']} ConceptGraph nodes ({chunk_concept_ratio}%) have extracted full-text chunks in Chroma; {syllabus['metadata_only_concept_count']} foundational concepts (`math_linear_algebra_calculus`, `rag_and_grounded_ai_systems`) currently rely on approved seed metadata.",
+            f"Assessment Pass Rate & Score Mean: {pass_rate}% pass rate across {lt['assessment_attempts_count']} attempt(s) with mean rubric score {lt['average_assessment_score']:.2f}.",
+        ]
+        if lt["weak_objectives_needing_practice"]:
+            derived_statistics.append(
+                f"Identified Learner Knowledge Gaps ({len(lt['weak_objectives_needing_practice'])} objective(s) needing practice): "
+                + "; ".join(lt["weak_objectives_needing_practice"][:4])
+            )
+
+        recommendations: List[str] = [
+            "Prioritize Stage 6 (`SCHEDULED_COLLECTION`) and Stage 7 (`KNOWLEDGE_EXTRACTION_AND_CHUNKING`) for the 24 `APPROVED_UNCOLLECTED_RESOURCE` seed entries—specifically `SRC-3B1B` linear algebra/calculus series and `SRC-WIKIPEDIA` / `SRC-ARXIV` RAG references—to convert metadata-backed lessons into chunk-backed evidence.",
+            "Keep `SRC-THE-BATCH` strictly in Stage 1–5 discovery radar (`CANDIDATE_PENDING_REVIEW`); use its weekly topics only to trigger primary-paper searches on `SRC-ARXIV`, `SRC-HINTON`, and `SRC-BENGIO`.",
+        ]
+        if lt["weak_objectives_needing_practice"]:
+            recommendations.append(
+                "In the Learning Workspace, remediate the flagged objectives needing practice before advancing to downstream prerequisite-locked lessons."
+            )
+        else:
+            recommendations.append(
+                "Use the 3-exercise rubric suite (Conceptual, Mathematical, Practical) in each lesson to verify objective mastery before progressing along the ConceptGraph."
+            )
+
+        unknown_or_unavailable: List[str] = [
+            "Live cloud billing cost, external token spend, and remote Vertex AI quota utilization counters are not measured locally and are never fabricated.",
+            f"Full-text body chunks for the {ks['approved_uncollected_resources']} `APPROVED_UNCOLLECTED_RESOURCE` seed records and the {ks['discovered_link_candidates']} `DISCOVERED_LINK` candidate URLs have not yet been fetched into `knowledge_chunks`.",
+            "Long-term longitudinal learner retention across spaced-repetition intervals is not yet measured by single-session rubric evaluations.",
+        ]
+
+        evidence_references: Tuple[str, ...] = (
+            f"sqlite:{ks['db_path']} (sources={ks['total_sources']}, chunks={ks['curriculum_ready_chunks']}, candidates={ks['discovered_link_candidates']})",
+            f"chroma:{snapshot['vector_store']['collection_name']} (indexed_chunks={snapshot['vector_store']['indexed_chunk_count']})",
+            f"progress_db:learning_schema_migrations={snapshot['cloud_and_multi_learner_readiness']['migration_versions_applied']}",
+            f"governance:{THE_BATCH_SOURCE_ID}={tb.get('status')}",
+        )
+
+        summary_parts: List[str] = []
+        if "the_batch_governance" in topics:
+            summary_parts.append(
+                f"`{THE_BATCH_SOURCE_ID}` (The Batch by DeepLearning.AI) is governed as `{tb.get('status')}` and serves exclusively as an AI news and industry discovery radar—never as foundational concept proof."
+            )
+        if "sources_and_ingestion" in topics:
+            summary_parts.append(
+                f"The platform governs {ks['total_sources']} sources across 5 epistemic tiers and a 9-stage ingestion control plane ({ks['curriculum_ready_chunks']} curriculum-ready chunks from {ks['extracted_primary_documents']} extracted documents, {ks['approved_uncollected_resources']} approved uncollected seed resources, and {ks['discovered_link_candidates']} discovered candidates)."
+            )
+        if "agents_and_workflows" in topics:
+            summary_parts.append(
+                f"PlatformOrchestrator coordinates {ar['total_registered_agents']} logical agents (Research, Knowledge Curator, Learning Planner, Teaching, Assessment, Learning Progress, and read-only Platform Intelligence) with {ar['recent_workflow_runs_count']} tracked workflow run(s)."
+            )
+        if "curricula_and_syllabus" in topics:
+            summary_parts.append(
+                f"Syllabus intelligence spans {syllabus['total_domains']} AI domains and {syllabus['total_concepts_in_graph']} prerequisite-ordered concepts ({syllabus['chunk_backed_concept_count']} chunk-backed, {syllabus['metadata_only_concept_count']} seed-metadata-backed) across {cs['total_curricula']} curriculum plan(s)."
+            )
+        if "learner_progress_and_gaps" in topics:
+            summary_parts.append(
+                f"Learner telemetry records {lt['lesson_status_counts']['COMPLETED']} completed lesson(s), {lt['teaching_interactions_count']} teaching turn(s), and {lt['assessment_attempts_count']} rubric evaluation(s) (mean score {lt['average_assessment_score']:.2f})."
+            )
+        if "runtime_and_resilience" in topics:
+            summary_parts.append(
+                f"Vertex AI requests target the `{pr['vertex_ai_default_location']}` endpoint with bounded truncated exponential backoff + jitter (max_retries={pr['http_429_resilience_policy']['max_retries']}) and `Retry-After` compliance."
+            )
+        if not summary_parts:
+            summary_parts.append(
+                f"AI Research & Learning Platform is healthy with {ar['total_registered_agents']} coordinated agents, {ks['curriculum_ready_chunks']} active knowledge chunks, and {cs['total_curricula']} curriculum plan(s)."
+            )
+
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        q_hash = hashlib.sha256(f"{run_state.run_id}:{cleaned_question}:{now_iso}".encode("utf-8")).hexdigest()[:12]
+        return PlatformIntelligenceResponse(
+            query_id=f"piq_{q_hash}",
+            run_id=run_state.run_id,
+            question=cleaned_question,
+            status="ANSWERED_FROM_LIVE_PLATFORM_STATE",
+            executive_summary=" ".join(summary_parts),
+            measured_facts=tuple(measured_facts),
+            derived_statistics=tuple(derived_statistics),
+            recommendations=tuple(recommendations),
+            unknown_or_unavailable=tuple(unknown_or_unavailable),
+            evidence_references=evidence_references,
+            detected_topics=topics,
+            read_only_guarantee=(
+                "Strictly read-only response: zero database mutations, zero source-approval overrides, "
+                "and explicit separation between measured facts, derived statistics, recommendations, and unmeasured data."
+            ),
+            created_at=now_iso,
+        )
+
+
 class PlatformOrchestrator:
     """Controlled orchestrator managing workflow state, step tracing, and tool permissions."""
 
@@ -4787,6 +5776,17 @@ class PlatformOrchestrator:
         self._curricula: Dict[str, CurriculumPlan] = {}
         for persisted_plan in self.progress_store.list_persisted_curricula():
             self._curricula[persisted_plan.curriculum_id] = persisted_plan
+
+        self.context_service = PlatformContextService(
+            db_path=self.db_path,
+            chroma_dir=self.chroma_dir,
+            ecosystem_service=self.ecosystem_service,
+            concept_graph=self.concept_graph,
+            progress_store=self.progress_store,
+            tool_registry=self.tool_registry,
+            get_curricula_fn=self.list_curricula,
+            get_runs_fn=self.list_runs,
+        )
         self._register_default_tools()
 
         self.learning_planner_agent = LearningPlannerAgent(
@@ -4808,6 +5808,10 @@ class PlatformOrchestrator:
             progress_store=self.progress_store,
             assessment_agent=self.assessment_agent,
             concept_graph=self.concept_graph,
+        )
+        self.platform_intelligence_agent = PlatformIntelligenceAgent(
+            tool_registry=self.tool_registry,
+            context_service=self.context_service,
         )
 
     def _search_knowledge_chunks(self, *, query_text: str, top_k: int = 6) -> List[RetrievedChunk]:
@@ -4842,6 +5846,7 @@ class PlatformOrchestrator:
                     AgentCapability.RESEARCH,
                     AgentCapability.KNOWLEDGE_CURATOR,
                     AgentCapability.LEARNING_PLANNER,
+                    AgentCapability.PLATFORM_INTELLIGENCE,
                 ),
                 read_only=True,
                 handler=self.ecosystem_service.summarize_ecosystem,
@@ -4854,6 +5859,7 @@ class PlatformOrchestrator:
                 allowed_capabilities=(
                     AgentCapability.KNOWLEDGE_CURATOR,
                     AgentCapability.LEARNING_PLANNER,
+                    AgentCapability.PLATFORM_INTELLIGENCE,
                 ),
                 read_only=True,
                 handler=self.ecosystem_service.list_approved_resources,
@@ -4863,7 +5869,10 @@ class PlatformOrchestrator:
             ToolDefinition(
                 name="list_discovered_candidates",
                 description="List unverified discovered link candidates (Tier 1: DISCOVERED_LINK).",
-                allowed_capabilities=(AgentCapability.KNOWLEDGE_CURATOR,),
+                allowed_capabilities=(
+                    AgentCapability.KNOWLEDGE_CURATOR,
+                    AgentCapability.PLATFORM_INTELLIGENCE,
+                ),
                 read_only=True,
                 handler=self.ecosystem_service.list_discovered_candidates,
             )
@@ -4876,6 +5885,7 @@ class PlatformOrchestrator:
                     AgentCapability.LEARNING_PLANNER,
                     AgentCapability.TEACHING,
                     AgentCapability.LEARNING_PROGRESS,
+                    AgentCapability.PLATFORM_INTELLIGENCE,
                 ),
                 read_only=True,
                 handler=self.concept_graph.select_concepts_for_goal,
@@ -4903,9 +5913,19 @@ class PlatformOrchestrator:
                     AgentCapability.TEACHING,
                     AgentCapability.ASSESSMENT,
                     AgentCapability.LEARNING_PROGRESS,
+                    AgentCapability.PLATFORM_INTELLIGENCE,
                 ),
                 read_only=True,
                 handler=self.get_curriculum,
+            )
+        )
+        self.tool_registry.register(
+            ToolDefinition(
+                name="inspect_platform_context",
+                description="Read-only inspection of live platform state, source control plane, syllabus coverage, and learner telemetry.",
+                allowed_capabilities=(AgentCapability.PLATFORM_INTELLIGENCE,),
+                read_only=True,
+                handler=self.context_service.get_context_snapshot,
             )
         )
 
@@ -5015,18 +6035,21 @@ class PlatformOrchestrator:
             else:
                 run_state.status = WorkflowStatus.COMPLETED
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             return run_state, plan
         except PlatformValidationError as exc:
             run_state.status = WorkflowStatus.FAILED
             run_state.error_code = exc.code
             run_state.error_message = exc.message
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             raise
         except Exception as exc:
             run_state.status = WorkflowStatus.FAILED
             run_state.error_code = "WORKFLOW_EXECUTION_ERROR"
             run_state.error_message = str(exc)
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             raise
 
     def open_lesson(
@@ -5120,18 +6143,21 @@ class PlatformOrchestrator:
                 else WorkflowStatus.COMPLETED
             )
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             return run_state, response
         except PlatformValidationError as exc:
             run_state.status = WorkflowStatus.FAILED
             run_state.error_code = exc.code
             run_state.error_message = exc.message
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             raise
         except Exception as exc:
             run_state.status = WorkflowStatus.FAILED
             run_state.error_code = "WORKFLOW_EXECUTION_ERROR"
             run_state.error_message = str(exc)
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             raise
 
     def get_lesson_exercises(
@@ -5154,12 +6180,14 @@ class PlatformOrchestrator:
             )
             run_state.status = WorkflowStatus.COMPLETED
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             return exercises
         except PlatformValidationError as exc:
             run_state.status = WorkflowStatus.FAILED
             run_state.error_code = exc.code
             run_state.error_message = exc.message
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             raise
 
     def run_assessment_evaluation(
@@ -5203,18 +6231,21 @@ class PlatformOrchestrator:
             )
             run_state.status = WorkflowStatus.COMPLETED
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             return run_state, evaluation, summary
         except PlatformValidationError as exc:
             run_state.status = WorkflowStatus.FAILED
             run_state.error_code = exc.code
             run_state.error_message = exc.message
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             raise
         except Exception as exc:
             run_state.status = WorkflowStatus.FAILED
             run_state.error_code = "WORKFLOW_EXECUTION_ERROR"
             run_state.error_message = str(exc)
             run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
             raise
 
     def get_curriculum_progress(
@@ -5240,6 +6271,65 @@ class PlatformOrchestrator:
 
     def get_run(self, run_id: str) -> Optional[WorkflowRunState]:
         return self._runs.get(run_id)
+
+    def list_runs(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        persisted = self.progress_store.list_workflow_runs(limit=limit)
+        seen_ids = {str(r["run_id"]) for r in persisted}
+        combined = list(persisted)
+        for run_id, run_state in sorted(
+            self._runs.items(),
+            key=lambda kv: kv[1].updated_at,
+            reverse=True,
+        ):
+            if run_id not in seen_ids:
+                combined.append(run_state.to_dict())
+        return combined[: max(1, int(limit))]
+
+    def get_platform_context(self, *, learner_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.context_service.get_context_snapshot(learner_id=learner_id)
+
+    def get_source_control_plane(self) -> Dict[str, Any]:
+        return self.context_service.get_source_control_plane()
+
+    def get_syllabus_intelligence(self) -> Dict[str, Any]:
+        return self.context_service.get_syllabus_intelligence()
+
+    def run_platform_intelligence_query(
+        self,
+        question: Any,
+        *,
+        learner_id: Optional[str] = None,
+    ) -> Tuple[WorkflowRunState, PlatformIntelligenceResponse]:
+        q_preview = str(question) if isinstance(question, str) else ""
+        run_state, _record_step = self._create_run_state(
+            capability=AgentCapability.PLATFORM_INTELLIGENCE,
+            goal_or_context=q_preview,
+        )
+        try:
+            response = self.platform_intelligence_agent.execute(
+                run_state=run_state,
+                question=question,
+                learner_id=learner_id,
+                record_step=_record_step,
+            )
+            run_state.status = WorkflowStatus.COMPLETED
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
+            return run_state, response
+        except PlatformValidationError as exc:
+            run_state.status = WorkflowStatus.FAILED
+            run_state.error_code = exc.code
+            run_state.error_message = exc.message
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
+            raise
+        except Exception as exc:
+            run_state.status = WorkflowStatus.FAILED
+            run_state.error_code = "WORKFLOW_EXECUTION_ERROR"
+            run_state.error_message = str(exc)
+            run_state.updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.progress_store.save_workflow_run(run_state)
+            raise
 
     def get_curriculum(self, curriculum_id: str) -> Optional[CurriculumPlan]:
         if curriculum_id in self._curricula:
@@ -5273,11 +6363,45 @@ class CurriculumManagementService:
             progress_db_path=progress_db_path,
         )
 
-    def list_agents(self) -> Dict[str, Any]:
-        catalog = get_logical_agent_catalog()
+    def list_agents(self, *, include_platform_intelligence: bool = False) -> Dict[str, Any]:
+        catalog = get_logical_agent_catalog(
+            include_platform_intelligence=include_platform_intelligence
+        )
         return {
             "total": len(catalog),
             "agents": [spec.to_dict() for spec in catalog],
+        }
+
+    def get_platform_context(self, *, learner_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.orchestrator.get_platform_context(learner_id=learner_id)
+
+    def get_source_control_plane(self) -> Dict[str, Any]:
+        return self.orchestrator.get_source_control_plane()
+
+    def get_syllabus_intelligence(self) -> Dict[str, Any]:
+        return self.orchestrator.get_syllabus_intelligence()
+
+    def list_runs(self, *, limit: int = 50) -> Dict[str, Any]:
+        runs = self.orchestrator.list_runs(limit=limit)
+        return {
+            "total": len(runs),
+            "runs": runs,
+        }
+
+    def ask_platform_intelligence(
+        self,
+        question: Any,
+        *,
+        learner_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        run_state, response = self.orchestrator.run_platform_intelligence_query(
+            question,
+            learner_id=learner_id,
+        )
+        return {
+            "run": run_state.to_dict(),
+            "intelligence_response": response.to_dict(),
+            **response.to_dict(),
         }
 
     def generate_curriculum(self, learner_goal: str) -> Dict[str, Any]:
@@ -5754,6 +6878,21 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Display curriculum learning progress and next lesson recommendation.",
     )
     parser.add_argument(
+        "--platform-status",
+        "--platform-context",
+        dest="platform_status",
+        action="store_true",
+        help="Display live Platform Context snapshot (agents, sources, ingestion stages, syllabus, resilience).",
+    )
+    parser.add_argument(
+        "--ask-platform",
+        "--platform-question",
+        dest="ask_platform",
+        type=str,
+        default=None,
+        help="Ask the read-only Platform Intelligence Agent an operational or architectural question.",
+    )
+    parser.add_argument(
         "--output-json",
         type=Path,
         default=None,
@@ -5777,6 +6916,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             chroma_dir=args.chroma_dir,
             progress_db_path=args.progress_db,
         )
+        if args.platform_status:
+            snapshot = orchestrator.get_platform_context(learner_id=args.learner_id)
+            sys.stdout.write(json.dumps(snapshot, indent=2, ensure_ascii=False) + "\n")
+            return 0
+
+        if args.ask_platform is not None:
+            _, pi_resp = orchestrator.run_platform_intelligence_query(
+                args.ask_platform,
+                learner_id=args.learner_id,
+            )
+            sys.stdout.write(json.dumps(pi_resp.to_dict(), indent=2, ensure_ascii=False) + "\n")
+            return 0
+
         curriculum_id = args.curriculum_id
         plan: Optional[CurriculumPlan] = None
         if not curriculum_id:

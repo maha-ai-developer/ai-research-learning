@@ -484,6 +484,53 @@ curl -s "http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/progress?learn
 curl -s "http://127.0.0.1:8000/api/v1/curricula/curr_d4e5110c934b/next-lesson?learner_id=default_learner" | python3 -m json.tool
 ```
 
+## 2.6 Unified AI Learning Platform & Platform Intelligence (Task 036)
+
+Task 036 unifies the application experience, adds a 9-stage Source Ingestion Control Plane, 9-domain Syllabus Intelligence across 5 explanation depths, a read-only Platform Intelligence Agent, and truncated exponential backoff for Vertex AI / provider HTTP 429 resilience (`src/ai_research_learning/platform.py`, `src/ai_research_learning/rag.py`, `src/ai_research_learning/api.py`, and `src/ai_research_learning/webapp.py`):
+
+1. **Visual Design System — "Scholarly Paper & Carbon Studio" (`src/ai_research_learning/webapp.py`):**
+   - Independently researched design system inspired by academic publications (*Distill.pub*, *Semantic Scholar*), structured technical learning platforms (*DeepLearning.AI*), and precision engineering workspaces (*Linear*), avoiding generic navy/cobalt themes and high-glare pure white backgrounds.
+   - **Persistent Theme Toggle (`localStorage` key `ai_learning_theme`):**
+     - **Light Mode ("Scholarly Paper"):** Warm ivory paper background (`#FAF8F5`), alabaster elevated surfaces (`#FFFFFF` / `#F3EFEA`), warm ink typography (`#18181B`), scholarly terracotta primary accent (`#C84B31`), and forest-pine citation verification accent (`#1E6F5C`).
+     - **Dark Mode ("Carbon Studio"):** Deep carbon obsidian background (`#121316`), slate-graphite surfaces (`#1A1C20` / `#22252A`), crisp parchment text (`#F4F2ED`), coral-ember primary accent (`#E26D52`), and luminous jade verification accent (`#34A88E`).
+   - **Six Primary Application Areas:** `HOME`, `LEARN`, `RESEARCH`, `AI AGENTS`, `LAB`, and `PLATFORM INTELLIGENCE`.
+2. **Source Ingestion Control Plane & Syllabus Intelligence (`PlatformContextService`):**
+   - **9-Stage Source Ingestion Control Plane:** Tracks every source (`SRC-HINTON`, `SRC-BENGIO`, `SRC-3B1B`, `SRC-ARXIV`, `SRC-WIKIPEDIA`, and candidate `SRC-THE-BATCH`) across `1. Registered Sources`, `2. Policy & Rights Gate`, `3. Discovered Links`, `4. Approved Seeds`, `5. Collected Metadata`, `6. Verified Documents`, `7. Transcript Pipeline`, `8. Extracted Knowledge Chunks`, and `9. Curriculum-Ready Evidence`. Enforces that `SRC-THE-BATCH` (`CANDIDATE_PENDING_REVIEW`) acts strictly as an AI discovery radar with `0` curriculum-ready chunks.
+   - **9-Domain Syllabus Intelligence Matrix:** Evaluates coverage across all 9 foundational-to-research AI domains (`mathematical_foundations`, `python_and_scientific_computing`, `machine_learning_fundamentals`, `neural_networks_and_backpropagation`, `deep_learning_architectures_and_representations`, `sequence_models_attention_and_transformers`, `large_language_models_rag_and_evaluation`, `agentic_ai_systems_and_tool_orchestration`, and `ai_research_methodology_and_safety_frontiers`) and 5 pedagogical depth levels (`foundational_intuition`, `beginner`, `intermediate`, `advanced`, `research_level`), surfacing honest evidence statuses (`STRONG_EVIDENCE`, `PARTIAL_EVIDENCE`, `SEED_METADATA_ONLY`, `COVERAGE_GAP`).
+3. **Read-Only Platform Intelligence Agent (`PlatformIntelligenceAgent`, `AgentCapability.PLATFORM_INTELLIGENCE`):**
+   - Uses strictly read-only inspection tools (`inspect_platform_context`, `inspect_source_control_plane`, `inspect_syllabus_coverage`, `inspect_curriculum_catalog`, `inspect_learner_progress`) to answer diagnostic questions about platform architecture, source coverage, `SRC-THE-BATCH` governance, syllabus gaps, learner progress, and cloud evolution stages.
+   - Deterministically refuses mutating, destructive, policy-bypass, or secret-exfiltration instructions (`status="refused_read_only"`, `refusal_code="PLATFORM_MUTATION_FORBIDDEN"`).
+4. **Vertex AI / Provider HTTP 429 Resilience (`src/ai_research_learning/rag.py`):**
+   - Implements `parse_retry_after_seconds` (supporting numeric seconds and RFC 7231 HTTP-dates) and `compute_truncated_backoff_delay` (truncated exponential backoff with bounded jitter and `DEFAULT_HTTP_MAX_RETRIES = 3`).
+   - Raises `ProviderRateLimitError` (a `RuntimeError` subclass) with redacted credentials and explicit retry telemetry when capacity remains unavailable after the configured retry budget.
+
+### Platform Intelligence CLI & HTTP API Commands
+
+```bash
+# 1. Inspect the full Platform Context Snapshot via CLI:
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.platform \
+  --platform-context \
+  --learner-id default_learner
+
+# 2. Ask the read-only Platform Intelligence Agent via CLI:
+PYTHONPATH=src:. .venv/bin/python -m src.ai_research_learning.platform \
+  --platform-question "Why is The Batch separated from core curriculum evidence and what are the current syllabus gaps?" \
+  --learner-id default_learner
+
+# 3. Query Platform Intelligence HTTP API endpoints:
+curl -s "http://127.0.0.1:8000/api/v1/platform/context?learner_id=default_learner" | python3 -m json.tool
+curl -s "http://127.0.0.1:8000/api/v1/platform/sources-control-plane" | python3 -m json.tool
+curl -s "http://127.0.0.1:8000/api/v1/platform/syllabus-coverage" | python3 -m json.tool
+curl -s "http://127.0.0.1:8000/api/v1/platform/runs" | python3 -m json.tool
+curl -s "http://127.0.0.1:8000/api/v1/agents?include_platform_intelligence=true" | python3 -m json.tool
+
+# 4. Ask the Platform Intelligence Agent via HTTP API (POST /api/v1/platform/intelligence/ask):
+curl -s -X POST http://127.0.0.1:8000/api/v1/platform/intelligence/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What sources are currently collected vs approved vs chunked?", "learner_id": "default_learner"}' \
+  | python3 -m json.tool
+```
+
 ## 3. Before enabling network collection
 
 First read `docs/DATA_AND_REUSE_POLICY.md` and `docs/JUPYTER_LAB_INTEGRATION.md`.
