@@ -421,6 +421,18 @@ Links extracted during HTML or API metadata collection are persisted in the loca
 - **Separation of Curation and Fetching:** Recording a discovery or a human curation review decision (`ACCEPTED_FOR_REFERENCE`, `APPROVED_FOR_MANIFEST`, etc.) **never** triggers a network fetch and **never** sets `fetch_permission_granted = 1`. Any future metadata fetch must pass the source-specific policy gate (`robots.txt` or official API terms) independently.
 - **Preserved Audit Lineage:** Every candidate preserves `original_url`, `normalized_url`, `referring_resource_id`, `referring_source_id`, `from_url`, `host_domain`, and `domain_classification` (`INTERNAL` or `EXTERNAL`), plus latest review metadata (`reviewed_by`, `reviewed_at`, `review_reason`, `review_count`, `last_review_event_id`) and an append-only audit trail in `discovered_link_reviews` linked to `provenance_events` (`CANDIDATE_LINK_REVIEWED`).
 
+### 4.10 Normalized Documents, Structured Knowledge Elements, and Ingestion Operations (`normalized_documents`, `knowledge_elements`, `ingestion_operations`)
+
+Introduced in Task 037 (`src/ai_research_learning/ingestion.py`, schema version `v10_source_to_knowledge_ingestion`):
+
+1. **`normalized_documents` (`NormalizedDocument`):**
+   - Stores normalized document payloads with all 15 mandatory provenance fields (`resource_id`, `version_id`, `source_id`, `title`, `authors`, `published_at`, `canonical_url`, `resource_type`, `content_origin`, `epistemic_classification`, `license_status`, `permitted_storage_scope`, `extraction_method`, `extraction_timestamp`, `content_hash`, `extraction_status`).
+   - Enforces the strict content-origin invariant (`validate_content_origin_invariant`): abstract/metadata records (`ABSTRACT_OR_METADATA`, `RESOURCE_ABSTRACT_OR_DESCRIPTION`) and `METADATA_ONLY` resources can never be promoted to `PRIMARY_SOURCE_TEXT` or `ORIGINAL_SOURCE_TEXT`.
+2. **`knowledge_elements` (`StructuredKnowledgeElement`):**
+   - Stores grounded structured knowledge elements extracted from normalized documents across 11 canonical types: `concepts`, `definitions`, `equations`, `hypotheses`, `claims`, `methods`, `experiments`, `results`, `limitations`, `concept_relationships`, and `citations`.
+3. **`ingestion_operations`:**
+   - Records structured audit telemetry (`operation_id`, `stage`, `source_id`, `resource_id`, `version_id`, `status`, `decision_or_reason`, `retryable`, `details_json`, `created_at`) for every policy evaluation, extraction, chunking, and vector indexing step.
+
 ---
 
 ## 5. Firestore vs. Cloud Storage Partitioning Summary

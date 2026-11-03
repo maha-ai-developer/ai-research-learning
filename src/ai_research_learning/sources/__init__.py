@@ -46,6 +46,7 @@ from .html_adapters import (
     BengioSourceAdapter,
     ConservativeHtmlAdapter,
     HintonSourceAdapter,
+    TheBatchSourceAdapter,
     ThreeBlueOneBrownAdapter,
 )
 from .pilot import (
@@ -95,6 +96,7 @@ __all__ = [
     "ScopeViolationError",
     "SourceAdapter",
     "SourceCandidate",
+    "TheBatchSourceAdapter",
     "ThreeBlueOneBrownAdapter",
     "TransientFetchError",
     "WikipediaSourceAdapter",

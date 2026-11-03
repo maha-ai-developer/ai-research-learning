@@ -3751,16 +3751,23 @@ class TeachingAgent:
                 )
 
             # Filter chunks that are relevant to the lesson or question
+            citations: List[CurriculumCitation] = list(lesson.source_citations)
+            seen_chunk_ids = {c.chunk_id for c in citations if c.chunk_id}
             node = self.concept_graph.get_node(lesson.concept_id)
             preferred_set = set(node.preferred_resource_ids)
-            prioritized_chunks = [c for c in retrieved_chunks if c.resource_id in preferred_set]
+            prioritized_chunks = [c for c in retrieved_chunks if c.resource_id in preferred_set][:2]
+            novel_question_chunks = [
+                c
+                for c in retrieved_chunks
+                if c.chunk_id not in seen_chunk_ids
+                and c.chunk_id not in {p.chunk_id for p in prioritized_chunks}
+            ]
+            if novel_question_chunks:
+                prioritized_chunks.insert(0, novel_question_chunks[0])
             if not prioritized_chunks:
                 prioritized_chunks = retrieved_chunks[:2]
             else:
-                prioritized_chunks = prioritized_chunks[:2]
-
-            citations: List[CurriculumCitation] = list(lesson.source_citations)
-            seen_chunk_ids = {c.chunk_id for c in citations if c.chunk_id}
+                prioritized_chunks = prioritized_chunks[:3]
             grounded_snippets: List[str] = []
 
             for idx, ch in enumerate(prioritized_chunks, start=1):
@@ -3793,7 +3800,10 @@ class TeachingAgent:
                 request.learner_question,
                 grounded_snippets,
             )
-            sanitized_explanation = _sanitize_answer_citations(raw_explanation, valid_chunk_ids)
+            sanitized_result = _sanitize_answer_citations(raw_explanation, valid_chunk_ids)
+            sanitized_explanation = (
+                sanitized_result[0] if isinstance(sanitized_result, tuple) else str(sanitized_result)
+            )
 
             # Verify all citations against SQLite knowledge store
             cit_ok, cit_errors = self.ecosystem_service.verify_citation_records(citations)
@@ -5298,11 +5308,27 @@ class PlatformContextService:
                 }
             )
 
+        from .ingestion import SourceToKnowledgeIngestionPipeline
+
+        ingestion_status: Dict[str, Any] = {}
+        try:
+            ingestion_pipeline = SourceToKnowledgeIngestionPipeline(
+                sqlite_db_path=self.db_path,
+                chroma_dir=self.chroma_dir,
+            )
+            ingestion_status = ingestion_pipeline.get_ingestion_status()
+        except Exception:
+            ingestion_status = {}
+
         return {
             "ecosystem_summary": summary.to_dict(),
             "epistemic_tiers": [t.value for t in EvidenceTier],
             "canonical_sources": source_profiles,
             "ingestion_pipeline_stages": stages_with_counts,
+            "ingestion_pipeline_metrics": ingestion_status.get("lifecycle_metrics", {}),
+            "epistemic_chunk_layers": ingestion_status.get("epistemic_chunk_breakdown", {}),
+            "wikipedia_scope_audit": ingestion_status.get("wikipedia_scope_audit", {}),
+            "index_consistency": ingestion_status.get("index_consistency", {}),
             "the_batch_governance": summary.the_batch_governance,
             "uncollected_approved_backlog_count": summary.approved_uncollected_resource_count,
         }

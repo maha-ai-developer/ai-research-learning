@@ -154,6 +154,40 @@ _PLATFORM_EXPORTS = frozenset(
 
 _WEBAPP_EXPORTS = frozenset({"DESIGN_SYSTEM_METADATA", "render_learning_web_app_html"})
 
+_INGESTION_EXPORTS = frozenset(
+    {
+        "CanonicalResourceType",
+        "ChunkDraft",
+        "ChunkEpistemicLayer",
+        "ChunkingStrategy",
+        "ContentAwareChunker",
+        "ContentExtractor",
+        "EpistemicCategory",
+        "ExtractionFormat",
+        "INGESTION_SCHEMA_VERSION",
+        "IndexConsistencyReport",
+        "IngestionPolicyViolationError",
+        "NormalizedContentOrigin",
+        "NormalizedDocument",
+        "NormalizedSection",
+        "PolicyEvaluationResult",
+        "STRUCTURED_KNOWLEDGE_ELEMENT_TYPES",
+        "SourceToKnowledgeIngestionPipeline",
+        "StructuredKnowledgeElement",
+        "attribution_for_license",
+        "audit_and_reconcile_wikipedia_scope",
+        "classify_canonical_resource_type",
+        "classify_epistemic_category",
+        "determine_chunk_epistemic_layer",
+        "ensure_ingestion_schema",
+        "evaluate_resource_ingestion_policy",
+        "extract_structured_knowledge",
+        "is_foundational_evidence_eligible",
+        "run_reproducible_ingestion_demo",
+        "verify_index_consistency",
+    }
+)
+
 __all__ = [
     "APIError",
     "APIResponse",
@@ -162,7 +196,7 @@ __all__ = [
     "LocalResearchLibraryAPI",
     "__version__",
     "create_http_server",
-    *sorted(_RAG_EXPORTS | _PLATFORM_EXPORTS | _WEBAPP_EXPORTS),
+    *sorted(_RAG_EXPORTS | _PLATFORM_EXPORTS | _WEBAPP_EXPORTS | _INGESTION_EXPORTS),
 ]
 __version__ = "0.1.0"
 
@@ -180,4 +214,8 @@ def __getattr__(name: str) -> Any:
         from . import webapp
 
         return getattr(webapp, name)
+    if name in _INGESTION_EXPORTS:
+        from . import ingestion
+
+        return getattr(ingestion, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

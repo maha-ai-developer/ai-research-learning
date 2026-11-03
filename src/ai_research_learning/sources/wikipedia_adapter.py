@@ -61,13 +61,14 @@ class WikipediaSourceAdapter(SourceAdapter):
         },
     )
 
-    def build_query_url(self, page_title: str) -> str:
+    def build_query_url(self, page_title: str, *, include_extracts: bool = False) -> str:
         clean_title = page_title.strip().replace(" ", "_")
         if not clean_title:
             raise ValueError("Wikipedia page title must not be empty")
+        props = "info|revisions|pageprops|categories|extracts" if include_extracts else "info|revisions|pageprops|categories"
         params = {
             "action": "query",
-            "prop": "info|revisions|pageprops|categories",
+            "prop": props,
             "inprop": "url",
             "rvprop": "ids|timestamp",
             "rvslots": "main",
@@ -77,6 +78,9 @@ class WikipediaSourceAdapter(SourceAdapter):
             "formatversion": "2",
             "titles": clean_title,
         }
+        if include_extracts:
+            params["explaintext"] = "1"
+            params["exintro"] = "1"
         return f"{self.api_endpoint}?{urlencode(params)}"
 
     def is_url_in_scope(self, url: str) -> bool:
@@ -418,6 +422,7 @@ class WikipediaSourceAdapter(SourceAdapter):
         pageprops = page.get("pageprops") if isinstance(page.get("pageprops"), dict) else {}
         wikidata_qid = pageprops.get("wikibase_item")
         short_desc = pageprops.get("wikibase-shortdesc")
+        extract_text = str(page.get("extract") or "").strip() or None
 
         raw_categories = page.get("categories") if isinstance(page.get("categories"), list) else []
         categories = [
@@ -436,7 +441,24 @@ class WikipediaSourceAdapter(SourceAdapter):
             "has_revision_timestamp": bool(rev_timestamp),
             "has_wikidata_qid": bool(wikidata_qid),
             "has_license": True,
+            "has_extract_text": bool(extract_text),
         }
+
+        has_extract = bool(extract_text)
+        source_meta: dict[str, Any] = {
+            "page_id": page_id,
+            "revision_id": rev_id,
+            "parent_revision_id": parent_rev_id,
+            "revision_timestamp": rev_timestamp,
+            "permanent_revision_url": permanent_revision_url,
+            "wikidata_qid": wikidata_qid,
+            "categories": categories,
+            "attribution_license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+        }
+        if short_desc:
+            source_meta["short_description"] = short_desc
+        if extract_text:
+            source_meta["extract_text"] = extract_text
 
         return NormalizedResourceEnvelope(
             source_id=self.source_id,
@@ -444,23 +466,31 @@ class WikipediaSourceAdapter(SourceAdapter):
             canonical_url=canonical_page_url,
             fetched_url=raw.final_url,
             title=title,
-            resource_type="encyclopedia_concept_metadata",
+            resource_type="encyclopedia_concept" if has_extract else "encyclopedia_concept_metadata",
             manifest_id=(candidate.manifest_id if candidate else None),
             authors="Wikipedia contributors",
             published_at=None,
             updated_at_source=rev_timestamp,
-            media_modality="TEXT_METADATA",
+            media_modality="TEXT_API_EXTRACT" if has_extract else "TEXT_METADATA",
             domain_scope="First-party API",
-            abstract_or_description=short_desc,
+            abstract_or_description=extract_text or short_desc,
             topic_tags=", ".join(categories[:8]) if categories else "artificial intelligence, machine learning",
             external_identifier=f"wikipedia:en:pageid={page_id};oldid={rev_id}",
             language=str(page.get("pagelanguage") or "en"),
             transcript_reference=None,
             official_links=[canonical_page_url, permanent_revision_url],
             observed_from=(candidate.observed_from if candidate else "MediaWiki Action API"),
-            information_to_inventory="Page ID, Title, Revision ID, Timestamp, Canonical URL, Wikidata QID, License",
+            information_to_inventory=(
+                "Page ID, Title, Revision ID, Timestamp, Canonical URL, Wikidata QID, License, CC BY-SA 4.0 Intro Extract"
+                if has_extract
+                else "Page ID, Title, Revision ID, Timestamp, Canonical URL, Wikidata QID, License"
+            ),
             priority=(candidate.priority if candidate else "P0"),
-            collection_decision="Fetch MediaWiki API Metadata Only",
+            collection_decision=(
+                "Fetch MediaWiki API Intro Extract (CC BY-SA 4.0)"
+                if has_extract
+                else "Fetch MediaWiki API Metadata Only"
+            ),
             verification_status=f"Verified MediaWiki API HTTP {raw.http_status} via {self.adapter_id}",
             robots_sitemap_status=(
                 f"{active_policy.status}: {active_policy.evidence_summary}"
@@ -473,25 +503,16 @@ class WikipediaSourceAdapter(SourceAdapter):
             ),
             license_status="CC_BY_SA_4_0",
             license_spdx="CC-BY-SA-4.0",
-            permitted_storage_scope="METADATA_ONLY",
+            permitted_storage_scope="WIKIPEDIA_OPEN_LICENSE_TEXT_PERMITTED",
             permits_full_text_storage=True,
             permits_verbatim_excerpts=True,
             legal_uncertainty_status="CLEARED_CC_BY_SA_4_0_ATTRIBUTION_REQUIRED",
-            text_storage_status="metadata-only",
+            text_storage_status="INTRO_EXTRACT_STORED_CC_BY_SA_4_0" if has_extract else "metadata-only",
             collected_at_utc=raw.fetched_at_utc,
             http_status=raw.http_status,
             etag=raw.headers.get("ETag"),
             last_modified_header=raw.headers.get("Last-Modified"),
             metadata_completeness=completeness,
-            source_specific_metadata={
-                "page_id": page_id,
-                "revision_id": rev_id,
-                "parent_revision_id": parent_rev_id,
-                "revision_timestamp": rev_timestamp,
-                "permanent_revision_url": permanent_revision_url,
-                "wikidata_qid": wikidata_qid,
-                "categories": categories,
-                "attribution_license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
-            },
+            source_specific_metadata=source_meta,
             discovered_links=[],
         )

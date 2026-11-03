@@ -1927,6 +1927,38 @@ class LocalResearchLibraryAPI:
             headers={},
         )
 
+    def get_ingestion_status_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /api/v1/ingestion/status`: Return Task 037 governed source-to-knowledge ingestion status."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        from .ingestion import SourceToKnowledgeIngestionPipeline
+
+        service = self._get_curriculum_service()
+        pipeline = SourceToKnowledgeIngestionPipeline(
+            sqlite_db_path=self.db_path,
+            chroma_dir=service.orchestrator.chroma_dir,
+        )
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body=pipeline.get_ingestion_status(),
+            headers={},
+        )
+
+    def get_ingestion_verify_index_endpoint(self, query_string: str = "") -> APIResponse:
+        """`GET /api/v1/ingestion/verify-index`: Return Task 037 6-check SQLite/Chroma consistency report."""
+        self._extract_single_params(query_string, allowed_keys=set())
+        from .ingestion import verify_index_consistency
+
+        service = self._get_curriculum_service()
+        report = verify_index_consistency(
+            sqlite_db_path=self.db_path,
+            chroma_dir=service.orchestrator.chroma_dir,
+        )
+        return APIResponse(
+            status=HTTPStatus.OK,
+            body=report.to_dict(),
+            headers={},
+        )
+
     def list_platform_runs_endpoint(self, query_string: str = "") -> APIResponse:
         """`GET /api/v1/platform/runs`: Return recent workflow execution runs and step traces."""
         params = self._extract_single_params(query_string, allowed_keys={"limit"})
@@ -2091,6 +2123,12 @@ class LocalResearchLibraryAPI:
 
             if path == "/api/v1/platform/runs":
                 return self.list_platform_runs_endpoint(query_string)
+
+            if path == "/api/v1/ingestion/status":
+                return self.get_ingestion_status_endpoint(query_string)
+
+            if path == "/api/v1/ingestion/verify-index":
+                return self.get_ingestion_verify_index_endpoint(query_string)
 
             if path == "/api/v1/sources":
                 return self.list_sources_endpoint(query_string)

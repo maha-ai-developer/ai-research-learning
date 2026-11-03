@@ -312,13 +312,26 @@ CREATE TABLE IF NOT EXISTS knowledge_chunks (
         content_origin IN (
             'RESOURCE_FULL_TEXT',
             'RESOURCE_ABSTRACT_METADATA',
-            'TRANSCRIPT_AUTHORIZED_TEXT'
+            'TRANSCRIPT_AUTHORIZED_TEXT',
+            'ORIGINAL_SOURCE_TEXT',
+            'AUTHORIZED_TRANSCRIPT',
+            'ABSTRACT_OR_METADATA',
+            'THIRD_PARTY_EXPLANATION',
+            'AI_GENERATED_SUMMARY',
+            'Original source text',
+            'Authorized transcript',
+            'Abstract or metadata',
+            'Third-party explanation',
+            'AI-generated summary'
         )
     ),
     epistemic_layer TEXT NOT NULL CHECK (
         epistemic_layer IN (
             'PRIMARY_SOURCE_TEXT',
-            'AUTHORIZED_ABSTRACT_OR_DESCRIPTION'
+            'AUTHORIZED_ABSTRACT_OR_DESCRIPTION',
+            'TRANSCRIPT_AUTHORIZED_TEXT',
+            'EDUCATIONAL_EXPLANATION',
+            'NEWS_AND_COMMENTARY'
         )
     ),
     char_start INTEGER NOT NULL CHECK (char_start >= 0),
@@ -544,6 +557,15 @@ class ProviderConfig:
             "requires_gemini_api_key": not self.use_vertex_ai,
         }
 
+    @property
+    def is_semantic_embedding(self) -> bool:
+        """Return True only when a genuine semantic embedding provider is configured (`openai` or `gemini`).
+
+        `local_deterministic` (`token-hash-bow-v1`) is an offline feature-hashing test fallback and
+        is explicitly reported as `is_semantic_embedding=False`.
+        """
+        return self.embedding_provider in ("openai", "gemini")
+
     def has_embedding_credentials(self) -> bool:
         """Return True if the selected `embedding_provider` has required credentials."""
         if self.embedding_provider == "local_deterministic":
@@ -574,6 +596,7 @@ class ProviderConfig:
             "embedding_provider": self.embedding_provider,
             "embedding_model": self.embedding_model,
             "embedding_dimensions": self.embedding_dimensions,
+            "is_semantic_embedding": self.is_semantic_embedding,
             "generation_provider": self.generation_provider,
             "generation_model": self.generation_model,
             "chroma_collection": self.chroma_collection,
@@ -1236,6 +1259,9 @@ class EmbeddingProvider(Protocol):
     @property
     def dimensions(self) -> int: ...
 
+    @property
+    def is_semantic(self) -> bool: ...
+
     def embed_texts(self, texts: Sequence[str]) -> list[list[float]]: ...
 
     def embed_query(self, query: str) -> list[float]: ...
@@ -1273,6 +1299,10 @@ class DeterministicHashEmbeddingProvider:
     @property
     def dimensions(self) -> int:
         return self._dimensions
+
+    @property
+    def is_semantic(self) -> bool:
+        return False
 
     def _embed_single(self, text: str) -> list[float]:
         vec = [0.0] * self._dimensions
@@ -1586,6 +1616,10 @@ class OpenAIEmbeddingProvider:
     def dimensions(self) -> int:
         return self._dimensions
 
+    @property
+    def is_semantic(self) -> bool:
+        return True
+
     def _require_key(self) -> str:
         if not self._api_key:
             raise ProviderNotConfiguredError(
@@ -1688,6 +1722,10 @@ class GeminiEmbeddingProvider:
     @property
     def dimensions(self) -> int:
         return self._dimensions
+
+    @property
+    def is_semantic(self) -> bool:
+        return True
 
     @property
     def use_vertex_ai(self) -> bool:
@@ -2587,11 +2625,48 @@ def create_generation_provider(
 
 
 def ensure_knowledge_chunks_schema(conn: sqlite3.Connection) -> None:
-    """Idempotently create the `knowledge_chunks` table and indexes in SQLite."""
+    """Idempotently create or upgrade the `knowledge_chunks` table and indexes in SQLite."""
     row = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks'"
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'knowledge_chunks'"
     ).fetchone()
     if row is not None:
+        table_sql = str(row[0] or "")
+        if "EDUCATIONAL_EXPLANATION" in table_sql and "Original source text" in table_sql:
+            return
+        try:
+            q_only = conn.execute("PRAGMA query_only;").fetchone()
+            if q_only and int(q_only[0]):
+                return
+            db_list = conn.execute("PRAGMA database_list;").fetchall()
+            for db_entry in db_list:
+                db_file = str(db_entry[2] or "")
+                if db_file and Path(db_file).resolve() == DEFAULT_RUNTIME_DB_PATH.resolve():
+                    return
+        except Exception:
+            pass
+        try:
+            base_cols = (
+                "chunk_id, resource_id, version_id, source_id, chunk_index, "
+                "content_origin, epistemic_layer, char_start, char_end, "
+                "chunk_text, content_hash, embedding_provider, embedding_model, "
+                "embedding_dimensions, vector_collection, vector_id, "
+                "lifecycle_state, indexed_at, provenance_event_id"
+            )
+            conn.executescript(
+                """
+                DROP INDEX IF EXISTS idx_knowledge_chunks_resource;
+                DROP INDEX IF EXISTS idx_knowledge_chunks_version;
+                DROP INDEX IF EXISTS idx_knowledge_chunks_source;
+                ALTER TABLE knowledge_chunks RENAME TO knowledge_chunks_legacy_v1;
+                """
+                + KNOWLEDGE_CHUNKS_SCHEMA_SQL
+                + f"""
+                INSERT INTO knowledge_chunks ({base_cols}) SELECT {base_cols} FROM knowledge_chunks_legacy_v1;
+                DROP TABLE knowledge_chunks_legacy_v1;
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
         return
     conn.executescript(KNOWLEDGE_CHUNKS_SCHEMA_SQL)
 
