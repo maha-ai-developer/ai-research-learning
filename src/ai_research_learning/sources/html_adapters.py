@@ -14,6 +14,7 @@ All three adapters:
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -86,7 +87,12 @@ class ConservativeHtmlAdapter(SourceAdapter):
         host = (parsed.hostname or "").lower()
         if host not in self.allowed_hosts:
             return False
-        path = parsed.path or "/"
+        raw_path = parsed.path or "/"
+        path = posixpath.normpath(raw_path)
+        if not path.startswith("/"):
+            path = "/" + path
+        if raw_path.endswith("/") and not path.endswith("/"):
+            path = path + "/"
         return any(path.startswith(prefix) for prefix in self.allowed_path_prefixes)
 
     def audit_policy(self, *, force_refresh: bool = False) -> PolicyAuditResult:
@@ -1118,7 +1124,10 @@ class TheBatchSourceAdapter(ConservativeHtmlAdapter):
         if not super().is_url_in_scope(url):
             return False
         parsed = urlsplit(canonicalize_url(url))
-        path = parsed.path or "/"
+        raw_path = parsed.path or "/"
+        path = posixpath.normpath(raw_path)
+        if not path.startswith("/"):
+            path = "/" + path
         return path == "/the-batch" or path.startswith("/the-batch/")
 
     def fetch_metadata(

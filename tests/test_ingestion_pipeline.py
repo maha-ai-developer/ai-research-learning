@@ -47,6 +47,7 @@ from ai_research_learning.sources import (
     HintonSourceAdapter,
     OriginRateLimiter,
     PolicyBlockedError,
+    ScopeViolationError,
     SourceCandidate,
     TheBatchSourceAdapter,
     ThreeBlueOneBrownAdapter,
@@ -168,19 +169,51 @@ class TestTask037IngestionPipeline(unittest.TestCase):
             self.assertFalse(cand_policy.is_permitted)
             self.assertEqual(cand_policy.decision_code, "REJECTED_UNAPPROVED_DISCOVERED_CANDIDATE")
 
-            # 2. SRC-THE-BATCH path scope violation outside /the-batch
-            batch_scope_violation = evaluate_resource_ingestion_policy(
-                conn,
-                source_id="SRC-THE-BATCH",
-                canonical_url="https://www.deeplearning.ai/courses/machine-learning-specialization/",
-                requested_action="COLLECT",
-                curation_approved_override=True,
+            # 2. SRC-THE-BATCH path scope violation outside /the-batch, lookalike paths, and dot-segment traversal
+            batch_adapter = TheBatchSourceAdapter(curation_approved=True)
+            self.assertTrue(batch_adapter.is_url_in_scope("https://www.deeplearning.ai/the-batch/"))
+            self.assertTrue(
+                batch_adapter.is_url_in_scope("https://www.deeplearning.ai/the-batch/issue-280/?utm_source=test#top")
             )
-            self.assertFalse(batch_scope_violation.is_permitted)
-            self.assertEqual(
-                batch_scope_violation.decision_code,
-                "REJECTED_THE_BATCH_PATH_SCOPE_VIOLATION",
+            for out_of_scope_url in (
+                "https://www.deeplearning.ai/courses/machine-learning-specialization/",
+                "https://www.deeplearning.ai/the-batch-extra/article/",
+                "https://www.deeplearning.ai/the-batching/issue-1/",
+                "https://www.deeplearning.ai/the-batch/../courses/ml/",
+                "https://evil.example.com/the-batch/issue-280/",
+            ):
+                self.assertFalse(batch_adapter.is_url_in_scope(out_of_scope_url))
+                batch_scope_violation = evaluate_resource_ingestion_policy(
+                    conn,
+                    source_id="SRC-THE-BATCH",
+                    canonical_url=out_of_scope_url,
+                    requested_action="COLLECT",
+                    curation_approved_override=True,
+                )
+                self.assertFalse(batch_scope_violation.is_permitted)
+                self.assertEqual(
+                    batch_scope_violation.decision_code,
+                    "REJECTED_THE_BATCH_PATH_SCOPE_VIOLATION",
+                )
+
+            # Verify HTTP 302 redirect out of /the-batch/ fails closed with ScopeViolationError
+            redirect_resp = _FakeHTTPResponse("", status_code=302)
+            redirect_resp.headers["Location"] = "https://www.deeplearning.ai/courses/generative-ai/"
+            redirect_session = _FakeHTTPSession(
+                {"deeplearning.ai/the-batch/issue-280": redirect_resp}
             )
+            redirect_adapter = TheBatchSourceAdapter(
+                session=redirect_session,
+                rate_limiter=OriginRateLimiter(sleep_fn=lambda _: None),
+                curation_approved=True,
+            )
+            with self.assertRaises(ScopeViolationError):
+                redirect_adapter.collect_candidate(
+                    SourceCandidate(
+                        source_id="SRC-THE-BATCH",
+                        url="https://www.deeplearning.ai/the-batch/issue-280/",
+                    )
+                )
 
             # 3. SRC-THE-BATCH blocked without explicit curation approval
             batch_blocked = evaluate_resource_ingestion_policy(
@@ -236,11 +269,19 @@ class TestTask037IngestionPipeline(unittest.TestCase):
             self.assertEqual(audit_before["inconsistent_count"], 2)
             self.assertEqual(len(audit_before["reconciled_resource_ids"]), 0)
 
-            # Reconcile on isolated copy
+            # Reconcile on isolated copy and verify audit log entries + non-eligible exclusion
             audit_fixed = audit_and_reconcile_wikipedia_scope(conn, apply_fix=True)
             self.assertEqual(len(audit_fixed["reconciled_resource_ids"]), 2)
             audit_after = audit_and_reconcile_wikipedia_scope(conn, apply_fix=False)
             self.assertEqual(audit_after["inconsistent_count"], 0)
+            audit_ops = conn.execute(
+                "SELECT * FROM ingestion_operations WHERE stage = 'WIKIPEDIA_LICENSE_RECONCILIATION'"
+            ).fetchall()
+            self.assertEqual(len(audit_ops), 2)
+            non_wiki_reconciled = conn.execute(
+                "SELECT COUNT(*) FROM resources WHERE source_id != 'SRC-WIKIPEDIA' AND permitted_storage_scope = 'WIKIPEDIA_OPEN_LICENSE_TEXT_PERMITTED'"
+            ).fetchone()[0]
+            self.assertEqual(non_wiki_reconciled, 0)
 
             # Full-text extraction is blocked for Hinton PDFs and arXiv default non-exclusive license
             hinton_res = conn.execute(
@@ -646,7 +687,7 @@ class TestTask037IngestionPipeline(unittest.TestCase):
             row_dict = dict(zip(cols, sample_row))
 
             # Insert a SQLite active chunk that has no Chroma vector, wrong dimension (64), stale version, and mismatched provider
-            row_dict["chunk_id"] = "chk_missing_and_mismatched_01"
+            row_dict["chunk_id"] = "chk_missing_and_mismatched_01_a"
             row_dict["vector_id"] = "chk_missing_and_mismatched_01"
             row_dict["chunk_index"] = 99
             row_dict["embedding_dimensions"] = 64
@@ -656,6 +697,16 @@ class TestTask037IngestionPipeline(unittest.TestCase):
             conn.execute(
                 f"INSERT INTO knowledge_chunks ({', '.join(cols)}) VALUES ({placeholders})",
                 [row_dict[c] for c in cols],
+            )
+            # Also insert a second chunk whose fallback chunk_id collides with the effective vector_id above to trigger duplicate_vector_ids
+            dup_dict = dict(row_dict)
+            dup_dict["chunk_id"] = "chk_missing_and_mismatched_01"
+            dup_dict["vector_id"] = ""
+            dup_dict["vector_collection"] = "secondary_collection_dup"
+            dup_dict["chunk_index"] = 100
+            conn.execute(
+                f"INSERT INTO knowledge_chunks ({', '.join(cols)}) VALUES ({placeholders})",
+                [dup_dict[c] for c in cols],
             )
             conn.commit()
         finally:
@@ -692,6 +743,7 @@ class TestTask037IngestionPipeline(unittest.TestCase):
         self.assertFalse(anomaly_report.is_consistent)
         self.assertIn("chk_missing_and_mismatched_01", anomaly_report.missing_vectors)
         self.assertIn("chk_orphan_vector_99", anomaly_report.orphaned_vectors)
+        self.assertIn("chk_missing_and_mismatched_01", anomaly_report.duplicate_vector_ids)
         self.assertTrue(len(anomaly_report.dimension_mismatches) >= 1)
         self.assertTrue(len(anomaly_report.stale_content_versions) >= 1)
         self.assertTrue(len(anomaly_report.provider_model_inconsistencies) >= 1)

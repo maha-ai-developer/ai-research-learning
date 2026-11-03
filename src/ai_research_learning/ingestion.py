@@ -17,6 +17,7 @@ from enum import Enum
 import hashlib
 import json
 from pathlib import Path
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -680,6 +681,25 @@ def audit_and_reconcile_wikipedia_scope(
                     """,
                     (target_text_status, str(r_dict["resource_id"])),
                 )
+                if _table_exists(conn, "ingestion_operations"):
+                    now_ts = _utc_now_iso()
+                    rid_str = str(r_dict["resource_id"])
+                    op_id = f"op_wiki_reconcile_{_sha256_text(f'{rid_str}:{now_ts}')[:12]}"
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO ingestion_operations (
+                            operation_id, stage, source_id, resource_id, version_id,
+                            status, decision_or_reason, retryable, details_json, recorded_at
+                        ) VALUES (?, 'WIKIPEDIA_LICENSE_RECONCILIATION', 'SRC-WIKIPEDIA', ?, NULL, 'SUCCEEDED', ?, 0, ?, ?)
+                        """,
+                        (
+                            op_id,
+                            str(r_dict["resource_id"]),
+                            "Reconciled Wikipedia CC_BY_SA_4_0 resource permitted_storage_scope from METADATA_ONLY to WIKIPEDIA_OPEN_LICENSE_TEXT_PERMITTED",
+                            json.dumps(inconsistent_records[-1], ensure_ascii=False),
+                            now_ts,
+                        ),
+                    )
                 reconciled_ids.append(str(r_dict["resource_id"]))
 
     if apply_fix and reconciled_ids:
@@ -846,7 +866,10 @@ def evaluate_resource_ingestion_policy(
     # 2. Check DeepLearning.AI The Batch strict path and curation rules
     if src_id == "SRC-THE-BATCH" or "deeplearning.ai" in url.lower():
         parsed = urlsplit(url) if url else None
-        path = (parsed.path if parsed else "") or "/"
+        raw_path = (parsed.path if parsed else "") or "/"
+        path = posixpath.normpath(raw_path)
+        if not path.startswith("/"):
+            path = "/" + path
         host = (parsed.hostname or "").lower() if parsed else ""
         if host not in {"www.deeplearning.ai", "deeplearning.ai"} or not (
             path == "/the-batch" or path.startswith("/the-batch/")
