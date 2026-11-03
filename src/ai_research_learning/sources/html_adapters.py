@@ -14,6 +14,7 @@ All three adapters:
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -86,7 +87,12 @@ class ConservativeHtmlAdapter(SourceAdapter):
         host = (parsed.hostname or "").lower()
         if host not in self.allowed_hosts:
             return False
-        path = parsed.path or "/"
+        raw_path = parsed.path or "/"
+        path = posixpath.normpath(raw_path)
+        if not path.startswith("/"):
+            path = "/" + path
+        if raw_path.endswith("/") and not path.endswith("/"):
+            path = path + "/"
         return any(path.startswith(prefix) for prefix in self.allowed_path_prefixes)
 
     def audit_policy(self, *, force_refresh: bool = False) -> PolicyAuditResult:
@@ -844,25 +850,49 @@ class HintonSourceAdapter(ConservativeHtmlAdapter):
     ) -> dict[str, Any]:
         pdf_citations: list[dict[str, str]] = []
         html_subpages: list[str] = []
+        categorized_items: dict[str, list[str]] = {
+            "publications_and_papers": [],
+            "lectures_and_tutorials": [],
+            "talks": [],
+            "linked_official_resources": list(common["official_links"]),
+        }
         for link in common["discovered_links"]:
-            if link.target_scope == "same-host-binary-not-fetched" and link.link_url.lower().endswith(".pdf"):
+            lower_url = link.link_url.lower()
+            lower_text = (link.link_text or "").lower()
+            if link.target_scope == "same-host-binary-not-fetched" and lower_url.endswith(".pdf"):
                 pdf_citations.append(
                     {
                         "url": link.link_url,
                         "title_hint": link.link_text or Path_basename(link.link_url),
                     }
                 )
+                categorized_items["publications_and_papers"].append(link.link_url)
             elif link.target_scope == "in-scope-html":
                 html_subpages.append(link.link_url)
+                if any(k in lower_url or k in lower_text for k in ("lecture", "csc", "course", "tutorial")):
+                    categorized_items["lectures_and_tutorials"].append(link.link_url)
+                elif any(k in lower_url or k in lower_text for k in ("talk", "video", "keynote", "colloquium")):
+                    categorized_items["talks"].append(link.link_url)
+                elif any(k in lower_url or k in lower_text for k in ("absps", "paper", "pub")):
+                    categorized_items["publications_and_papers"].append(link.link_url)
 
         return {
             "source_family": "academic_homepage",
             "institution": "University of Toronto",
             "topic_tags": "deep learning, neural networks, Boltzmann machines, representation learning",
+            "supported_content_facets": [
+                "publications",
+                "papers_and_abstracts",
+                "lectures",
+                "tutorials",
+                "talks",
+                "linked_official_resources",
+            ],
             "catalogued_pdf_citation_count": len(pdf_citations),
             "sample_pdf_citations_not_downloaded": pdf_citations[:10],
             "in_scope_html_subpage_count": len(html_subpages),
             "in_scope_html_subpages": html_subpages[:10],
+            "categorized_items": categorized_items,
         }
 
 
@@ -926,11 +956,30 @@ class BengioSourceAdapter(ConservativeHtmlAdapter):
             for tag in soup.find_all(["h2", "h3"])
         ]
         headings = [h for h in headings if h][:12]
+        lower_url = raw.final_url.lower()
+        lower_title = (common.get("title") or "").lower()
+        inferred_facet = "research_posts"
+        if any(k in lower_url or k in lower_title for k in ("safety", "governance", "policy", "risk", "alignment")):
+            inferred_facet = "ai_safety_governance_writing"
+        elif any(k in lower_url or k in lower_title for k in ("publication", "paper", "arxiv")):
+            inferred_facet = "publications"
+        elif any(k in lower_url or k in lower_title for k in ("talk", "interview", "video", "lecture")):
+            inferred_facet = "talks"
+        elif any(k in lower_url or k in lower_title for k in ("essay", "commentary", "blog", "post")):
+            inferred_facet = "essays_and_commentary"
         return {
             "source_family": "researcher_website",
             "affiliation": "Université de Montréal / Mila",
             "topic_tags": "deep learning, AI safety,科學/research themes, governance",
             "section_headings": headings,
+            "inferred_content_facet": inferred_facet,
+            "supported_content_facets": [
+                "research_posts",
+                "publications",
+                "essays_and_commentary",
+                "talks",
+                "ai_safety_governance_writing",
+            ],
         }
 
 
@@ -993,11 +1042,31 @@ class ThreeBlueOneBrownAdapter(ConservativeHtmlAdapter):
             for link in common["official_links"]
             if "youtube.com" in link or "youtu.be" in link
         ]
+        for iframe in soup.find_all("iframe", src=True):
+            iframe_src = str(iframe.get("src") or "").strip()
+            if ("youtube.com" in iframe_src or "youtu.be" in iframe_src) and iframe_src not in youtube_links:
+                youtube_links.append(iframe_src)
+                if iframe_src not in common["official_links"]:
+                    common["official_links"].append(iframe_src)
         path = urlsplit(raw.final_url).path
         media_modality = "VIDEO_AND_INTERACTIVE_LESSON_INDEX" if "/topics/" in path or "/lessons/" in path else "TEXT_HTML"
+        lesson_category = (
+            "neural_network_explanations"
+            if any(k in path.lower() for k in ("neural", "gpt", "attention", "backprop", "deep-learning"))
+            else "mathematics_lessons"
+        )
         return {
             "source_family": "educational_visual_lessons",
             "media_modality": media_modality,
+            "lesson_category": lesson_category,
+            "supported_content_facets": [
+                "lesson_pages",
+                "mathematics_lessons",
+                "neural_network_explanations",
+                "video_metadata",
+            ],
+            "video_access_permits_transcript_storage": False,
+            "transcript_authorization_required": True,
             "topic_tags": "mathematics, neural networks, linear algebra, visual intuition",
             "discovered_lesson_or_topic_urls": lesson_links[:15],
             "official_video_links": youtube_links[:10],
@@ -1007,3 +1076,111 @@ class ThreeBlueOneBrownAdapter(ConservativeHtmlAdapter):
                 else None
             ),
         }
+
+
+class TheBatchSourceAdapter(ConservativeHtmlAdapter):
+    """Conservative HTML metadata adapter for DeepLearning.AI — The Batch (`https://www.deeplearning.ai/the-batch`).
+
+    Governance rules:
+    - Strictly scoped to `https://www.deeplearning.ai/the-batch` (never general `deeplearning.ai` pages).
+    - Categorized strictly as `AI news and reports` / `AI_NEWS_AND_DEVELOPMENTS` (never mixed with foundational primary research).
+    - Requires explicit curation governance approval (`curation_approved=True`) before active collection.
+    """
+
+    source_id = "SRC-THE-BATCH"
+    adapter_id = "the-batch-html-adapter/0.1"
+    display_name = "DeepLearning.AI — The Batch"
+    origin = "https://www.deeplearning.ai"
+    min_delay_seconds = 5.0
+    allowed_hosts = ("www.deeplearning.ai", "deeplearning.ai")
+    allowed_path_prefixes = ("/the-batch",)
+    robots_url = "https://www.deeplearning.ai/robots.txt"
+    terms_of_use_url = "https://www.deeplearning.ai/terms-of-use/"
+    probe_urls = ("https://www.deeplearning.ai/the-batch/",)
+    default_authors = "DeepLearning.AI — The Batch Editorial Team"
+    default_candidates = (
+        {
+            "id": "TB-URL-001",
+            "url": "https://www.deeplearning.ai/the-batch/",
+            "page_type": "AI News & Developments Index",
+            "priority": "P2",
+            "domain_scope": "First-party /the-batch only",
+            "observed_from": "Candidate Registry Seed",
+            "information_to_inventory": "Issue Headlines, Dates, AI News Summaries (Metadata Only)",
+            "collection_decision": "Candidate Pending Curation Approval — Metadata Only",
+        },
+    )
+    unresolved_policy_questions = (
+        "Candidate source SRC-THE-BATCH requires explicit curation approval before active collection.",
+        "General deeplearning.ai pages outside /the-batch are strictly out of scope.",
+        "Categorized exclusively as AI_NEWS_AND_DEVELOPMENTS and excluded from foundational research proof.",
+    )
+
+    def __init__(self, *args: Any, curation_approved: bool = False, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.curation_approved = bool(curation_approved)
+
+    def is_url_in_scope(self, url: str) -> bool:
+        if not super().is_url_in_scope(url):
+            return False
+        parsed = urlsplit(canonicalize_url(url))
+        raw_path = parsed.path or "/"
+        path = posixpath.normpath(raw_path)
+        if not path.startswith("/"):
+            path = "/" + path
+        return path == "/the-batch" or path.startswith("/the-batch/")
+
+    def fetch_metadata(
+        self,
+        candidate: SourceCandidate,
+        *,
+        policy: PolicyAuditResult | None = None,
+        conditional_headers: dict[str, str] | None = None,
+    ) -> RawMetadataPayload:
+        if not self.is_url_in_scope(candidate.url):
+            raise ScopeViolationError(
+                f"SRC-THE-BATCH only permits https://www.deeplearning.ai/the-batch* URLs; general deeplearning.ai URLs are prohibited (got {candidate.url})",
+                source_id=self.source_id,
+                url=candidate.url,
+            )
+        if not self.curation_approved:
+            raise PolicyBlockedError(
+                "SRC-THE-BATCH is in CANDIDATE_PENDING_REVIEW status; explicit curation approval is required before active collection.",
+                source_id=self.source_id,
+                url=candidate.url,
+            )
+        return super().fetch_metadata(
+            candidate,
+            policy=policy,
+            conditional_headers=conditional_headers,
+        )
+
+    def _extract_source_specific_metadata(
+        self,
+        soup: BeautifulSoup,
+        raw: RawMetadataPayload,
+        common: dict[str, Any],
+    ) -> dict[str, Any]:
+        issue_links = [
+            link.link_url
+            for link in common["discovered_links"]
+            if self.is_url_in_scope(link.link_url)
+        ]
+        return {
+            "source_family": "ai_news_newsletter",
+            "epistemic_category": "AI_NEWS_AND_DEVELOPMENTS",
+            "foundational_evidence_eligible": False,
+            "strict_path_scope": "/the-batch",
+            "topic_tags": "AI news, industry developments, weekly AI report",
+            "discovered_issue_urls": issue_links[:15],
+        }
+
+    def normalize(
+        self,
+        raw: RawMetadataPayload,
+        *,
+        policy: PolicyAuditResult | None = None,
+    ) -> NormalizedResourceEnvelope:
+        envelope = super().normalize(raw, policy=policy)
+        envelope.resource_type = "ai_news_and_reports"
+        return envelope

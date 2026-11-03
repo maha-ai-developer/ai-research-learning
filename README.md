@@ -531,6 +531,56 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/platform/intelligence/ask \
   | python3 -m json.tool
 ```
 
+## 2.7 Source-to-Knowledge Ingestion Pipeline (Task 037)
+
+Task 037 transforms the platform into a policy-aware, multi-source knowledge ingestion system (`src/ai_research_learning/ingestion.py`, `src/ai_research_learning/sources/`, `src/ai_research_learning/rag.py`, `src/ai_research_learning/platform.py`, and `src/ai_research_learning/api.py`) executing the complete pipeline:
+
+`SOURCE → AUTHORIZATION → COLLECTION → EXTRACTION → NORMALIZATION → KNOWLEDGE → CHUNKING → EMBEDDING → INDEXING → LEARNING AGENTS`
+
+### Key Capabilities
+
+1. **Source Policy & Governance Engine (`evaluate_resource_ingestion_policy`, `audit_and_reconcile_wikipedia_scope`):**
+   - Enforces fail-closed policy gates across all registered sources (`SRC-HINTON`, `SRC-BENGIO`, `SRC-3B1B`, `SRC-ARXIV`, `SRC-WIKIPEDIA`, and candidate `SRC-THE-BATCH`).
+   - Blocks unapproved discovered candidates (`181` rows in `discovered_link_candidates` with `PENDING_REVIEW` / `fetch_permission_granted=0`) from automatic ingestion.
+   - Restricts `SRC-THE-BATCH` to `https://www.deeplearning.ai/the-batch*` (`AI_NEWS_AND_DEVELOPMENTS`), rejecting general `deeplearning.ai` URLs and preventing news items from serving as foundational research proof.
+   - Enforces transcript authorization (`permits_transcript_storage=1` + verified `TranscriptAuthorizationAttestation`) before any transcript extraction.
+   - Audits and reconciles `SRC-WIKIPEDIA` resources (`CC_BY_SA_4_0` + `permits_full_text_storage=True`) from `METADATA_ONLY` to `WIKIPEDIA_OPEN_LICENSE_TEXT_PERMITTED`.
+2. **Multi-Source Normalization & Structured Knowledge Extraction (`ContentExtractor`, `extract_structured_knowledge`, `ContentAwareChunker`):**
+   - Normalizes HTML, MediaWiki extracts, arXiv Atom API metadata/abstracts, authorized PDFs, and authorized transcripts into `NormalizedDocument` records with 15 mandatory provenance fields.
+   - Enforces strict epistemic separation across `PRIMARY_SOURCE_TEXT`, `AUTHORIZED_ABSTRACT_OR_DESCRIPTION`, `TRANSCRIPT_AUTHORIZED_TEXT`, `EDUCATIONAL_EXPLANATION`, and `NEWS_AND_COMMENTARY` (never promoting abstracts or metadata to `PRIMARY_SOURCE_TEXT`).
+   - Extracts grounded `StructuredKnowledgeElement` records (`concepts`, `definitions`, `equations`, `hypotheses`, `claims`, `methods`, `experiments`, `results`, `limitations`, `concept_relationships`, `citations`) without fabricating missing elements.
+   - Splits documents using `ContentAwareChunker`, preserving mathematical equations (`$$...$$`) and section headers while computing deterministic content-addressed `chunk_id`s (`compute_chunk_id`).
+3. **6-Check SQLite ↔ Chroma Index Consistency Verification (`verify_index_consistency`):**
+   - Audits active `knowledge_chunks` in SQLite against Chroma vectors to detect: (1) missing vectors, (2) orphaned vectors, (3) duplicate vector IDs, (4) embedding dimension mismatches, (5) stale content versions, and (6) provider/model metadata inconsistencies.
+   - Explicitly flags whether the active embedding model is a deterministic prototype (`is_semantic=False`, `local_deterministic/token-hash-bow-v1@128d`) or a production semantic embedding model (`is_semantic=True`, `gemini/gemini-embedding-001@768d`).
+
+### Source-to-Knowledge Ingestion CLI Commands
+
+```bash
+# 1. Inspect full pipeline lifecycle counts, epistemic chunk breakdown, and index consistency:
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion status
+
+# 2. List curated resources by source:
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion list-resources --source SRC-WIKIPEDIA
+
+# 3. Inspect a single resource's policy evaluation across collection and extraction actions:
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion inspect-resource --id res_24d64fe06f34c722
+
+# 4. Run a dry-run extraction + normalization + structured knowledge preview (never mutates runtime DB):
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion extract --resource-id res_24d64fe06f34c722 --dry-run
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion chunk --resource-id res_24d64fe06f34c722 --dry-run
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion index --resource-id res_24d64fe06f34c722 --dry-run
+
+# 5. Verify SQLite <-> Chroma index consistency across all 6 anomaly checks:
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion verify-index
+
+# 6. Inspect deferred resources and retryable/failed ingestion operations:
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion show-failures
+
+# 7. Run the self-contained end-to-end ingestion demonstration on an isolated temporary copy:
+PYTHONPATH=src:. .venv/bin/python -m ai_research_learning.ingestion demo
+```
+
 ## 3. Before enabling network collection
 
 First read `docs/DATA_AND_REUSE_POLICY.md` and `docs/JUPYTER_LAB_INTEGRATION.md`.
